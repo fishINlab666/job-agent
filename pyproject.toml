@@ -1,0 +1,26 @@
+[project]
+name = "job-agent"
+version = "0.1.0"
+description = "校招 Agent —— 发现、筛选、代投、跟踪"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "playwright>=1.62.0",
+    "pydantic>=2.13.4",
+    "pyyaml>=6.0.3",
+    "rich>=15.0.0",
+    "typer>=0.27.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[project.scripts]
+jobagent = "jobagent.cli:app"

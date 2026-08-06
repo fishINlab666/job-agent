@@ -1,0 +1,22 @@
+name: 张三
+phone: '13800138000'
+email: zhangsan@example.com
+school: 清华大学
+major: 计算机科学与技术
+degree: 硕士
+grad_year: 2027
+grad_month: 6
+# resume_path: ~/Documents/resume.pdf  # 可选：简历文件路径（PDF/DOC/DOCX）
+
+# 用于匹配的画像配置（与 apply 命令无关，仅供 digest/jobs 使用）
+families:
+  - operations
+  - product
+cities:
+  - 北京
+  - 上海
+  - 深圳
+  - 杭州
+recruit_types:
+  - campus
+  - intern
