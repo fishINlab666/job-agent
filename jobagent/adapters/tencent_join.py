@@ -44,12 +44,12 @@ FAMILY_LABEL = {2: "技术", 3: "产品", 4: "设计", 5: "市场", 6: "职能",
 GRAD_WINDOW = {"campus": "26", "intern": "27"}
 
 
-def _recruit_type(label: str) -> str:
+def _recruit_type(label: str) -> str | None:
     if "应届毕业生" in label:
         return "campus"
     if "实习" in label:
         return "intern"
-    return "campus"
+    return None
 
 
 class TencentJoinAdapter:
@@ -95,9 +95,18 @@ class TencentJoinAdapter:
                 batch = data.get("positionList") or []
                 if total is None:
                     total = int(data.get("count") or 0)
+                # 先检查是否拿够，拿够了就不管 batch 是否为空
+                if len(rows) >= total:
+                    break
+                # 还没拿够但遇到空批次 = 截断，必须抛异常
+                if not batch:
+                    raise RuntimeError(
+                        f"tencent_join: page={page} 返回空批次，"
+                        f"但 count={total} 只拿到 {len(rows)} 条，拒绝返回半截数据"
+                    )
                 rows.extend(batch)
-                # 服务端一次可能就给全量（pageSize 上限很宽），拿够或拿空就停
-                if not batch or len(rows) >= total or page > 50:
+                # 防止无限循环
+                if page > 50:
                     break
                 page += 1
 

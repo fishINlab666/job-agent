@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from jobagent import db, ingest
@@ -27,13 +29,20 @@ class FakeAdapter:
         return self._jobs
 
 
-def make_job(ext_id: str, title: str = "产品运营", family: str = "operations") -> RawJob:
+def make_job(
+    ext_id: str,
+    title: str = "产品运营",
+    family: str = "operations",
+    cities: list[str] | None = None,
+) -> RawJob:
+    # cities 用 None 当哨兵而不是直接默认 ["北京"]：要能区分「没传」和
+    # 「传了空列表」—— 城市变空是一个正经用例（TestCitiesDiff 里那条）。
     return RawJob(
         external_id=ext_id,
         title=title,
         raw_json={"id": ext_id, "title": title},
         job_family=family,
-        cities=["北京"],
+        cities=["北京"] if cities is None else cities,
         recruit_type="campus",
         grad_year="27",
         apply_url=f"https://example.test/{ext_id}",
@@ -239,6 +248,102 @@ class TestReopen:
         assert conn.execute(
             "SELECT closed_at FROM jobs WHERE external_id='5'"
         ).fetchone()["closed_at"] is None
+
+
+class TestCitiesDiff:
+    """城市变更要进 diff，且口径必须和指纹一致。
+
+    原来 cities 在指纹里（`ingest._fp`）却不在 diff 的字段清单里，于是
+    「只有城市变了」会触发 job_updated 但 diff 是空的 —— 用户收到
+    「岗位 XXX 有更新」，后面什么都没有。真库里这样的事件有 16 条，
+    回查源站快照，变的字段全是 workCities。见方案 006 问题 1。
+    """
+
+    def _diff_of(self, conn, before: list[str], after: list[str]) -> dict | None:
+        """跑两轮 sync，返回第二轮 job_updated 的 diff（没有事件则 None）。"""
+        ingest.sync(conn, FakeAdapter([make_job("1", cities=before)]))
+        ingest.sync(conn, FakeAdapter([make_job("1", cities=after)]))
+        row = conn.execute(
+            "SELECT payload FROM events WHERE kind='job_updated'"
+        ).fetchone()
+        return json.loads(row["payload"])["diff"] if row else None
+
+    def test_cities_change_enters_diff(self, conn) -> None:
+        """城市从三地缩到一地，diff 里要能看出来。
+
+        修之前这条红：diff 是 {}，事件照发，用户看不到变了什么。
+        """
+        diff = self._diff_of(conn, ["北京", "上海", "深圳"], ["深圳"])
+
+        assert diff is not None, "城市变了却没发 job_updated"
+        assert "cities" in diff, f"城市变了但 diff 里没有 cities：{diff}"
+        assert diff["cities"] == {"from": ["上海", "北京", "深圳"], "to": ["深圳"]}
+
+    def test_diff_carries_lists_not_json_strings(self, conn) -> None:
+        """diff 里的 cities 是 list，不是 JSON 字符串。
+
+        钉的是渲染端的形状依赖：`cli._fmt_cities` 按 list 处理。
+        谁图省事把 `prev["cities"]` 原样塞进 diff（那是字符串），这条红。
+        """
+        diff = self._diff_of(conn, ["北京"], ["深圳"])
+
+        assert isinstance(diff["cities"]["from"], list)
+        assert isinstance(diff["cities"]["to"], list)
+
+    def test_unchanged_cities_stay_out_of_diff(self, conn) -> None:
+        """城市没变就不该出现在 diff 里（反向用例）。
+
+        忘了反序列化时这条红：库里是 `'["北京"]'`、内存里是 `["北京"]`，
+        直接比永远不等，于是**每个**岗位都被判成城市变了。
+        """
+        diff = self._diff_of(conn, ["北京"], ["北京"])
+
+        # 城市和其它字段都没变 → 指纹不变 → 压根不该有事件
+        assert diff is None, f"什么都没变却发了 job_updated：{diff}"
+
+    def test_city_reorder_alone_emits_no_event(self, conn) -> None:
+        """只换城市顺序，不算变更 —— 指纹算的是排序后的值。
+
+        这条钉的是不变量，但它**抓不住** diff 里漏掉 sorted 的错：
+        顺序变了指纹不变，事件根本不发，diff 那几行走不到。
+        真正抓 sorted 的是下一条。
+        """
+        assert self._diff_of(conn, ["北京", "深圳"], ["深圳", "北京"]) is None
+
+    def test_city_reorder_is_not_a_change_next_to_a_real_change(self, conn) -> None:
+        """标题变了、城市只换了顺序：diff 里要有 title，不许有 cities。
+
+        **这条是 sorted 的唯一守卫。** 必须搭一个别的字段变更把指纹顶开，
+        才能让代码走到建 diff 那几行；否则顺序变化根本进不了那段逻辑。
+        去掉 `_cities` 里的 sorted 之后，这条红（会多出一个假的 cities 变更），
+        而上面那条仍然绿。
+        """
+        ingest.sync(conn, FakeAdapter([make_job("1", cities=["北京", "深圳"])]))
+        ingest.sync(
+            conn,
+            FakeAdapter([make_job("1", title="高级产品运营", cities=["深圳", "北京"])]),
+        )
+        diff = json.loads(
+            conn.execute(
+                "SELECT payload FROM events WHERE kind='job_updated'"
+            ).fetchone()["payload"]
+        )["diff"]
+
+        assert "title" in diff, "标题变了却没进 diff，用例本身坏了"
+        assert "cities" not in diff, (
+            f"只换了城市顺序却报成变更 —— 指纹说没变、diff 说变了，自相矛盾：{diff}"
+        )
+
+    def test_cities_going_empty_is_a_change(self, conn) -> None:
+        """城市变空是变更，不是「没变」。
+
+        `[]` 的含义是「源站这次什么都没给」，和 `["不限"]`（源站明说哪都行）
+        是两件事。空列表不许被当成「跳过比较」。
+        """
+        diff = self._diff_of(conn, ["北京"], [])
+
+        assert diff is not None and "cities" in diff
+        assert diff["cities"] == {"from": ["北京"], "to": []}
 
 
 class TestDryRunWritesNothing:

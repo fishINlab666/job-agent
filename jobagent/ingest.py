@@ -33,13 +33,28 @@ CLOSE_GUARD_MIN_COUNT = 5
 BATCH_THRESHOLD = 15
 
 
+def _cities(value: str | list[str] | None) -> list[str]:
+    """把 cities 归一成排好序的 list，两种形态都接：库里是 JSON 串，内存里是 list。
+
+    排序是**指纹和 diff 必须共用**的口径。指纹算的是排序后的值，而下面
+    insert/update 两处存的是适配器给的原始顺序（`json.dumps(j.cities, ...)`）——
+    真库 9401 行里有 1090 行本身没排序。所以比较前不排序的话，同一个岗位会出现
+    「指纹说没变、diff 说城市变了」的自相矛盾。
+    `_fp` 和下面建 diff 的地方都走这个函数，是为了让这个口径没法被改跑偏。
+    这里不写行号：这个函数本身就把下面的行号推移过一次。
+    """
+    if isinstance(value, str):
+        value = json.loads(value or "[]")
+    return sorted(value or [])
+
+
 def _fp(job: RawJob) -> str:
     """只覆盖「变了就该通知」的字段，description 刻意不含。"""
     return fingerprint(
         {
             "title": job.title,
             "family": job.job_family,
-            "cities": sorted(job.cities),
+            "cities": _cities(job.cities),
             "recruit_type": job.recruit_type,
             "department": job.department,
             "apply_url": job.apply_url,
@@ -201,6 +216,16 @@ def sync(conn, adapter: Adapter, *, dry_run: bool = False) -> dict:
                     for k in ("title", "job_family", "recruit_type", "department", "apply_url")
                     if prev[k] != getattr(j, k)
                 }
+                # cities 单独比，不能塞进上面那个推导式：库里存的是 JSON 字符串，
+                # 内存里是 list，直接比永远不等 —— 会把每个岗位都判成城市变了。
+                # 两边都过 _cities() 归一，和指纹同口径。
+                # 这个字段原来不在 diff 里，而指纹里有它（见 _fp）—— 于是
+                # 「只有城市变了」会触发 job_updated 但 diff 是空的，用户收到
+                # 「岗位 XXX 有更新」后面什么都没有。真库里这样的事件有 16 条，
+                # 源站原文里变的字段全是 workCities。见方案 006 问题 1。
+                prev_cities, now_cities = _cities(prev["cities"]), _cities(j.cities)
+                if prev_cities != now_cities:
+                    diff["cities"] = {"from": prev_cities, "to": now_cities}
                 conn.execute(
                     """UPDATE jobs SET title=?, job_family=?, raw_category=?, cities=?,
                            raw_location=?, department=?, recruit_type=?, grad_year=?,

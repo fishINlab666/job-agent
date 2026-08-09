@@ -1,6 +1,6 @@
 ---
-来源: 用户实地核对入口（2026-08-05）+ 全量翻页实测（2026-08-06）；每家的归属都用页面标题核实过
-版本: v2
+来源: 用户实地核对入口（2026-08-05）+ 全量翻页实测（2026-08-06 16:50 核对库 / 17:07 主库）；每家的归属都用页面标题核实过
+版本: v3
 生效时间: 2026-08-06
 权限范围: 公开
 更新负责人: wujingyu
@@ -14,16 +14,26 @@
 
 ## 已接的五家
 
-| 公司 | 系统 | 社招入口 | 校招入口 | `website-path` | 校招条数 |
-|---|---|---|---|---|---|
-| 腾讯 | 自建 | `join.qq.com/post.html` | 同一个站 | —— | 366（26 届存量）+ 435 实习 |
-| 蔚来 | feishu `nio` | `nio.jobs.feishu.cn/` | **`campus.nio.com/#/`** | `campus` | **627** |
-| 小鹏汽车 | feishu `xiaopeng` | `xiaopeng.jobs.feishu.cn/` | **`xiaopeng.jobs.feishu.cn/398875`** | `campus` | **436** |
-| 字节跳动 | feishu `bytedance` | `bytedance.jobs.feishu.cn/` | **`jobs.bytedance.com/campus`** | `campus` | **7395** |
-| 商汤科技 | feishu `sensetime` | `sensetime.jobs.feishu.cn/` | **`hr-jobs.sensetime.com/edu/`** | `edu` | **160** |
+| 公司 | 系统 | 社招入口 | 校招入口 | `website-path` | 门户下开放合计 | 其中 campus / intern |
+|---|---|---|---|---|---|---|
+| 腾讯 | 自建 | `join.qq.com/post.html` | 同一个站 | —— | **805** | 366 / 439 |
+| 蔚来 | feishu `nio` | `nio.jobs.feishu.cn/` | **`campus.nio.com/#/`** | `campus` | **634** | 218 / 416 |
+| 小鹏汽车 | feishu `xiaopeng` | `xiaopeng.jobs.feishu.cn/` | **`xiaopeng.jobs.feishu.cn/398875`** | `campus` | **431** | 312 / 119 |
+| 字节跳动 | feishu `bytedance` | `bytedance.jobs.feishu.cn/` | **`jobs.bytedance.com/campus`** | `campus` | **7368** | 2073 / 5295 |
+| 商汤科技 | feishu `sensetime` | `sensetime.jobs.feishu.cn/` | **`hr-jobs.sensetime.com/edu/`** | `edu` | **161** | 92 / 69 |
 
-校招合计 **8618**（627+436+7395+160，2026-08-06 全量翻页，每个门户
-`rows == count` 且 id 全 unique）。
+飞书四家合计 **8594**（634+431+7368+161），五家合计 **9399**。
+测量时间 2026-08-06 16:50（核对库）/ 17:07（主库），两库逐源相等。
+
+**这一列的名字改过，因为老名字是个口径坑。** 它原来叫「校招条数」，值是
+`627+436+7395+160 = 8618` —— 但那个数是**校招门户下的全部开放岗位，含实习**，
+不是 `recruit_type=campus`。两个口径差得很远：飞书四家门户下 8594 条里，
+`campus` 只有 2695 条，`intern` 有 5899 条。说「校招 8594 条」会让人以为
+有 8594 个应届岗位。**报这个数必须说清是哪一个。**
+
+`8618 → 8594` 不是改错，是**重测漂移**：v2 的数来自 00:43 那一轮，
+16:50 重新同步后各家都动了（蔚来 +7、商汤 +1、小鹏 −5、字节 −27），
+岗位池本来就是活的。同理腾讯实习 435 → 439。核对办法见文末命令。
 
 **不含** 小鹏的 `398875`（335 条）：它是 `campus` 的子门户，
 `campus ∩ 398875 = 335` 完全包含。**采了 `campus` 就别再采它。**
@@ -65,9 +75,43 @@
 反面教训：找海底捞替补时先猜了 18 个 slug，16 个直接 `JSONDecodeError`。
 **猜命名空间**（租户名、门户路径、body 参数）是这个项目复发三次的错法。
 
+## 复核命令
+
+上面每一个条数都从这条命令出，**报数前重跑一遍**（岗位池是活的，数会漂）：
+
+```bash
+uv run python -c "
+import collections
+from pathlib import Path
+from jobagent import db
+rows=[dict(r) for r in db.connect(Path('data/jobagent.db')).execute('''
+  SELECT source_key, recruit_type, COUNT(*) n FROM jobs
+  WHERE closed_at IS NULL GROUP BY 1,2''')]
+per=collections.defaultdict(dict); tot=collections.Counter()
+for r in rows:
+    per[r['source_key']][r['recruit_type'] or 'NULL']=r['n']; tot[r['source_key']]+=r['n']
+for k in sorted(per): print(f'{k:32s} 合计 {tot[k]:5d}  {dict(per[k])}')
+print('开放合计', sum(tot.values()))
+print('飞书合计', sum(v for k,v in tot.items() if k.startswith('feishu:')))
+"
+```
+
+配套看一眼是哪一轮同步出的数（漂移都能在这儿对上）：
+
+```bash
+uv run python -c "
+from pathlib import Path
+from jobagent import db
+for r in db.connect(Path('data/jobagent.db')).execute(
+    'SELECT started_at, source_key, status, fetched FROM runs ORDER BY started_at'):
+    print(dict(r))
+"
+```
+
 ## 变更记录
 
 | 版本 | 日期 | 变化 |
 |---|---|---|
 | v1 | 2026-08-05 | 首版。五家已接，校招入口全部改为用户核对过的地址 |
 | v2 | 2026-08-06 | 海底捞（无校招门户）换成字节跳动 7395 条；校招合计 1222 → **8618**；商汤 159 → 160；补投递链接形状（必须带门户段）；已排除租户表扩到 15 个。来源：`docs/plans/003-校招门户采集.md` §0 偏差 4/6、§11 |
+| v3 | 2026-08-06 | 「校招条数」列改名成「门户下开放合计」并拆出 campus / intern —— 老列名是口径坑：`8618` 是门户下**含实习**的全部开放岗位，不是应届岗位数（飞书 8594 条里 campus 只有 2695）。条数按 16:50/17:07 轮重测：蔚来 627→**634**、小鹏 436→**431**、字节 7395→**7368**、商汤 160→**161**、腾讯实习 435→**439**，飞书合计 8618→**8594**，五家合计 **9399**；**这是重测漂移不是改错**，v2 的数在 00:43 那一轮是对的。新增「复核命令」节（两条命令都实跑过，`runs` 的列名是 `fetched` 不是 `n_fetched`）。来源：`docs/plans/004-届别补全.md` §9 |

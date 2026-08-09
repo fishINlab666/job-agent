@@ -26,6 +26,19 @@ FAM_ZH = {
 RTYPE_ZH = {"campus": "应届", "intern": "实习", "social": "社招"}
 
 
+def _fmt_cities(cities: list[str]) -> str:
+    """diff 里的城市列表转成给人看的一行。
+
+    空列表显示「未写」而不是「不限」：「不限」在本仓是一个**真实的城市值**
+    （`normalize.CITY_WILDCARDS`），源站写「工作地点不限」时它会作为一个元素
+    出现在 cities 里，`any_city_ok` 认它。拿「不限」去表示空列表，会让
+    `["不限"]`（源站说哪都行）和 `[]`（我们没拿到）打印成同一句话。
+    「未写」沿用 digest 表格里已有的写法（同文件 `cities = ... or "未写"`），
+    这里不写行号：这个函数本身就把下面的行号推移过一次。
+    """
+    return "、".join(cities) if cities else "未写"
+
+
 @app.command()
 def init() -> None:
     """建库建表。"""
@@ -107,8 +120,12 @@ def jobs(
     recruit_type: str = typer.Option(None, help="campus / intern"),
     limit: int = typer.Option(30),
     matched: bool = typer.Option(False, "--matched", help="只看命中我画像的"),
+    allow_missing: list[str] = typer.Option(
+        None, "--allow-missing",
+        help=f"某一维没写也算能看，可重复。可选：{'/'.join(match.MISSING_DIMS)}",
+    ),
     loose: bool = typer.Option(
-        False, "--loose", help="连信息不全的一起看（届别/城市没写的岗位）"
+        False, "--loose", help="连信息不全的一起看（等于放开全部维度）"
     ),
 ) -> None:
     """看当前开放岗位。"""
@@ -120,9 +137,20 @@ def jobs(
         ).fetchall()
     ]
 
+    # --loose 是「全放开」的简写，保持老行为。两个都给时取并集。
+    allowed = set(allow_missing or ())
+    if bad := allowed - set(match.MISSING_DIMS):
+        raise typer.BadParameter(
+            f"不认识的维度 {sorted(bad)}，可选：{'/'.join(match.MISSING_DIMS)}"
+        )
+    if loose:
+        allowed |= set(match.MISSING_DIMS)
+    if allowed and not matched:
+        console.print("[yellow]--allow-missing / --loose 只在 --matched 下生效，已忽略[/yellow]")
+
     if matched:
         rows = match.filter_jobs(
-            rows, match.load_profile().get("intent") or {}, include_unknown=loose
+            rows, match.load_profile().get("intent") or {}, allow_missing=allowed
         )
     if family:
         rows = [r for r in rows if r["job_family"] == family]
@@ -224,14 +252,24 @@ def digest(mark: bool = typer.Option(False, "--mark", help="标记为已推送")
         console.print("[yellow]岗位变更（影响你的画像）[/yellow]")
         for job, diff in changed:
             parts = []
+            # 内层键是 from/to —— 生产端 ingest.sync() 建 diff 时写的就是这两个。
+            # 原来这里读的是 old/new，真实负载上当场 KeyError，见方案 006 问题 0。
+            # 改键名要两端一起改，库里 90 条存量负载全是 from/to。
             if "title" in diff:
-                parts.append(f"标题: {diff['title']['old']} → {diff['title']['new']}")
+                parts.append(f"标题: {diff['title']['from']} → {diff['title']['to']}")
             if "job_family" in diff:
-                old_fam = FAM_ZH.get(diff["job_family"]["old"], diff["job_family"]["old"])
-                new_fam = FAM_ZH.get(diff["job_family"]["new"], diff["job_family"]["new"])
-                parts.append(f"族: {old_fam} → {new_fam}")
+                fam = diff["job_family"]
+                # job_family 可空（schema.sql:57），取不到显示 "-"，别打印字面量 None
+                from_fam = FAM_ZH.get(fam["from"], fam["from"] or "-")
+                to_fam = FAM_ZH.get(fam["to"], fam["to"] or "-")
+                parts.append(f"族: {from_fam} → {to_fam}")
             if "cities" in diff:
-                parts.append(f"城市: {diff['cities']['old']} → {diff['cities']['new']}")
+                # 负载里是 list（ingest 建 diff 时存的排序后列表），不是字符串 ——
+                # 直接塞进 f-string 会打印成 ['北京'] → ['深圳']
+                cty = diff["cities"]
+                parts.append(
+                    f"城市: {_fmt_cities(cty['from'])} → {_fmt_cities(cty['to'])}"
+                )
             console.print(f"  • {job['title']} ({job['company']}) — {'; '.join(parts)}")
 
     if hits:
