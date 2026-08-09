@@ -134,13 +134,15 @@ def register_source(
     entry_url: str,
     notes: str = "",
     tenant: str | None = None,
-    commit: bool = True,
 ) -> None:
-    """登记/更新一个源。
+    """登记/更新一个源。**自己提交**，调用方不再控制提交时机。
 
-    `commit=False` 是给 `sync(dry_run=True)` 用的：dry-run 靠调用方最后
-    `conn.rollback()` 把整轮抹掉，这里要是自己 commit 了，那句 rollback 就
-    无事可回——**表现是「只算不写」的命令往库里留了一行**。见 start_run。
+    提交是必须的，不是可选的：`runs.source_key REFERENCES sources(source_key)`
+    （schema.sql:28），源那行没落盘的话，紧接着 `start_run` 走侧连接会撞
+    `FOREIGN KEY constraint failed`（主连接还持着写锁时先撞 `database is locked`）。
+
+    dry-run 不许落盘，靠调用方传一个吞掉 commit 的包装连接（见 `ingest._NoCommit`），
+    不靠这里的形参 —— 形参得让每个调用方都记着传，忘了就静默落盘。
     """
     conn.execute(
         """INSERT INTO sources(source_key, company, system, entry_url, notes, tenant)
@@ -155,27 +157,25 @@ def register_source(
              tenant=COALESCE(excluded.tenant, sources.tenant)""",
         (source_key, company, system, entry_url, notes, tenant),
     )
-    if commit:
-        conn.commit()
+    conn.commit()
 
 
-def start_run(conn: sqlite3.Connection, source_key: str, commit: bool = True) -> int:
-    """开一条 run，返回 id。
+def start_run(conn: sqlite3.Connection, source_key: str) -> int:
+    """开一条 run，返回 id。**自己提交**，调用方不再控制提交时机。
 
-    `commit=True` 是有意的默认：真跑的时候这一行必须**先**落盘，进程中途被杀
-    也留得下「这轮开过、没收尾」的痕迹，否则崩一次就查不到崩在哪。
+    这一行必须**先**落盘，进程中途被杀也留得下「这轮开过、没收尾」的痕迹，
+    否则崩一次就查不到崩在哪。`cli status` 每个源只读最近一条 run
+    （`ORDER BY id DESC LIMIT 1`），没有这行 `running`，崩掉的一轮会显示成
+    上一次的 `ok` —— 等于报假账。
 
-    `commit=False` 只给 dry-run。它抢先 commit 过一次，导致 `--dry-run` 在
-    `runs` 里留下一行永远 `running` 的记录，而 `cli status` 取的是
-    `ORDER BY id DESC LIMIT 1` —— 于是明明上一轮真实成功、有 795 条开放岗位的
-    源，状态栏显示 `running` / 抓取 0。不报错，只是显示的东西是错的。
+    所以真跑时这里走的是**侧连接**（见 `ingest.sync`）：主事务异常回滚业务数据，
+    这一行痕迹不跟着回滚。dry-run 走吞掉 commit 的包装连接，什么都不落盘。
     """
     cur = conn.execute(
         "INSERT INTO runs(source_key, started_at) VALUES(?,?)",
         (source_key, now()),
     )
-    if commit:
-        conn.commit()
+    conn.commit()
     return int(cur.lastrowid)
 
 
@@ -185,20 +185,20 @@ def finish_run(
     status: str,
     fetched: int = 0,
     error: str | None = None,
-    commit: bool = True,
 ) -> None:
-    """给 run 收尾。`commit=False` 同 start_run，只给 dry-run。
+    """给 run 收尾。**自己提交**，调用方不再控制提交时机。
 
-    dry-run 下这里尤其不能 commit：失败路径上 `start_run` 那条 INSERT 还没落盘，
-    这一句 commit 会把 INSERT 和 UPDATE 一起提交，于是「只算不写」反倒写进去
-    一条 failed。
+    必须在主事务 `commit`/`rollback` **之后**调用：SQLite 单写者，主连接还持着
+    写事务时侧连接写 `runs` 会撞 `database is locked`（见 `ingest.sync` 的顺序）。
+
+    dry-run 下这一句是空操作，不是 bug：`rollback()` 已经把 `start_run` 那行
+    INSERT 退掉了，这条 UPDATE 命中 0 行。
     """
     conn.execute(
         "UPDATE runs SET finished_at=?, status=?, fetched=?, error=? WHERE id=?",
         (now(), status, fetched, error, run_id),
     )
-    if commit:
-        conn.commit()
+    conn.commit()
 
 
 def record_prefill(

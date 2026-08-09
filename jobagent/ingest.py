@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from pathlib import Path
 
 from . import db
 from .adapters.base import Adapter, RawJob
@@ -79,21 +80,38 @@ def _open_families(conn, company: str) -> set[tuple[str, str]]:
     return {(r["job_family"], r["recruit_type"]) for r in rows}
 
 
+class _NoCommit:
+    """dry-run 用：记账照写主连接，但把 commit 吞掉，留给结尾那句 rollback。
+
+    去掉 `commit=` 形参之后 register_source/start_run 变成无条件提交，
+    dry-run 下如果直接把 side 设成 conn，这两句 commit 就落在主连接上，
+    结尾那句 rollback() 无事可回 —— 库里留下 sources 一行 + runs 一行
+    永远 running，正是 db.start_run 注释里记的「cli status 说假话」那个 bug。
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def commit(self):
+        pass
+
+
 def sync(conn, adapter: Adapter, *, dry_run: bool = False) -> dict:
     """跑一次采集 + 增量判定，返回统计摘要。"""
-    # dry-run 靠函数结尾那句 conn.rollback() 把整轮抹掉，所以这一路上**任何**
-    # 写动作都不许自己 commit —— commit 过的东西 rollback 不回来。
-    # 这两个原来是无条件 commit 的，于是 `sync --dry-run` 往真库里留下了
-    # sources 一行 + runs 一行永远 running 的记录，后者让 cli status 说假话。
     write = not dry_run
+    # 侧连接必须跟随主连接的库文件，不能写 bare db.connect()（会打到真库）。
+    dbfile = conn.execute("PRAGMA database_list").fetchone()[2]
+    side = db.connect(Path(dbfile)) if write else _NoCommit(conn)
     db.register_source(
-        conn, adapter.source_key, adapter.company, adapter.system, adapter.entry_url,
+        side, adapter.source_key, adapter.company, adapter.system, adapter.entry_url,
         # 多租户 ATS 的适配器才有 tenant（feishu:xiaopeng 的 xiaopeng）。
         # 自建的没有这个属性，取到 None，register_source 会保留库里原值。
         tenant=getattr(adapter, "tenant", None),
-        commit=write,
     )
-    run_id = db.start_run(conn, adapter.source_key, commit=write)
+    run_id = db.start_run(side, adapter.source_key)
     stats = {
         "source": adapter.source_key,
         "bootstrap": False,
@@ -111,194 +129,194 @@ def sync(conn, adapter: Adapter, *, dry_run: bool = False) -> dict:
 
     try:
         jobs = adapter.fetch()
-    except Exception as exc:
-        db.finish_run(conn, run_id, "failed", 0, str(exc), commit=write)
-        if dry_run:
-            conn.rollback()
-        raise
 
-    # 空结果**默认**不是合法状态：招聘站不可能一个岗位都没有。
-    # 这个检查必须在 ingest 层，不能指望每个适配器作者都记得写 ——
-    # 一旦漏掉，diff 会把全部岗位判成关闭，是本项目最危险的静默故障。
-    #
-    # 唯一的例外：适配器能**说清空的原因**。飞书那个接口会明确回
-    # code=0 + count=0（真租户、当下没在招，实测 luckin/horizon 就是这样），
-    # 那是一个事实，不是故障。区分交给适配器做，ingest 不猜：
-    #   适配器返回空且说不清为什么 = 「我没拿到数据」→ 抛
-    #   接口明确回了 count=0        = 「这家现在没岗位」→ 正常走完，opened=0
-    # getattr 带默认 False：没声明这个属性的适配器（腾讯）行为完全不变，
-    # 新语义默认关闭，只有显式声明的适配器才享受。
-    if not jobs:
-        if not getattr(adapter, "empty_is_authoritative", False):
-            msg = f"{adapter.source_key} 返回 0 条，判定为上游异常，拒绝按「全部关闭」处理"
-            db.finish_run(conn, run_id, "failed", 0, msg, commit=write)
-            # 抛之前也要回滚：不然 start_run 那条未提交的 INSERT 会挂在事务里，
-            # 被下一个源的 commit 顺手带进库。
-            if dry_run:
-                conn.rollback()
-            raise RuntimeError(msg)
+        # 空结果**默认**不是合法状态：招聘站不可能一个岗位都没有。
+        # 这个检查必须在 ingest 层，不能指望每个适配器作者都记得写 ——
+        # 一旦漏掉，diff 会把全部岗位判成关闭，是本项目最危险的静默故障。
+        #
+        # 唯一的例外：适配器能**说清空的原因**。飞书那个接口会明确回
+        # code=0 + count=0（真租户、当下没在招，实测 luckin/horizon 就是这样），
+        # 那是一个事实，不是故障。区分交给适配器做，ingest 不猜：
+        #   适配器返回空且说不清为什么 = 「我没拿到数据」→ 抛
+        #   接口明确回了 count=0        = 「这家现在没岗位」→ 正常走完，opened=0
+        # getattr 带默认 False：没声明这个属性的适配器（腾讯）行为完全不变，
+        # 新语义默认关闭，只有显式声明的适配器才享受。
+        if not jobs:
+            if not getattr(adapter, "empty_is_authoritative", False):
+                msg = f"{adapter.source_key} 返回 0 条，判定为上游异常，拒绝按「全部关闭」处理"
+                raise RuntimeError(msg)
 
-    stats["fetched"] = len(jobs)
-    # 分母是「这一次抓到的条数」，和 fetched 同一个粒度 —— 不是新增的条数。
-    # 判不出族的岗位照样入库，只是按族筛不到，所以要报的是全量占比。
-    stats["family_unknown"] = sum(1 for j in jobs if j.job_family is None)
-    bootstrap = _is_bootstrap(conn, adapter.source_key)
-    stats["bootstrap"] = bootstrap
-    families_before = _open_families(conn, adapter.company)
-    ts = db.now()
+        stats["fetched"] = len(jobs)
+        # 分母是「这一次抓到的条数」，和 fetched 同一个粒度 —— 不是新增的条数。
+        # 判不出族的岗位照样入库，只是按族筛不到，所以要报的是全量占比。
+        stats["family_unknown"] = sum(1 for j in jobs if j.job_family is None)
+        bootstrap = _is_bootstrap(conn, adapter.source_key)
+        stats["bootstrap"] = bootstrap
+        families_before = _open_families(conn, adapter.company)
+        ts = db.now()
 
-    # 落原始快照
-    for j in jobs:
-        conn.execute(
-            """INSERT INTO snapshots(run_id, source_key, external_id, fingerprint, raw_json, captured_at)
-               VALUES(?,?,?,?,?,?)""",
-            (
-                run_id,
-                adapter.source_key,
-                j.external_id,
-                _fp(j),
-                json.dumps(j.raw_json, ensure_ascii=False),
-                ts,
-            ),
-        )
-
-    existing = {
-        r["external_id"]: r
-        for r in conn.execute(
-            "SELECT * FROM jobs WHERE source_key=?", (adapter.source_key,)
-        ).fetchall()
-    }
-    seen_ids = {j.external_id for j in jobs}
-
-    # 坑一的守卫：先算消失比例，再决定要不要关闭
-    live_before = {k: v for k, v in existing.items() if v["closed_at"] is None}
-    disappeared = [k for k in live_before if k not in seen_ids]
-    guard = (
-        len(disappeared) >= CLOSE_GUARD_MIN_COUNT
-        and bool(live_before)
-        and (len(disappeared) / len(live_before)) > CLOSE_GUARD_RATIO
-    )
-    stats["guard_tripped"] = guard
-
-    for j in jobs:
-        fp = _fp(j)
-        prev = existing.get(j.external_id)
-        payload = asdict(j)
-        payload.pop("raw_json", None)
-
-        if prev is None:
-            cur = conn.execute(
-                """INSERT INTO jobs(source_key, external_id, company, title, job_family,
-                       raw_category, cities, raw_location, country, department,
-                       recruit_type, grad_year, apply_url, apply_system, description,
-                       fingerprint, first_seen_at, last_seen_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        # 落原始快照
+        for j in jobs:
+            conn.execute(
+                """INSERT INTO snapshots(run_id, source_key, external_id, fingerprint, raw_json, captured_at)
+                   VALUES(?,?,?,?,?,?)""",
                 (
-                    adapter.source_key, j.external_id, adapter.company, j.title,
-                    j.job_family, j.raw_category, json.dumps(j.cities, ensure_ascii=False),
-                    j.raw_location, j.country, j.department, j.recruit_type,
-                    j.grad_year, j.apply_url, j.apply_system, j.description,
-                    fp, ts, ts,
+                    run_id,
+                    adapter.source_key,
+                    j.external_id,
+                    _fp(j),
+                    json.dumps(j.raw_json, ensure_ascii=False),
+                    ts,
                 ),
             )
-            stats["opened"] += 1
-            if not bootstrap:
-                db.add_event(
-                    conn, "job_opened", source_key=adapter.source_key,
-                    company=adapter.company, job_id=int(cur.lastrowid),
-                    payload=payload, run_id=run_id,
-                )
-        else:
-            reopened = prev["closed_at"] is not None
-            if prev["fingerprint"] != fp or reopened:
-                diff = {
-                    k: {"from": prev[k], "to": getattr(j, k)}
-                    for k in ("title", "job_family", "recruit_type", "department", "apply_url")
-                    if prev[k] != getattr(j, k)
-                }
-                # cities 单独比，不能塞进上面那个推导式：库里存的是 JSON 字符串，
-                # 内存里是 list，直接比永远不等 —— 会把每个岗位都判成城市变了。
-                # 两边都过 _cities() 归一，和指纹同口径。
-                # 这个字段原来不在 diff 里，而指纹里有它（见 _fp）—— 于是
-                # 「只有城市变了」会触发 job_updated 但 diff 是空的，用户收到
-                # 「岗位 XXX 有更新」后面什么都没有。真库里这样的事件有 16 条，
-                # 源站原文里变的字段全是 workCities。见方案 006 问题 1。
-                prev_cities, now_cities = _cities(prev["cities"]), _cities(j.cities)
-                if prev_cities != now_cities:
-                    diff["cities"] = {"from": prev_cities, "to": now_cities}
-                conn.execute(
-                    """UPDATE jobs SET title=?, job_family=?, raw_category=?, cities=?,
-                           raw_location=?, department=?, recruit_type=?, grad_year=?,
-                           apply_url=?, apply_system=?, fingerprint=?, last_seen_at=?,
-                           closed_at=NULL
-                       WHERE id=?""",
+
+        existing = {
+            r["external_id"]: r
+            for r in conn.execute(
+                "SELECT * FROM jobs WHERE source_key=?", (adapter.source_key,)
+            ).fetchall()
+        }
+        seen_ids = {j.external_id for j in jobs}
+
+        # 坑一的守卫：先算消失比例，再决定要不要关闭
+        live_before = {k: v for k, v in existing.items() if v["closed_at"] is None}
+        disappeared = [k for k in live_before if k not in seen_ids]
+        guard = (
+            len(disappeared) >= CLOSE_GUARD_MIN_COUNT
+            and bool(live_before)
+            and (len(disappeared) / len(live_before)) > CLOSE_GUARD_RATIO
+        )
+        stats["guard_tripped"] = guard
+
+        for j in jobs:
+            fp = _fp(j)
+            prev = existing.get(j.external_id)
+            payload = asdict(j)
+            payload.pop("raw_json", None)
+
+            if prev is None:
+                cur = conn.execute(
+                    """INSERT INTO jobs(source_key, external_id, company, title, job_family,
+                           raw_category, cities, raw_location, country, department,
+                           recruit_type, grad_year, apply_url, apply_system, description,
+                           fingerprint, first_seen_at, last_seen_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
-                        j.title, j.job_family, j.raw_category,
-                        json.dumps(j.cities, ensure_ascii=False), j.raw_location,
-                        j.department, j.recruit_type, j.grad_year, j.apply_url,
-                        j.apply_system, fp, ts, prev["id"],
+                        adapter.source_key, j.external_id, adapter.company, j.title,
+                        j.job_family, j.raw_category, json.dumps(j.cities, ensure_ascii=False),
+                        j.raw_location, j.country, j.department, j.recruit_type,
+                        j.grad_year, j.apply_url, j.apply_system, j.description,
+                        fp, ts, ts,
                     ),
                 )
-                stats["updated"] += 1
+                stats["opened"] += 1
                 if not bootstrap:
                     db.add_event(
-                        conn, "job_reopened" if reopened else "job_updated",
-                        source_key=adapter.source_key, company=adapter.company,
-                        job_id=int(prev["id"]), payload={"diff": diff, **payload},
-                        run_id=run_id,
+                        conn, "job_opened", source_key=adapter.source_key,
+                        company=adapter.company, job_id=int(cur.lastrowid),
+                        payload=payload, run_id=run_id,
                     )
             else:
+                reopened = prev["closed_at"] is not None
+                if prev["fingerprint"] != fp or reopened:
+                    diff = {
+                        k: {"from": prev[k], "to": getattr(j, k)}
+                        for k in ("title", "job_family", "recruit_type", "department", "apply_url")
+                        if prev[k] != getattr(j, k)
+                    }
+                    # cities 单独比，不能塞进上面那个推导式：库里存的是 JSON 字符串，
+                    # 内存里是 list，直接比永远不等 —— 会把每个岗位都判成城市变了。
+                    # 两边都过 _cities() 归一，和指纹同口径。
+                    # 这个字段原来不在 diff 里，而指纹里有它（见 _fp）—— 于是
+                    # 「只有城市变了」会触发 job_updated 但 diff 是空的，用户收到
+                    # 「岗位 XXX 有更新」后面什么都没有。真库里这样的事件有 16 条，
+                    # 源站原文里变的字段全是 workCities。见方案 006 问题 1。
+                    prev_cities, now_cities = _cities(prev["cities"]), _cities(j.cities)
+                    if prev_cities != now_cities:
+                        diff["cities"] = {"from": prev_cities, "to": now_cities}
+                    conn.execute(
+                        """UPDATE jobs SET title=?, job_family=?, raw_category=?, cities=?,
+                               raw_location=?, department=?, recruit_type=?, grad_year=?,
+                               apply_url=?, apply_system=?, fingerprint=?, last_seen_at=?,
+                               closed_at=NULL
+                           WHERE id=?""",
+                        (
+                            j.title, j.job_family, j.raw_category,
+                            json.dumps(j.cities, ensure_ascii=False), j.raw_location,
+                            j.department, j.recruit_type, j.grad_year, j.apply_url,
+                            j.apply_system, fp, ts, prev["id"],
+                        ),
+                    )
+                    stats["updated"] += 1
+                    if not bootstrap:
+                        db.add_event(
+                            conn, "job_reopened" if reopened else "job_updated",
+                            source_key=adapter.source_key, company=adapter.company,
+                            job_id=int(prev["id"]), payload={"diff": diff, **payload},
+                            run_id=run_id,
+                        )
+                else:
+                    conn.execute(
+                        "UPDATE jobs SET last_seen_at=? WHERE id=?", (ts, prev["id"])
+                    )
+
+        # 关闭判定
+        if disappeared and not guard:
+            for ext_id in disappeared:
+                prev = existing[ext_id]
                 conn.execute(
-                    "UPDATE jobs SET last_seen_at=? WHERE id=?", (ts, prev["id"])
+                    "UPDATE jobs SET closed_at=?, last_seen_at=last_seen_at WHERE id=?",
+                    (ts, prev["id"]),
                 )
+                stats["closed"] += 1
+                if not bootstrap:
+                    db.add_event(
+                        conn, "job_closed", source_key=adapter.source_key,
+                        company=adapter.company, job_id=int(prev["id"]),
+                        payload={"title": prev["title"]}, run_id=run_id,
+                    )
 
-    # 关闭判定
-    if disappeared and not guard:
-        for ext_id in disappeared:
-            prev = existing[ext_id]
-            conn.execute(
-                "UPDATE jobs SET closed_at=?, last_seen_at=last_seen_at WHERE id=?",
-                (ts, prev["id"]),
-            )
-            stats["closed"] += 1
-            if not bootstrap:
+        # family_first_seen：某公司某岗位族从 0 变非 0，最有价值的信号
+        if not bootstrap:
+            for fam, rtype in _open_families(conn, adapter.company) - families_before:
+                stats["families_first_seen"].append(f"{fam}/{rtype}")
                 db.add_event(
-                    conn, "job_closed", source_key=adapter.source_key,
-                    company=adapter.company, job_id=int(prev["id"]),
-                    payload={"title": prev["title"]}, run_id=run_id,
+                    conn, "family_first_seen", source_key=adapter.source_key,
+                    company=adapter.company,
+                    payload={"job_family": fam, "recruit_type": rtype}, run_id=run_id,
                 )
-
-    # family_first_seen：某公司某岗位族从 0 变非 0，最有价值的信号
-    if not bootstrap:
-        for fam, rtype in _open_families(conn, adapter.company) - families_before:
-            stats["families_first_seen"].append(f"{fam}/{rtype}")
+            if stats["opened"] >= BATCH_THRESHOLD:
+                db.add_event(
+                    conn, "batch_started", source_key=adapter.source_key,
+                    company=adapter.company, payload={"count": stats["opened"]},
+                    run_id=run_id,
+                )
+        else:
             db.add_event(
-                conn, "family_first_seen", source_key=adapter.source_key,
+                conn, "source_bootstrapped", source_key=adapter.source_key,
                 company=adapter.company,
-                payload={"job_family": fam, "recruit_type": rtype}, run_id=run_id,
+                payload={"count": stats["opened"]}, run_id=run_id,
             )
-        if stats["opened"] >= BATCH_THRESHOLD:
-            db.add_event(
-                conn, "batch_started", source_key=adapter.source_key,
-                company=adapter.company, payload={"count": stats["opened"]},
-                run_id=run_id,
-            )
-    else:
-        db.add_event(
-            conn, "source_bootstrapped", source_key=adapter.source_key,
-            company=adapter.company,
-            payload={"count": stats["opened"]}, run_id=run_id,
-        )
 
-    status = "partial" if guard else "ok"
-    err = (
-        f"关闭守卫触发：{len(disappeared)}/{len(live_before)} 个岗位消失，"
-        f"超过阈值 {CLOSE_GUARD_RATIO:.0%}，本轮不执行关闭"
-        if guard else None
-    )
-    if dry_run:
+        status = "partial" if guard else "ok"
+        err = (
+            f"关闭守卫触发：{len(disappeared)}/{len(live_before)} 个岗位消失，"
+            f"超过阈值 {CLOSE_GUARD_RATIO:.0%}，本轮不执行关闭"
+            if guard else None
+        )
+        if dry_run:
+            conn.rollback()
+        else:
+            conn.commit()
+    except Exception as exc:
+        # 业务数据先退，再写痕迹 —— 顺序是硬的：主连接还持着写事务时
+        # 侧连接写 runs 会撞 database is locked。
         conn.rollback()
+        db.finish_run(side, run_id, "failed", 0, str(exc))
+        raise
     else:
-        db.finish_run(conn, run_id, status, len(jobs), err)
-        conn.commit()
+        db.finish_run(side, run_id, status, len(jobs), err)
+    finally:
+        if write:
+            side.close()
     return stats

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -15,15 +16,29 @@ from jobagent.adapters.base import RawJob
 
 
 class FakeAdapter:
-    """可控的假适配器，用来构造 diff 场景。"""
+    """可控的假适配器，用来构造 diff 场景。
+
+    `source_key` / `company` 既是类属性也能按实例覆盖：绝大多数测试只用一个源，
+    读类属性（`FakeAdapter.source_key`）就够；跨源污染那条要两个不同的源，
+    走参数覆盖。
+    """
 
     source_key = "fake_src"
     company = "测试公司"
     system = "self_built"
     entry_url = "https://example.test"
 
-    def __init__(self, jobs: list[RawJob]) -> None:
+    def __init__(
+        self,
+        jobs: list[RawJob],
+        key: str | None = None,
+        company: str | None = None,
+    ) -> None:
         self._jobs = jobs
+        if key is not None:
+            self.source_key = key
+        if company is not None:
+            self.company = company
 
     def fetch(self) -> list[RawJob]:
         return self._jobs
@@ -59,6 +74,15 @@ def conn(tmp_path):
 
 def events_of(conn, kind: str) -> list:
     return conn.execute("SELECT * FROM events WHERE kind=?", (kind,)).fetchall()
+
+
+def _is_closed(c: sqlite3.Connection) -> bool:
+    """sqlite3 没有 `.closed` 属性，只能拿一句无害的查询试出来。"""
+    try:
+        c.execute("SELECT 1")
+    except sqlite3.ProgrammingError as exc:
+        return "closed" in str(exc).lower()
+    return False
 
 
 class TestBootstrap:
@@ -444,3 +468,193 @@ class TestSnapshots:
         ingest.sync(conn, FakeAdapter([make_job("1"), make_job("2")]))
 
         assert conn.execute("SELECT COUNT(*) n FROM snapshots").fetchone()["n"] == 4
+
+
+class TestTransactionBoundary:
+    """一次 sync = 一个事务，崩了整轮退干净，但 `runs` 那行痕迹留下。
+
+    报告里那例 bug 的形状：同一批喂进来两条相同 external_id，撞
+    `UNIQUE(source_key, external_id)`，异常往上抛 —— 而抛之前已经写进去的
+    snapshots / jobs / events 没人回滚，留在库里。下一个源的 `commit()`
+    顺手把它们带进库，于是**失败的那一轮污染了成功的那一轮**。
+
+    收拢的做法是业务数据全部走主连接、只在函数结尾提交一次；`runs` 那行走
+    独立的侧连接自己提交，所以主事务回滚它不跟着退。两半缺一不可，缺哪一半
+    会红哪条测试写在各自的 docstring 里。
+
+    触发器为什么用重复 external_id：它是真实故障（报告里就是这么炸的），
+    而且不用 monkeypatch —— 改 `conn.execute` 会撞
+    `attribute 'execute' is read-only`，而且假造的失败点证明不了真实路径。
+    """
+
+    DUP = "UNIQUE constraint failed"
+
+    def _counts(self, conn) -> dict:
+        return {
+            t: conn.execute(f"SELECT COUNT(*) n FROM {t}").fetchone()["n"]
+            for t in ("jobs", "snapshots", "events")
+        }
+
+    def test_write_loop_error_rolls_back_business_data(self, conn) -> None:
+        """写库循环中途抛异常，这一轮的业务数据一行都不许留。
+
+        只收拢事务这一半就能过。单独钉住是因为它是本方案的主命题：
+        没有它，下面几条都可以靠「异常发生前什么都还没写」假绿。
+        """
+        with pytest.raises(Exception, match=self.DUP):
+            ingest.sync(conn, FakeAdapter([make_job("1"), make_job("2"), make_job("2")]))
+
+        assert self._counts(conn) == {"jobs": 0, "snapshots": 0, "events": 0}
+
+    def test_duplicate_external_id_leaves_no_partial_rows(self, conn) -> None:
+        """复现报告问题 2：库里已经有数据时，崩掉的那轮不许改动它。
+
+        和上一条的区别是这里有基线 —— 「回滚」不能是「清空」。上一条在空库上
+        跑，`DELETE FROM jobs` 也能让它绿。
+        """
+        ingest.sync(conn, FakeAdapter([make_job("1")]))
+        before = self._counts(conn)
+
+        with pytest.raises(Exception, match=self.DUP):
+            ingest.sync(conn, FakeAdapter([make_job("2"), make_job("3"), make_job("3")]))
+
+        assert self._counts(conn) == before
+        # 具体钉住：新岗位一条都没进来，老岗位还在
+        assert [r["external_id"] for r in conn.execute(
+            "SELECT external_id FROM jobs ORDER BY external_id"
+        )] == ["1"]
+
+    def test_failed_source_does_not_leak_into_next(self, conn) -> None:
+        """报告那例 bug 的守门测试：A 源崩了，B 源的 commit 不许把 A 的数据带进库。
+
+        这是「不回滚」最恶劣的表现形式 —— 单独跑 A 会看到异常，单独跑 B 会看到
+        正确结果，只有连着跑才能看到 A 的半截数据混在 B 的事务里落盘。
+        """
+        with pytest.raises(Exception, match=self.DUP):
+            ingest.sync(conn, FakeAdapter([make_job("1"), make_job("2"), make_job("2")],
+                                          key="src_a", company="A公司"))
+
+        st = ingest.sync(conn, FakeAdapter([make_job("10"), make_job("11")],
+                                           key="src_b", company="B公司"))
+
+        # B 自己完整
+        assert (st["fetched"], st["opened"]) == (2, 2)
+        # 三张表里都不许出现 src_a 的行
+        for table in ("jobs", "snapshots"):
+            assert conn.execute(
+                f"SELECT COUNT(*) n FROM {table} WHERE source_key=?", ("src_a",)
+            ).fetchone()["n"] == 0, f"{table} 里混进了失败源的数据"
+        assert conn.execute(
+            "SELECT COUNT(*) n FROM events WHERE source_key=?", ("src_a",)
+        ).fetchone()["n"] == 0
+        # B 是首轮，所以 events 只有一条 source_bootstrapped —— 数量对得上说明
+        # 没有 A 的事件被算进去
+        assert [r["source_key"] for r in conn.execute("SELECT source_key FROM events")] == ["src_b"]
+
+    def test_run_row_survives_write_failure(self, conn) -> None:
+        """业务数据退干净，但 `runs` 那一行**留着** —— 崩过的痕迹是排查的唯一入口。
+
+        **只收拢事务、没上侧连接时这条红**：`runs` 那行也在主连接的事务里，
+        跟着 `rollback()` 一起退掉，库里查不到这轮崩过。业务数据是干净的、
+        报告那例 bug 也确实修好了，代价是排查能力静默退化 ——
+        本仓库 001 §12 那个坑是同一个形状：常见路径全绿。
+        """
+        with pytest.raises(Exception, match=self.DUP):
+            ingest.sync(conn, FakeAdapter([make_job("1"), make_job("2"), make_job("2")]))
+
+        # sources 那行也要留着：runs.source_key 有外键指过去
+        assert conn.execute(
+            "SELECT COUNT(*) n FROM sources WHERE source_key=?", (FakeAdapter.source_key,)
+        ).fetchone()["n"] == 1
+        assert conn.execute("SELECT COUNT(*) n FROM runs").fetchone()["n"] == 1
+
+    def test_write_loop_failure_marks_run_failed_not_running(self, conn) -> None:
+        """崩掉的那轮必须是 `failed` + 有 error，不能停在 `running` + error 为空。
+
+        **照方案 §5 骨架字面实现时这条红**（骨架里 `...` 占位掩盖了一次真实重构：
+        当前代码的 `try` 只包 `fetch()`，写库循环整段在 try 外面）。那个形状下
+        业务数据回滚正确、四条原有路径全对、全量测试也绿，唯独写库循环这条路径上
+        run 停在 `running`。
+
+        上面那条 `test_run_row_survives_write_failure` 抓不到它 —— 那条只断言
+        「行还在」，而这里行确实还在，只是状态不对。
+
+        为什么这一行的状态要紧：`cli status` 每个源只读最近一条 run
+        （`ORDER BY id DESC LIMIT 1`），崩过的一轮会显示成「还在跑」。
+        留痕是为了查得到崩在哪，痕迹里没 error、状态还是 running，
+        等于只说了半句话。
+        """
+        with pytest.raises(Exception, match=self.DUP):
+            ingest.sync(conn, FakeAdapter([make_job("1"), make_job("2"), make_job("2")]))
+
+        run = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+        assert run["status"] == "failed"
+        assert run["error"] and self.DUP in run["error"], "error 得写进去，不然查不到崩在哪"
+        assert run["finished_at"] is not None
+
+    def test_fetch_failure_also_marks_run_failed(self, conn) -> None:
+        """反向对照：源返回空这条路径原来就对，收拢之后不许退化。
+
+        少了它，上一条可以靠「把所有失败都写成 failed」蒙对 —— 而空返回那条
+        路径在重构里被改过（原来是 `finish_run` + `raise`，现在是裸 `raise`，
+        统一由 except 收尾），改坏了得有人喊。
+        """
+        with pytest.raises(RuntimeError, match="拒绝按「全部关闭」处理"):
+            ingest.sync(conn, FakeAdapter([]))
+
+        run = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+        assert run["status"] == "failed"
+        assert "返回 0 条" in run["error"]
+        assert self._counts(conn) == {"jobs": 0, "snapshots": 0, "events": 0}
+
+    def test_repeated_syncs_do_not_leak_connections(self, conn, monkeypatch) -> None:
+        """每一个侧连接都得关掉，**失败路径也算**。常驻进程里不关就是每轮泄一个。
+
+        判据是「开出来的每个侧连接都已关闭」，不是「存活的 Connection 对象数没涨」。
+        后者测不出东西：CPython 靠引用计数，函数栈退掉时那个没人引用的连接会被
+        立刻回收，于是 `side.close()` 只写在 `else` 里（失败路径不关）也能全绿 ——
+        实测过，378 passed。改成盯 `db.connect` 开出来的对象才抓得住。
+
+        `finally` 这个位置是必须的：放在 `else` 里失败路径漏关，放在 `finish_run`
+        之前成功路径会拿到已关闭的连接（`ProgrammingError`）。所以这里成功和
+        失败混着跑。
+        """
+        opened: list[sqlite3.Connection] = []
+        real_connect = db.connect
+
+        def tracking(path, *a, **kw):
+            c = real_connect(path, *a, **kw)
+            opened.append(c)
+            return c
+
+        monkeypatch.setattr(db, "connect", tracking)
+
+        for i in range(9):
+            if i % 3 == 2:
+                # 重复的那一对每轮换新 id：库里已经有的 external_id 走 UPDATE 分支，
+                # 撞不到 UNIQUE —— 复用 "2" 的话这一轮根本不会抛。
+                dup = make_job(f"d{i}")
+                with pytest.raises(Exception, match=self.DUP):
+                    ingest.sync(conn, FakeAdapter([make_job("1"), make_job("2"), dup, dup]))
+            else:
+                ingest.sync(conn, FakeAdapter([make_job("1"), make_job("2")]))
+
+        assert len(opened) == 9, "每轮真跑都该开一个侧连接，开的数量不对说明侧连接没接上"
+        still_open = [i for i, c in enumerate(opened) if not _is_closed(c)]
+        assert still_open == [], f"第 {still_open} 轮的侧连接没关"
+
+    def test_dry_run_opens_no_side_connection(self, conn, monkeypatch) -> None:
+        """dry-run 不许开侧连接 —— 开了就会真提交，`rollback()` 无事可回。
+
+        `_NoCommit` 换成真侧连接时这条红。上面 `TestDryRunWritesNothing` 那几条
+        也会红，但它们说的是「库里多了行」，这条说的是「为什么多」。
+        """
+        calls: list = []
+        real_connect = db.connect
+        monkeypatch.setattr(
+            db, "connect", lambda *a, **kw: (calls.append(a), real_connect(*a, **kw))[1]
+        )
+
+        ingest.sync(conn, FakeAdapter([make_job("1")]), dry_run=True)
+
+        assert calls == [], f"dry-run 开了侧连接：{calls}"
