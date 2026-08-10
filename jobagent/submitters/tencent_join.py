@@ -108,6 +108,7 @@ class TencentJoinSubmitter:
 
         try:
             page.goto(plan.apply_url, timeout=self.timeout)
+            page.wait_for_load_state("networkidle", timeout=self.timeout)
             shot = self._shot(page, job_id, "prepare")
             plan.screenshot_path = shot
 
@@ -115,13 +116,39 @@ class TencentJoinSubmitter:
                 closer()
                 return self._blocked(plan, "岗位已关闭", shot)
 
+            # 先检查登录态，未登录时页面上没有"立即申请"按钮
+            if self._need_login(page):
+                if self.headless:
+                    # 无头模式下无法手动登录，直接报错
+                    closer()
+                    return self._blocked(
+                        plan,
+                        "需要登录。请先用 --no-headless 手动登录一次（配合 user_data_dir "
+                        "持久化），再重新 prepare",
+                        self._shot(page, job_id, "login"),
+                    )
+                else:
+                    # 有头模式下等待用户手动登录，最多等180秒
+                    print("检测到未登录，请在浏览器中完成登录...", flush=True)
+                    try:
+                        page.wait_for_selector("text=立即申请", timeout=180000)
+                        print("登录成功，继续填表", flush=True)
+                    except PlaywrightTimeout:
+                        closer()
+                        return self._blocked(
+                            plan,
+                            "等待登录超时（180秒）",
+                            self._shot(page, job_id, "login_timeout"),
+                        )
+
             apply_btn = page.locator("text=立即申请").first
-            if not apply_btn.is_visible(timeout=5000):
+            if not apply_btn.is_visible(timeout=10000):
                 closer()
                 return self._blocked(plan, "未找到申请按钮，页面结构可能已变", shot)
             apply_btn.click()
             page.wait_for_timeout(2000)
 
+            # 点击后可能还会弹登录框
             if self._need_login(page):
                 closer()
                 return self._blocked(
@@ -379,8 +406,14 @@ class TencentJoinSubmitter:
         return page.locator("text=/已停止|已下线|已结束/").count() > 0
 
     def _need_login(self, page: Page) -> bool:
-        """是否需要登录。登录页特征：扫码登录 / 手机号登录。"""
-        return page.locator("text=/扫码登录|手机号登录|微信登录/").count() > 0
+        """是否需要登录。检测登录相关元素或缺少"立即申请"按钮。"""
+        # 方法1：页面上有明确的登录入口文字
+        if page.locator("text=/扫码登录|手机号登录|微信登录/").count() > 0:
+            return True
+        # 方法2：页面顶部有"登录"按钮且没有"立即申请"按钮
+        has_login_btn = page.locator("button:has-text('登录')").count() > 0
+        has_apply_btn = page.locator("text=立即申请").count() > 0
+        return has_login_btn and not has_apply_btn
 
     def _is_success(self, page: Page) -> bool:
         """提交是否成功。成功文案：申请成功 / 提交成功 / 已提交。"""

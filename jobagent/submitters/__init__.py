@@ -6,9 +6,17 @@
 """
 from ..routing import register_submitter
 from .base import SubmissionResult, Submitter
+from .feishu import FeishuSubmitter
 from .tencent_join import TencentJoinSubmitter
 
 # 键是**招聘系统**，不是公司。自建的系统名就是它自己。
+# 飞书一个类管四个租户（同一套前端），租户由 routing 传进构造函数。
 register_submitter(TencentJoinSubmitter.system, TencentJoinSubmitter)
+register_submitter(FeishuSubmitter.system, FeishuSubmitter)
 
-__all__ = ["Submitter", "SubmissionResult", "TencentJoinSubmitter"]
+__all__ = [
+    "Submitter",
+    "SubmissionResult",
+    "TencentJoinSubmitter",
+    "FeishuSubmitter",
+]

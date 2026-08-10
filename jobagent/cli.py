@@ -26,6 +26,27 @@ FAM_ZH = {
 RTYPE_ZH = {"campus": "应届", "intern": "实习", "social": "社招"}
 
 
+APP_STATUS_ZH = {
+    "prefilled": "填好待确认", "submitted": "已提交", "duplicate": "投过了",
+    "closed": "岗位已关", "failed": "失败", "blocked": "被拦", "abandoned": "已放弃",
+}
+
+# 漏斗的分档。**写死每个状态的归属，不许用「其他」兜底** —— 见
+# docs/plans/012 §6：把 duplicate/closed 混进失败档，会让「代投不好用」
+# 这个结论凭空多出两类本来正常的记录（duplicate 是「已经投过了」、
+# closed 是「岗位关了」，两个都不是错误）。
+# 顺序就是展示顺序，也是这条链路的真实先后。
+APP_FUNNEL = (
+    ("被拦", ("blocked",), "yellow"),
+    ("填好待确认", ("prefilled",), "cyan"),
+    ("已提交", ("submitted",), "green"),
+    ("失败", ("failed",), "red"),
+    ("无需投递", ("duplicate", "closed"), "dim"),
+    ("已放弃", ("abandoned",), "dim"),
+)
+APP_STATUSES = tuple(s for _, ss, _ in APP_FUNNEL for s in ss)
+
+
 def _fmt_cities(cities: list[str]) -> str:
     """diff 里的城市列表转成给人看的一行。
 
@@ -77,7 +98,7 @@ def sync(
             adapter = routing.get_adapter({"source_key": key}, dict(row) if row else None)
         except routing.RouteError as exc:
             console.print(f"[red]采不了[/red] {key}: {exc}")
-            raise typer.Exit(1)
+            continue
         console.print(f"[cyan]同步 {key}[/cyan] ...")
         try:
             st = ingest.sync(conn, adapter, dry_run=dry_run)
@@ -111,6 +132,111 @@ def sync(
                 f"  [bold magenta]★ 新岗位族开放[/bold magenta] "
                 f"{FAM_ZH.get(fam, fam)}/{RTYPE_ZH.get(rt, rt)}"
             )
+
+
+@app.command()
+def refresh_grad_year(
+    source: str = typer.Option(..., help="源 key，例如 tencent_join"),
+    apply: bool = typer.Option(False, "--apply", help="真写库。不带这个 flag 只打印"),
+) -> None:
+    """按适配器当前的推导规则重算存量岗位的届别。
+
+    换季改了 `CURRENT_CAMPUS_YEAR` 之后要跑一次。`grad_year` 不在指纹里，
+    单靠 sync 刷不动存量（会看到「改了代码、updated=0、库里没动」）。
+    """
+    conn = db.connect()
+    db.init(conn)
+    row = conn.execute("SELECT * FROM sources WHERE source_key=?", (source,)).fetchone()
+    try:
+        adapter = routing.get_adapter(
+            {"source_key": source}, dict(row) if row else None
+        )
+    except routing.RouteError as exc:
+        console.print(f"[red]认不出这个源[/red] {source}: {exc}")
+        raise typer.Exit(1)
+
+    try:
+        st = ingest.refresh_grad_year(conn, adapter, apply=apply)
+    except ingest.RefreshUnsupported as exc:
+        console.print(f"[yellow]这个源不需要刷新[/yellow] {source}: {exc}")
+        raise typer.Exit(0)
+
+    if not st["changed"]:
+        console.print(
+            f"[green]届别已是最新[/green] {source} · 查了 {st['examined']} 行，无需改动"
+        )
+    else:
+        verb = "已更新" if apply else "会更新"
+        console.print(
+            f"{verb} [bold]{st['changed']}[/bold] 行 · 查了 {st['examined']} 行"
+            f"（{st['unchanged']} 行本来就对）"
+        )
+        # 报变化明细而不是只报一个总数：「441 行」看不出对不对，
+        # 「'27'→'不限' 348 条」能让人当场判断这次刷新是不是自己想要的。
+        for (old, new), n in sorted(st["transitions"].items(), key=lambda x: -x[1]):
+            console.print(f"    {old!r} → {new!r}   {n} 条")
+        if not apply:
+            console.print("[dim]这是预演，没写库。加 --apply 才真写。[/dim]")
+
+    # 这两条只在真发生时打。都是「该修但这次没修」，不说就等于瞒。
+    if st["skipped_would_null"]:
+        console.print(
+            f"  [yellow]{st['skipped_would_null']} 行跳过[/yellow]"
+            "：重算出来是空值，但库里有值 —— 不拿空值覆盖好值。"
+            "源站大概改了招聘标签的字面量，去核对适配器的推导规则。"
+        )
+    if st["no_snapshot"]:
+        console.print(
+            f"  [yellow]{st['no_snapshot']} 行没有快照[/yellow]"
+            "，重算不了（这些岗位入库时的原文没留下）。"
+        )
+
+
+@app.command()
+def repair_apply_url(
+    source_prefix: str = typer.Option(
+        "feishu", help="源 key 前缀，默认 feishu（四个租户一起修）"
+    ),
+    apply: bool = typer.Option(False, "--apply", help="真写库。不带这个 flag 只打印"),
+) -> None:
+    """给存量飞书 apply_url 补上漏掉的 `/detail` 后缀。
+
+    2026-08-10 实测四个租户：少 `/detail` 的链接全部渲染「您正在寻找的页面不存在」，
+    库里 8594 条飞书链接因此全是死的。`apply_url` 的唯一用途是「点开就是官网
+    那一页」拿去人工核对，链接死了整条筛选链的产出就没法核对。
+
+    为什么不靠 sync 修：`apply_url` 在指纹里，走 sync 会造出 8594 条
+    假 `job_updated` 事件（每条 diff 都是「我们修了个 bug」）。见 plan 010 §7。
+    """
+    conn = db.connect()
+    db.init(conn)
+    st = ingest.repair_apply_url(conn, source_prefix=source_prefix, apply=apply)
+
+    if not st["changed"]:
+        console.print(
+            f"[green]链接形状已是最新[/green] {source_prefix}* · "
+            f"查了 {st['examined']} 行，{st['already_ok']} 行本来就带 /detail"
+        )
+    else:
+        verb = "已修" if apply else "会修"
+        console.print(
+            f"{verb} [bold]{st['changed']}[/bold] 行 · 查了 {st['examined']} 行"
+            f"（{st['already_ok']} 行本来就对）"
+        )
+        if not apply:
+            console.print("[dim]这是预演，没写库。加 --apply 才真写。[/dim]")
+
+    # 「该修但这次没修」的，不说就等于瞒。
+    if st["skipped_unknown_shape"]:
+        console.print(
+            f"  [yellow]{st['skipped_unknown_shape']} 行形状不认识[/yellow]"
+            "：链接里没有 /position/ 段，没按套路拼 —— 保留原值。"
+            "源站大概改版了，去核对适配器的 _position_url()。"
+        )
+    if st["skipped_empty"]:
+        console.print(
+            f"  [yellow]{st['skipped_empty']} 行 apply_url 是空的[/yellow]，没链接可修。"
+        )
 
 
 @app.command()
@@ -316,8 +442,91 @@ def digest(mark: bool = typer.Option(False, "--mark", help="标记为已推送")
         console.print(f"[dim]已标记 {len(shown)} 条事件为已推送[/dim]")
 
 
+def _check_grad_year_staleness(conn) -> None:
+    """检查届别常量是否过期（对比站点自我声明）。
+
+    判据：抓取腾讯站点的 Project_CampusSubtitle，提取届别，和代码常量对比。
+    粒度：source_key × recruit_type 两级（见 plan 008 §6）。
+    """
+    import re
+    import httpx
+    from jobagent.adapters import tencent_join
+
+    console.print("[cyan]届别过期检查[/cyan]")
+
+    # 1. 抓取站点声明的届别
+    try:
+        resp = httpx.get(
+            "https://cdn.multilingualres.hr.tencent.com/campusjoin/V2Index_zh-cn.js",
+            headers={
+                "User-Agent": tencent_join.UA,
+                "Referer": "https://join.qq.com/",
+            },
+            timeout=10,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        match = re.search(r'"Project_CampusSubtitle":"(\d{4})应届生招聘"', resp.text)
+        if not match:
+            console.print("[yellow]警告[/yellow] 无法从站点提取届别声明")
+            return
+        site_year_full = match.group(1)  # "2026"
+        site_year = site_year_full[-2:]   # "26"
+    except Exception as exc:
+        console.print(f"[yellow]警告[/yellow] 抓取站点声明失败: {exc}")
+        return
+
+    # 2. 对比代码常量
+    code_year = tencent_join.CURRENT_CAMPUS_YEAR
+
+    if site_year != code_year:
+        console.print(
+            f"[red]届别过期[/red] 腾讯站点声明 {site_year} 届，"
+            f"代码常量 CURRENT_CAMPUS_YEAR='{code_year}'"
+        )
+        console.print(
+            f"[yellow]建议[/yellow] 更新 jobagent/adapters/tencent_join.py:50 "
+            f"后运行 refresh-grad-year"
+        )
+    else:
+        # 3. 检查库中实际分布（按 source_key × recruit_type 分组）
+        rows = conn.execute("""
+            SELECT source_key, recruit_type, grad_year, COUNT(*) as n
+            FROM jobs
+            WHERE source_key = 'tencent_join'
+              AND closed_at IS NULL
+              AND recruit_type IN ('campus', 'intern')
+            GROUP BY source_key, recruit_type, grad_year
+            ORDER BY source_key, recruit_type, grad_year
+        """).fetchall()
+
+        has_stale = False
+        for row in rows:
+            rt = row["recruit_type"]
+            gy = row["grad_year"]
+            n = row["n"]
+
+            # 校招应该是当届，实习应该是"不限"
+            if rt == "campus" and gy != site_year:
+                console.print(
+                    f"[yellow]警告[/yellow] {rt} 有 {n} 条届别为 '{gy}'，"
+                    f"期望 '{site_year}'"
+                )
+                has_stale = True
+            elif rt == "intern" and gy not in ("不限", None):
+                # 实习允许"不限"或None（未知），但不应该有具体届别
+                console.print(
+                    f"[dim]提示[/dim] {rt} 有 {n} 条届别为 '{gy}'（实习通常为'不限'）"
+                )
+
+        if not has_stale:
+            console.print(f"[green]✓[/green] 届别正常（站点={site_year}，代码={code_year}）")
+
+
 @app.command()
-def status() -> None:
+def status(
+    check_grad_year: bool = typer.Option(False, "--check-grad-year", help="检查届别是否过期"),
+) -> None:
     """看各源的健康度。"""
     conn = db.connect()
     table = Table(title="数据源状态")
@@ -343,6 +552,10 @@ def status() -> None:
             str(r["fetched"]) if r else "-",
         )
     console.print(table)
+
+    if check_grad_year:
+        console.print()
+        _check_grad_year_staleness(conn)
 
 
 @app.command()
@@ -474,6 +687,202 @@ def apply(
         raise typer.Exit(1)
 
 
+@app.command()
+def applications(
+    status: str = typer.Option(None, "--status", help=f"只看某个状态：{'/'.join(APP_STATUSES)}"),
+    source: str = typer.Option(None, "--source", help="只看某个源"),
+    limit: int = typer.Option(30),
+    funnel: bool = typer.Option(False, "--funnel", help="只看分档汇总，不列明细"),
+) -> None:
+    """看投递记录：投了什么、卡在哪、截图在哪。
+
+    只读。**不提供任何改状态的开关**（`--mark-abandoned` 之类都没有）：
+    状态变更必须走 `apply` 的 prepare/execute 两阶段闸门，从一个查看命令里
+    改终态等于给那条硬约束开后门。见 docs/plans/012 §5。
+    """
+    conn = db.connect()
+
+    if status and status not in APP_STATUSES:
+        raise typer.BadParameter(
+            f"不认识的状态 {status!r}，可选：{'/'.join(APP_STATUSES)}"
+        )
+
+    # LEFT JOIN 不是 JOIN：job_id 指向的 jobs 行可能已经不在了（schema 自己写了
+    # external_id 的用途是「jobs 行被重建也能追溯」）。用 INNER JOIN 的话这种
+    # 孤儿行会静默消失，而投递记录消失比岗位消失严重得多 —— 它是不可撤销动作
+    # 的唯一凭证。见 docs/plans/012 §4。
+    #
+    # 排序用 created_at 而不是 submitted_at：后者在 blocked/prefilled 行全是
+    # NULL，拿它排序等于让这些行的顺序变成未定义。
+    sql = """SELECT a.*, j.title AS job_title
+             FROM applications a LEFT JOIN jobs j ON a.job_id = j.id"""
+    where, params = [], []
+    if status:
+        where.append("a.status = ?")
+        params.append(status)
+    if source:
+        where.append("a.source_key = ?")
+        params.append(source)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY a.created_at DESC, a.id DESC"
+    rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    if not rows:
+        what = f"状态 {status} 的" if status else ""
+        console.print(f"[dim]没有{what}投递记录。[/dim]")
+        if not status and not source:
+            console.print("[dim]代投还没跑过，先看 `cli jobs --matched` 挑一个岗位。[/dim]")
+        return
+
+    # 表里出现了分档表没覆盖的状态时显式报出来，不静默归类 —— 静默归类
+    # 就是下一次口径事故。这里用全表算，不受 --status/--source 过滤影响。
+    unknown = {
+        r["status"]
+        for r in conn.execute("SELECT DISTINCT status FROM applications").fetchall()
+    } - set(APP_STATUSES)
+    if unknown:
+        console.print(
+            f"[red]警告：库里有分档表没认的状态 {sorted(unknown)}[/red]"
+            f"[dim] —— 它们不在漏斗里，改 cli.APP_FUNNEL 之后再看这个数[/dim]"
+        )
+
+    if funnel:
+        _render_app_funnel(rows)
+        return
+
+    # 标题必须带上过滤条件：`--status blocked` 打出「投递记录 14 条」时，
+    # 截图/回滚屏幕里看不出这是筛过的，会被当成全表。
+    total = len(rows)
+    filters = []
+    if status:
+        filters.append(f"status={status}")
+    if source:
+        filters.append(f"source={source}")
+    title = f"投递记录 {total} 条"
+    if filters:
+        title += f"（筛选：{'，'.join(filters)}）"
+    if total > limit:
+        title += f"（显示前 {limit}）"
+    table = Table(title=title)
+    # min_width 保 # 和状态两列：窄终端下 rich 会按比例压所有列，这两列一压
+    # 就只剩「…」，而它们是这张表的定位信息（要照着 # 去找截图、照着状态判断
+    # 该不该重投）。宁可挤岗位名。
+    table.add_column("#", style="dim", no_wrap=True, min_width=2)
+    table.add_column("公司", style="cyan", no_wrap=True, min_width=4)
+    # 中日韩字符是双宽，光靠截断字数压不住列宽，要显式给 max_width，
+    # 否则每行会被撑成三四行。
+    # 中日韩字符是双宽，光靠截断字数压不住列宽。而且光给 max_width 不够：
+    # rich 会先按空格断词再套宽度，所以必须同时 no_wrap，才是「一行截断」。
+    table.add_column("岗位", max_width=24, no_wrap=True, overflow="ellipsis")
+    table.add_column("状态", no_wrap=True, min_width=8)
+    table.add_column("时间", style="dim", no_wrap=True, min_width=11)
+    table.add_column("卡在哪 / 备注", no_wrap=True, overflow="ellipsis")
+
+    style_of = {s: c for _, ss, c in APP_FUNNEL for s in ss}
+    for r in rows[:limit]:
+        st = r["status"]
+        color = style_of.get(st, "red")
+        # 岗位行没了就退化成 external_id 并标记，不留空白：空白会被读成
+        # 「这条记录坏了」，而它其实是完好的记录 + 消失的岗位。
+        title = r["job_title"] or f"[dim]<岗位行已不在>[/dim] {r['external_id']}"
+        # blocked 的 error 是给人看的整段建议（最长 60+ 字），只取第一句：
+        # 后面几句是「怎么办」，那属于 --funnel 的输出，不该挤在表格里。
+        note = r["error"] or r["note"] or ""
+        note = note.split("。")[0]
+        # 两个 JSON 列在 blocked 行是 NULL（表单没见到过，无从填起），
+        # 所以是 `or "[]"` 而不是直接 loads —— 直接 loads 会在这些行抛。
+        filled = len(json.loads(r["filled_fields"] or "[]"))
+        skipped = len(json.loads(r["skipped_fields"] or "[]"))
+        if filled or skipped:
+            note = f"填 {filled}/跳 {skipped}" + (f"；{note}" if note else "")
+        table.add_row(
+            str(r["id"]), r["company"] or "-", title,
+            f"[{color}]{APP_STATUS_ZH.get(st, st)}[/{color}]",
+            # 只到「月-日 时:分」：年份对投递记录没有区分度（都是本季），
+            # 省下来的 6 列留给岗位名。完整时间戳在库里，需要就直接查。
+            (r["created_at"] or "")[5:16].replace("T", " "), note,
+        )
+    console.print(table)
+
+    shots = [r for r in rows[:limit] if r["screenshot_path"]]
+    if shots:
+        console.print("[dim]截图存证：[/dim]")
+        for r in shots:
+            console.print(f"  [dim]#{r['id']} {r['screenshot_path']}[/dim]")
+
+
+def _render_app_funnel(rows: list[dict]) -> None:
+    """分档汇总。**报条数，不报成功率** —— 见 docs/plans/012 §7。
+
+    今天是 14 尝试 / 0 提交，成功率算出来是 0%，但那 14 条全部停在登录门，
+    提交逻辑一次都没执行过。0% 的分母里装的全是「还没试到那一步」的记录，
+    等于把「没试」洗成「失败」。`blocked` 是信息不全，不是不命中。
+    """
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+
+    # 尝试数和岗位数必须分开报。实测 14 次尝试只覆盖 7 个岗位（腾讯一个岗位重试
+    # 了 7 次），把 14 读成「14 个岗位试过了」就是翻倍高估覆盖面。
+    jobs_n = len({r["external_id"] for r in rows})
+    table = Table(title=f"投递漏斗（{len(rows)} 次尝试，{jobs_n} 个岗位）")
+    table.add_column("阶段", no_wrap=True)
+    table.add_column("条数", justify="right", no_wrap=True)
+    for label, states, color in APP_FUNNEL:
+        n = sum(counts.get(s, 0) for s in states)
+        style = color if n else "dim"
+        table.add_row(f"[{style}]{label}[/{style}]", f"[{style}]{n}[/{style}]")
+    console.print(table)
+
+    blocked_rows = [r for r in rows if r["status"] == "blocked"]
+    if blocked_rows:
+        console.print(f"\n[yellow]被拦的 {len(blocked_rows)} 条卡在哪：[/yellow]")
+        _render_blocked_reasons(blocked_rows)
+
+# 拦截原因的归类。**认的是 error 文案**，所以它和 011 的届别判据是同一类东西：
+# 换个文案就静默失效。守卫写在下面 —— 认不出的原因**原样打印成独立一行**，
+# 不进「其他」桶。文案变了的表现是列表里多出一行陌生原因，而不是某个数字悄悄
+# 变小。见 docs/plans/012 §6 和 memory 里的 string-level-judgements-need-a-watchdog。
+BLOCK_REASONS = (
+    ("要登录（手机号+验证码，只能你本人做）", ("登录",)),
+    ("找不到投递按钮（页面结构变了）", ("未找到申请按钮", "找不到")),
+)
+
+
+def _render_blocked_reasons(blocked_rows: list[dict]) -> None:
+    buckets: dict[str, list[dict]] = {}
+    for r in blocked_rows:
+        err = r["error"] or ""
+        for label, keys in BLOCK_REASONS:
+            if any(k in err for k in keys):
+                buckets.setdefault(label, []).append(r)
+                break
+        else:
+            # 归不进已知原因就自己成一档，原文当档名（截断只为排版）。
+            buckets.setdefault(f"[dim]未归类：[/dim]{err[:24] or '(error 为空)'}", []).append(r)
+
+    # 带上「最近一次」的时间：原因是历史记录，不都还成立。实测那 4 条
+    # 「找不到投递按钮」比同一岗位的「要登录」更早 —— 说明按钮问题当时已修掉，
+    # 后来那次跑得更远。不写时间的话这两档看起来像并列的两个现存问题。
+    for label, rs in sorted(buckets.items(), key=lambda kv: -len(kv[1])):
+        who = sorted({r["company"] or "-" for r in rs})
+        jobs_n = len({r["external_id"] for r in rs})
+        last = max((r["created_at"] or "") for r in rs)[5:16].replace("T", " ")
+        console.print(
+            f"  {len(rs)} 次 / {jobs_n} 个岗位  {label}"
+            f"  [dim]({'、'.join(who)}；最近 {last})[/dim]"
+        )
+
+    # --user-data-dir 是这句话的重点：不带它登录态不落盘，这次登录白登。
+    # headless 默认就是关的（cli.py 里 apply 的 headless 默认 False），不用加开关。
+    if any("登录" in (r["error"] or "") for r in blocked_rows):
+        console.print(
+            "\n[dim]登录只能你本人做一次，且必须带 --user-data-dir，否则登录态不落盘：\n"
+            "  uv run python -m jobagent.cli apply <external_id> --user-data-dir .browser[/dim]"
+        )
+
+
 def _render_plan(plan: SubmissionPlan, job: dict, form: "profile.FormProfile") -> None:
     """把「即将提交什么」摊开给用户看。
 
@@ -523,6 +932,68 @@ def _render_plan(plan: SubmissionPlan, job: dict, form: "profile.FormProfile") -
     if plan.screenshot_path:
         console.print(f"  [dim]填表后截图: {plan.screenshot_path}[/dim]")
     console.print(f"  [dim]确认有效期 {int((plan.expires_at - plan.created_at) / 60)} 分钟[/dim]")
+
+
+@app.command()
+def checkup(
+    job_id: str = typer.Argument(..., help="拿哪个岗位的表单来体检（external_id）"),
+    source: str = typer.Option(None, help="指定源（默认从 jobs 表推断）"),
+    user_data_dir: str = typer.Option(None, help="浏览器用户数据目录（要有登录态）"),
+) -> None:
+    """核一遍投递表单的判据还认不认页面。**只读，不填不投。**
+
+    为什么需要它：投递器里靠字符串认页面的常量有一打（中文字段名、CSS-modules
+    类名前缀、勾选框旁的文案、下拉选项全称）。它们坏掉的方式全是静默的 ——
+    命中 0 个，然后代投交出一张几乎空的表单加一句「填了 2 个字段」。
+
+    判据写对了不算完，得有一条命令能回答「怎么知道它失效了」。这就是那条命令。
+    改完选择器、或者隔一段时间没投过，跑一次。
+    """
+    conn = db.connect()
+    row = conn.execute("SELECT * FROM jobs WHERE external_id=?", (job_id,)).fetchone()
+    if not row:
+        console.print(f"[red]岗位不存在[/red] {job_id}（先跑 sync）")
+        raise typer.Exit(1)
+    job = dict(row)
+    src = source or job["source_key"]
+
+    src_row = conn.execute("SELECT * FROM sources WHERE source_key=?", (src,)).fetchone()
+    lookup = dict(job)
+    if source:
+        lookup.pop("apply_system", None)
+        lookup["source_key"] = src
+    try:
+        submitter = routing.get_submitter(
+            lookup, dict(src_row) if src_row else None,
+            headless=False, user_data_dir=user_data_dir,
+        )
+    except routing.RouteError as exc:
+        console.print(f"[red]投不了[/red] {exc}")
+        raise typer.Exit(1)
+
+    if not hasattr(submitter, "checkup"):
+        console.print(f"[yellow]{type(submitter).__name__} 还没有体检实现[/yellow]")
+        raise typer.Exit(1)
+
+    console.print("[dim]启动浏览器，走到表单但不填…[/dim]")
+    rows = submitter.checkup(job)
+
+    table = Table(title=f"判据体检 {job['company']}／{job['title']}")
+    table.add_column("判据")
+    table.add_column("")
+    table.add_column("实际")
+    for name, ok, note in rows:
+        table.add_row(name, "[green]OK[/green]" if ok else "[red]坏了[/red]",
+                      note or "")
+    console.print(table)
+
+    bad = [n for n, ok, _ in rows if not ok]
+    if bad:
+        console.print(f"\n[red]{len(bad)} 条判据失效[/red]：{'、'.join(bad)}")
+        console.print("[dim]这些字段代投会静默跳过。改 feishu.py 里对应的常量，"
+                      "改完再跑一次这个命令。[/dim]")
+        raise typer.Exit(1)
+    console.print(f"\n[green]{len(rows)} 条判据全部有效[/green]")
 
 
 def _record_blocked(conn, job: dict, src: str, plan: SubmissionPlan) -> None:

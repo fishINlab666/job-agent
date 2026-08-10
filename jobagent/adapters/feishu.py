@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import httpx
 
-from ..normalize import family_from_title, normalize_city
+from ..normalize import family_from_title, grad_years_from_title, normalize_city
 from .base import RawJob
 
 # UA 门：这个串能过，换掉就是 HTTP 405 + 空 body。**不要简化它。**
@@ -58,6 +58,42 @@ UA = (
 
 # offset 硬上限，防翻页死循环。真实租户最大 2265 条，两万条留足余量。
 MAX_OFFSET = 20000
+
+
+def _grad_year_from_subject(post: dict) -> str | None:
+    """招聘项目名（`job_subject`）→ 届别。**第三条观测通道**（plan 011）。
+
+    这个源的 `grad_year` 那一列确实不存在（4 租户 × 12 门户全量核实过），
+    但届别一直躺在招聘项目名里，从采集第一天起就在 `snapshots.raw_json` 中：
+
+        "2027届校园招聘"                1852 条（bytedance）
+        "2027届校园招聘-技术提前批"      197 条（nio）
+        "27届校园招聘"                    73 条（sensetime）
+
+    2026-08-10 实测覆盖率：bytedance 2073/7368、nio 313/634、
+    sensetime 73/161、xiaopeng **0/431**（小鹏的项目名全是 `None`，
+    它的届别写在标题里，通道二已经覆盖 —— 对它本通道是 0 增量，这是预期不是遗漏）。
+
+    **为什么复用 `grad_years_from_title()` 而不新写解析**：它要求必须出现「届」字，
+    这道门刚好挡住不含届别的项目名 —— `ByteIntern`（2656）、`日常实习`（2438）、
+    `营销暑期实习生招募`（233）、`Shine校园招聘计划`（40）全部返回 `None`。
+    实习岗**不许兜底成「不限」**：腾讯那边实习是「不限」，但那是 projectId 分桶
+    实测出来的（plan 009），这里没有等价证据，编一个「不限」等于把 5295 条实习岗
+    洗成「任何届别都命中」。
+
+    三层嵌套每层都可能是 `None`（小鹏是整个 `job_subject` 为 `None`，
+    商汤有 7 条也是），所以逐层用 `or {}` 兜。
+
+    **这条判据是项目名字符串级的，换季会失效。** 飞书的 `job_subject` 只给
+    `id` + `name`，而 id 是各租户自己的雪花号、跨租户没有稳定语义，没法像腾讯
+    `projectId` 那样分桶（plan 009）。所以只能认字符串，代价是换季要复核。
+    """
+    name = ((post.get("job_subject") or {}).get("name") or {}).get("zh_cn")
+    years = grad_years_from_title(name)
+    # 取第一个：`grad_year` 列是单值。实测 21 个真实取值全部解析成单元素，
+    # 所以当前不会截断；写成显式取首而不是假装它一定单元素 ——
+    # 下个招聘季出现「26/27届」时这里不能静默丢。
+    return years[0] if years else None
 
 
 def _recruit_type(post: dict) -> str | None:
@@ -230,26 +266,47 @@ class FeishuAdapter:
             headers["website-path"] = self.portal
         return headers
 
-    def _position_url(self, post_id: str) -> str:
-        """岗位详情页链接。**门户段是必须的**：`/position/<id>` 是硬 404。
+    @staticmethod
+    def grad_year_from_raw(raw: dict) -> str | None:
+        """从源站原文重算届别，和 fetch 走的是同一条规则（`_grad_year_from_subject`）。
 
-        2026-08-06 实测（nio / xiaopeng / bytedance 三个租户一致）：
+        为什么要单独暴露这个入口：`grad_year` 不在指纹里（见 `ingest._fp`），
+        所以加了这条通道之后 `sync` 不会更新存量岗位 —— 指纹没变就落到
+        「只动 last_seen_at」那条分支。`refresh-grad-year` 靠这个方法重算，
+        输入取 `snapshots.raw_json`，**不联网**。
 
-            /position/<id>          → 404，body 只有 9 字节
-            /campus/position/<id>   → 200
+        **必须是类可取的**（`@staticmethod` 或 `@classmethod`）：
+        `ingest.refresh_grad_year()` 用 `getattr(type(adapter), "grad_year_from_raw", None)`
+        取它。写成实例方法取不到，会被当成「这个源不支持刷新」抛
+        `RefreshUnsupported` —— 那是静默跳过，不是报错。
 
-        不带门户的老源退到 `index`：那个池子的岗位在 `/index/position/<id>`
-        下能开，而 `/position/<id>` 谁都开不了。**这是修 bug，不是加功能**
-        —— 核对库里 4810 条飞书岗位的 `apply_url` 现在全是 404，而
-        `apply_url` 的唯一用途就是「点开就是官网那一页」拿去人工核对。
-
-        没做的那一步写在这儿免得下一个人以为验过了：这些页面是客户端渲染的
-        SPA，**任何 id（含乱填的）都回同一个 200 外壳**，所以「200」只证明
-        路由存在，不证明这个 id 落在这个门户下。详情 XHR 没找到（JS bundle
-        里搜不到 `/api/v*` 路径），因此「校招 id 必须配校招门户前缀」目前
-        **只是按门户构造，没有独立验证**。要验它得跑真浏览器看 network。
+        必须和 fetch 同源。两处各写一遍推导，换季时只改一处就是静默分裂：
+        新抓的岗位一个届别、刷新过的存量另一个届别，而两边都说自己是对的。
         """
-        return f"{self.base}/{self.portal or 'index'}/position/{post_id}"
+        return _grad_year_from_subject(raw)
+
+    def _position_url(self, post_id: str) -> str:
+        """岗位详情页链接。形状是 `/<portal>/position/<id>/detail`。
+
+        2026-08-10 实测（nio / xiaopeng / bytedance / sensetime 四个租户一致），
+        形状从各租户列表页的 `<a href>` 上直接读出来的，不是猜的：
+
+            /position/<id>                  → 渲染「页面不存在」
+            /<portal>/position/<id>         → 渲染「页面不存在」  ← 曾经用的
+            /<portal>/position/<id>/detail  → 渲染岗位正文        ← 现在用的
+
+        **`/detail` 是 2026-08-10 补上的，补之前库里 8594 条飞书链接全是死的。**
+        当初为什么漏：这些页面是客户端渲染的 SPA，**404 发生在渲染层，HTTP 照样
+        200 而且 body 有 200KB**（实测 nio 209298 字节，正文却是「您正在寻找的
+        页面不存在」）。当初的验证只看到 HTTP 状态码就收了。
+
+        教训写在这儿免得下一个人再踩：**对 SPA，「200」不是页面存在的证据，
+        得看渲染后的正文。** 判死活的判据是正文里有没有「页面不存在」。
+
+        不带门户的老源退到 `index`。门户段仍然是必须的 ——
+        `apply_url` 的唯一用途是「点开就是官网那一页」拿去人工核对。
+        """
+        return f"{self.base}/{self.portal or 'index'}/position/{post_id}/detail"
 
     def fetch(self) -> list[RawJob]:
         self.empty_is_authoritative = False
@@ -355,7 +412,10 @@ class FeishuAdapter:
             country="中国",
             department=None,        # 接口只给 department_id，没有名字，不编
             recruit_type=_recruit_type(row),
-            grad_year=None,         # 这个口子没有届别字段，全量核实过
+            # 结构化 grad_year 那一列确实不存在（全量核实过），但届别写在招聘项目名
+            # 里 —— 这是通道三，见 _grad_year_from_subject（plan 011）。
+            # 这里必须和 grad_year_from_raw() 同源，否则新抓的和刷新的会分裂。
+            grad_year=_grad_year_from_subject(row),
             apply_url=self._position_url(post_id),
             apply_system=self.system,
             description=description,

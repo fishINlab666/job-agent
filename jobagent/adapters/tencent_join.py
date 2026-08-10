@@ -37,11 +37,18 @@ FAMILY_MAP = {
 
 FAMILY_LABEL = {2: "技术", 3: "产品", 4: "设计", 5: "市场", 6: "职能", 7: "AI"}
 
-# 届别推导来自站点自身的项目配置（V2Index bundle）：
-#   应届生招聘  毕业时间 2025-01-01 ~ 2026-12-31  → 26 届
-#   实习生招聘  毕业时间 2026-09-01 ~ 2027-12-31  → 27 届
-# 每个招聘季这两个窗口都会变，换季时必须重新核对，别当常量信一年。
-GRAD_WINDOW = {"campus": "26", "intern": "27"}
+# 届别推导：按站点自己的 projectId 分桶（已核实 2026-08-09）
+#   应届桶 {1, 14}             → 26 届（站点当前入口年份）
+#   实习桶 {4, 5, 12, 20}      → 不限（站点实习入口明说「不限毕业时间」）
+#   projectId=2（应届实习）    → 26 届（本地例外：站点对它返回 null，我们按标签推断）
+#   其余                       → None（站点未声明，我们不猜）
+#
+# 站点在 renderProjectMeta 里按 projectId 分派届别声明，这是站点自己的键。
+# 007 用的是 recruitLabelName 字符串匹配，重建站点逻辑，但标签会错分项目：
+# pid=12 的项目名「项目实习生」、标签「日常实习」，字符串匹配认不出它是另一个项目。
+#
+# 每个招聘季入口年份会变，换季时核对 Project_CampusSubtitle（见 plan 008）。
+CURRENT_CAMPUS_YEAR = "26"
 
 
 def _recruit_type(label: str) -> str | None:
@@ -49,6 +56,32 @@ def _recruit_type(label: str) -> str | None:
         return "campus"
     if "实习" in label:
         return "intern"
+    return None
+
+
+def _parse_grad_year(project_id: int | None) -> str | None:
+    """按 projectId 推导届别。用站点自己的分派键，不是重建的标签映射。
+
+    站点语义（核实日期 2026-08-09，renderProjectMeta 函数体）：
+    - 应届桶 {1, 14} → 当届（当前入口年份）
+    - 实习桶 {4, 5, 12, 20} → "不限"（站点实习入口明说「不限毕业时间」）
+    - projectId=2（应届实习）→ 当届（本地例外，见下方注释）
+    - 其余 → None（站点未声明，我们不猜）
+
+    返回值：
+    - "26" / "27" 等具体届别
+    - "不限" 表示知道不限毕业年份（parse_grad_years 会解析成 []，匹配时命中）
+    - None 表示未知（需 --allow-missing 才能看到，带 ? 标记）
+    """
+    if project_id in {1, 14}:           # 应届桶
+        return CURRENT_CAMPUS_YEAR
+    if project_id in {4, 5, 12, 20}:    # 实习桶
+        return "不限"
+    if project_id == 2:                 # 应届实习（本地例外）
+        # 站点 renderProjectMeta 对 pid=2 返回 null，但标签原文是「应届实习」，
+        # 我们推断它跟应届生走。如果它其实是「在读即可」，93 条会漏报（选漏报
+        # 方向：宁可让它对当届可见，也不放宽成不限）。
+        return CURRENT_CAMPUS_YEAR
     return None
 
 
@@ -64,6 +97,22 @@ class TencentJoinAdapter:
     def __init__(self, timeout: float = 20.0, page_size: int = 200) -> None:
         self.timeout = timeout
         self.page_size = page_size
+
+    @staticmethod
+    def grad_year_from_raw(raw: dict) -> str | None:
+        """从源站原文重算届别，和 fetch 走的是同一条规则（`_parse_grad_year`）。
+
+        为什么要单独暴露这个入口：`grad_year` 不在指纹里（见 `ingest._fp`），
+        换季改了 `CURRENT_CAMPUS_YEAR` 之后 `sync` 不会更新存量岗位 ——
+        指纹没变就落到「只动 last_seen_at」那条分支。`refresh-grad-year`
+        靠这个方法重算，输入取 `snapshots.raw_json`，**不联网**。
+
+        必须和 fetch 同源。两处各写一遍推导，换季时只改一处就是静默分裂：
+        新抓的岗位一个届别、刷新过的存量另一个届别，而两边都说自己是对的。
+
+        实测 2026-08-09：805 个共有 id 上，用快照重算与实时 fetch 的结果零分歧。
+        """
+        return _parse_grad_year(raw.get("projectId"))
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -135,7 +184,7 @@ class TencentJoinAdapter:
             country="中国",
             department=(row.get("bgs") or "").strip() or None,
             recruit_type=rtype,
-            grad_year=GRAD_WINDOW.get(rtype),
+            grad_year=_parse_grad_year(row.get("projectId")),
             apply_url=f"https://join.qq.com/post.html?pid={post_id}",
             apply_system="tencent_join",
             description=None,   # 详情要单独打 jobDetails 接口，MVP 先不拉

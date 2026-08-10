@@ -283,14 +283,15 @@ class TestFieldMapping:
         assert jobs[0].department is None, "接口只给 id 没给名字，不编"
 
     def test_apply_url_and_system(self, monkeypatch):
-        """不带门户的老源退到 `index`。**不是 `/position/<id>`** —— 那个是硬 404。
+        """不带门户的老源退到 `index`，且必须带 `/detail` 后缀。
 
-        2026-08-06 实测（nio/xiaopeng/bytedance 一致）：`/position/<id>` 回 404、
-        body 9 字节；`/<portal>/position/<id>` 回 200。老源那批岗位在
-        `/index/position/<id>` 下能开。见 `_position_url()` 的注释。
+        2026-08-10 实测（nio/xiaopeng/bytedance/sensetime 四家一致），形状是从各
+        租户列表页的 `<a href>` 上读出来的：只有 `/<portal>/position/<id>/detail`
+        渲染岗位正文，少 `/detail` 或少门户段都渲染「页面不存在」。
+        见 `_position_url()` 的注释。
         """
         _, jobs = _fetch(monkeypatch, _serve([_body([_post("777")])]))
-        assert jobs[0].apply_url == "https://nio.jobs.feishu.cn/index/position/777"
+        assert jobs[0].apply_url == "https://nio.jobs.feishu.cn/index/position/777/detail"
         assert jobs[0].apply_system == "feishu"
 
     def test_description_joins_requirement(self, monkeypatch):
@@ -514,29 +515,46 @@ class TestPortalSourceKey:
 
 
 class TestApplyUrlCarriesPortal:
-    """`apply_url` 必须带门户段。这是修 bug，不是加功能。
+    """`apply_url` 必须带门户段**和** `/detail` 后缀。这是修 bug，不是加功能。
 
-    2026-08-06 实测（nio / xiaopeng / bytedance 三个租户一致）：
+    2026-08-10 实测（nio / xiaopeng / bytedance / sensetime 四个租户一致），
+    形状从各租户列表页的 `<a href>` 上直接读出来：
 
-        /position/<id>          → 404，body 只有 9 字节
-        /<portal>/position/<id> → 200
+        /position/<id>                  → 渲染「页面不存在」
+        /<portal>/position/<id>         → 渲染「页面不存在」  ← 2026-08-10 前用的
+        /<portal>/position/<id>/detail  → 渲染岗位正文
 
     `apply_url` 的唯一用途就是「点开就是官网那一页」拿去人工核对，
-    而核对库里 4810 条飞书岗位的链接在修之前全是 404。
+    而库里 8594 条飞书岗位的链接在补 `/detail` 之前**全部**打不开。
 
-    这里钉的是**构造形状**，不是归属：页面是 SPA，任何 id 都回同一个 200 外壳，
-    所以「校招 id 配校招门户」这条至今没有独立验证（见 `_position_url()` 注释）。
+    **为什么上一轮验漏了**：页面是 SPA，404 发生在渲染层，HTTP 照样 200 而且
+    body 有 200KB。只看状态码看不出死活，判据得是渲染后的正文里有没有
+    「页面不存在」。
     """
 
     def test_portal_in_path(self, monkeypatch):
         _, jobs = _fetch(monkeypatch, _serve([_body([_campus(post_id="42")])]),
                          portal="campus")
-        assert jobs[0].apply_url == "https://nio.jobs.feishu.cn/campus/position/42"
+        assert jobs[0].apply_url == "https://nio.jobs.feishu.cn/campus/position/42/detail"
+
+    def test_detail_suffix_always_present(self, monkeypatch):
+        """反向用例：谁把 `/detail` 去掉，这条立刻红。
+
+        单独一条而不是并进上面那条，因为这两个段是**两个独立的错法**：
+        门户段管「id 落在哪个门户下」，`/detail` 管「路由到详情页而不是空壳」。
+        少任何一个都是死链，但修法不同。
+        """
+        for portal in ("campus", "edu", None):
+            _, jobs = _fetch(monkeypatch, _serve([_body([_post("777")])]),
+                             portal=portal)
+            assert jobs[0].apply_url.endswith("/position/777/detail"), (
+                f"portal={portal!r} 时少了 /detail 后缀"
+            )
 
     def test_bare_position_path_never_produced(self, monkeypatch):
         """反向用例：谁把门户段去掉图省事，这条立刻红。
 
-        断言的是「不等于那个 404 形状」而不是「等于某个形状」—— 上一条已经钉了
+        断言的是「不等于那个死链形状」而不是「等于某个形状」—— 上面已经钉了
         正形状，这条专门盯住回退。
         """
         for portal in ("campus", "edu", None):
@@ -544,7 +562,7 @@ class TestApplyUrlCarriesPortal:
                              portal=portal)
             assert jobs[0].apply_url != "https://nio.jobs.feishu.cn/position/777"
             assert "/position/777" in jobs[0].apply_url
-            # 门户段就在 /position/ 前面那一节，且不是空的（`//position/` 也是 404）
+            # 门户段就在 /position/ 前面那一节，且不是空的（`//position/` 也是死链）
             prefix = jobs[0].apply_url.split("/position/")[0]
             assert prefix.rsplit("/", 1)[1], f"portal={portal!r} 时门户段是空的"
 
@@ -560,7 +578,7 @@ class TestCustomHost:
     def test_apply_url_uses_custom_host(self, monkeypatch):
         _, jobs = _fetch(monkeypatch, _serve([_body([_campus(post_id="9")])]),
                          tenant="sensetime", portal="edu", host="hr-jobs.sensetime.com")
-        assert jobs[0].apply_url == "https://hr-jobs.sensetime.com/edu/position/9"
+        assert jobs[0].apply_url == "https://hr-jobs.sensetime.com/edu/position/9/detail"
 
     def test_request_goes_to_custom_host(self, monkeypatch):
         seen: list[httpx.Request] = []
@@ -571,7 +589,7 @@ class TestCustomHost:
 
     def test_default_host_unchanged(self, monkeypatch):
         _, jobs = _fetch(monkeypatch, _serve([_body([_post("777")])]))
-        assert jobs[0].apply_url == "https://nio.jobs.feishu.cn/index/position/777"
+        assert jobs[0].apply_url == "https://nio.jobs.feishu.cn/index/position/777/detail"
 
     def test_feishu_host_tenant_must_match(self):
         """飞书自己域名下租户在子域名里，能核对就必须核对。
@@ -584,3 +602,122 @@ class TestCustomHost:
         # 对得上就放过
         assert FeishuAdapter("nio", host="nio.jobs.feishu.cn").base == \
             "https://nio.jobs.feishu.cn"
+
+
+def _subject(name: str | None) -> dict:
+    """招聘项目名的真实嵌套形状：job_subject.name.zh_cn。"""
+    return {"job_subject": {"name": {"zh_cn": name}}}
+
+
+class TestGradYearFromSubject:
+    """届别第三通道：招聘项目名（`job_subject`）。plan 011。
+
+    这个源的 `grad_year` 那一列确实不存在（全量核实过），但届别一直躺在招聘
+    项目名里，从采集第一天起就在 `snapshots.raw_json` 中。kb v3 那句
+    「飞书 0/8594，字段真的不存在」说的是那一列，被误当成了整个数据源的结论。
+
+    2026-08-10 实测覆盖率：bytedance 2073/7368、nio 313/634、
+    sensetime 73/161、xiaopeng 0/431。
+    """
+
+    def test_grad_year_from_job_subject(self, monkeypatch):
+        _, jobs = _fetch(monkeypatch, _serve([_body([
+            _campus(**_subject("2027届校园招聘"))
+        ])]), portal="campus")
+        assert jobs[0].grad_year == "27"
+
+    def test_real_subject_values_all_four_tenants(self):
+        """四租户的真实取值逐个过一遍（值抄自 2026-08-10 全量枚举）。"""
+        from jobagent.adapters.feishu import _grad_year_from_subject as g
+
+        # 带届别的
+        for name in ("2027届校园招聘", "2027届前沿技术领域人才校招",
+                     "2027届Seed大模型人才校招", "2027届校园招聘-技术提前批",
+                     "蔚来2027届实习生招募", "2027届校园招聘-正式批",
+                     "27届校园招聘"):
+            assert g(_subject(name)) == "27", name
+
+        # 不带届别的 —— 必须是 None，见下一条
+        for name in ("ByteIntern", "日常实习", "前沿技术领域人才实习招聘",
+                     "Seed大模型人才实习招聘", "营销暑期实习生招募",
+                     "Shine校园招聘计划", "蔚来AGI超星计划",
+                     "Super Sparks 招聘计划", "实习生",
+                     "「无限原力」顶尖人才计划"):
+            assert g(_subject(name)) is None, name
+
+    def test_intern_subject_yields_none_not_unlimited(self):
+        """实习项目名返回 None（信息不全），**不许兜底成「不限」**。
+
+        腾讯那边实习是「不限」，但那是 projectId 分桶实测出来的（plan 009）。
+        这里没有等价证据，编一个「不限」等于把 5295 条实习岗洗成
+        「任何届别都命中」—— 把不知道说成确定命中，方向最错。
+        """
+        from jobagent.adapters.feishu import _grad_year_from_subject as g
+
+        assert g(_subject("ByteIntern")) is None
+        assert g(_subject("日常实习")) is None
+        # 关键：不是空串也不是「不限」
+        assert g(_subject("日常实习")) != "不限"
+        assert g(_subject("日常实习")) != ""
+
+    def test_job_subject_none_at_every_level(self):
+        """三层嵌套每层都可能是 None，一层都不许崩。
+
+        小鹏 431 条整个 `job_subject` 是 None，商汤有 7 条也是。
+        """
+        from jobagent.adapters.feishu import _grad_year_from_subject as g
+
+        assert g({}) is None                                   # 键都没有
+        assert g({"job_subject": None}) is None                 # 小鹏 / 商汤
+        assert g({"job_subject": {}}) is None
+        assert g({"job_subject": {"name": None}}) is None
+        assert g({"job_subject": {"name": {}}}) is None
+        assert g(_subject(None)) is None                        # zh_cn 是 None
+
+    def test_xiaopeng_shape_yields_none_by_design(self, monkeypatch):
+        """小鹏的项目名全是 None → 本通道 0 增量，这是预期不是遗漏。
+
+        它的届别写在标题里（343 条带「27届」），通道二已经覆盖。
+        """
+        _, jobs = _fetch(monkeypatch, _serve([_body([
+            _campus(**{"job_subject": None})
+        ])]), portal="campus")
+        assert jobs[0].grad_year is None
+
+    def test_fetch_fills_grad_year_from_subject(self, monkeypatch):
+        """**守采集路径**：新采的岗位当场就要带届别，不能只靠 refresh 补。
+
+        这条是「做一半」的守门测试。只写了 `grad_year_from_raw()`、刷了存量、
+        但没接进 `fetch()` 的话：跑 refresh 全绿、库里数字也对，
+        **但下一次 sync 进来的新岗位届别又是 NULL**。而且 `grad_year` 不在指纹里，
+        这些新岗位不会触发任何事件 —— 表现是「数字慢慢退回去」，几周后才发现。
+        """
+        _, jobs = _fetch(monkeypatch, _serve([_body([
+            _campus(**_subject("2027届校园招聘")),
+            _campus(post_id="2", **_subject("日常实习")),
+        ])]), portal="campus")
+
+        assert jobs[0].grad_year == "27", "fetch 没把届别写进去"
+        assert jobs[1].grad_year is None, "不带届别的项目名不该被兜底"
+
+    def test_grad_year_from_raw_is_class_accessible(self):
+        """`grad_year_from_raw` 必须能从**类**上直取，不经实例。
+
+        `ingest.refresh_grad_year()` 用
+        `getattr(type(adapter), "grad_year_from_raw", None)` 取它。
+        写成实例方法取不到 → 被当成「这个源不支持刷新」抛 `RefreshUnsupported`
+        → **静默跳过，不报错**。这条守的是那个失败模式。
+        """
+        assert getattr(FeishuAdapter, "grad_year_from_raw", None) is not None
+        assert FeishuAdapter.grad_year_from_raw(
+            _subject("2027届校园招聘")
+        ) == "27"
+
+    def test_raw_and_fetch_agree(self, monkeypatch):
+        """两条入口必须同源。各写一遍推导 = 换季时静默分裂：
+        新抓的一个届别、刷新过的另一个届别，而两边都说自己是对的。
+        """
+        row = _campus(**_subject("2027届校园招聘-技术提前批"))
+        _, jobs = _fetch(monkeypatch, _serve([_body([row])]), portal="campus")
+
+        assert jobs[0].grad_year == FeishuAdapter.grad_year_from_raw(row)

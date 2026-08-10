@@ -393,9 +393,20 @@ class TestLazyLoad:
         assert r.returncode == 0, r.stderr
 
     def test_not_implemented_message_names_what_is_registered(self):
-        """「还没写」和「没加载」得能分开。所以错误里要带上已注册的列表。"""
-        with pytest.raises(routing.RouteError, match="已注册：tencent_join"):
-            routing.get_submitter({"apply_url": FEISHU_URL})
+        """「还没写」和「没加载」得能分开。所以错误里要带上已注册的列表。
+
+        例子用 mokahr：它在 `ats.VENDORS` 里但还没写代投器。
+        原来用的是 feishu，2026-08-10 飞书代投落地后它不再是「还没写」的例子了
+        （plan 010）。**换例子而不是放宽断言** —— 这条测的是错误信息里到底
+        列不列已注册项，放宽了就测不到了。
+        """
+        moka_url = "https://app.mokahr.com/campus-recruitment/acme/1234"
+        with pytest.raises(routing.RouteError, match="已注册：") as exc:
+            routing.get_submitter({"apply_system": "mokahr", "apply_url": moka_url},
+                                  {"tenant": "acme"})
+        # 列表里得真有已经实现的那些，不是一句空话
+        assert "tencent_join" in str(exc.value)
+        assert "feishu" in str(exc.value)
 
 
 class TestRegistryInvariants:

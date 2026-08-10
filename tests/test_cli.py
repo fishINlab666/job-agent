@@ -1,0 +1,517 @@
+"""CLI 层测试。
+
+这个文件在 refresh-grad-year 之前不存在 —— 之前所有测试都打在函数层。
+加它的理由是本命令的闸门（默认不写库）在 **CLI 参数** 上：`--apply` 这个 flag
+存不存在、默不默认，函数层测不到。函数层的那套不变量在
+`tests/test_ingest.py::TestGradYearRefresh` 里，两边不重复。
+"""
+from __future__ import annotations
+
+import json
+
+import pytest
+from typer.testing import CliRunner
+
+from jobagent import cli, db
+
+runner = CliRunner()
+
+
+@pytest.fixture
+def tmp_db(tmp_path, monkeypatch):
+    """把 CLI 的默认库指到临时文件，并把腾讯这个源登记好。
+
+    CLI 里是 `db.connect()` 不带参数，取的是模块级 `DB_PATH`。不改这个的话
+    测试会打到真库 —— 而本命令是批量写库的，那是不可接受的测试副作用。
+
+    源和 run 必须先建：`jobs.source_key` 和 `snapshots.run_id` 都是外键
+    （后者还是 NOT NULL）。第一版这里直接插 jobs、run_id 传 NULL，
+    六条用例全挂在 FOREIGN KEY constraint failed 上。
+    """
+    path = tmp_path / "t.db"
+    monkeypatch.setattr(db, "DB_PATH", path)
+    conn = db.connect(path)
+    db.init(conn)
+    db.register_source(
+        conn, "tencent_join", "腾讯", "tencent_join", "https://join.qq.com/post.html"
+    )
+    db.start_run(conn, "tencent_join")
+    yield conn
+    conn.close()
+
+
+def seed(conn, ext_id: str, project_id: int, grad_year: str | None) -> None:
+    """造一行腾讯岗位 + 它的快照。
+
+    刷新的输入是 `snapshots.raw_json`，所以两张表都要有 —— 只有 jobs 行时
+    重算不出东西（那种情况本身有一条用例：`test_reports_rows_without_snapshot`）。
+
+    run_id 在这里查而不是由 fixture 传：`sqlite3.Connection` 没有 `__dict__`，
+    挂不上属性（第一版就是那么写的，九条用例全 AttributeError）。
+    """
+    run_id = conn.execute(
+        "SELECT MAX(id) AS id FROM runs WHERE source_key='tencent_join'"
+    ).fetchone()["id"]
+    conn.execute(
+        """INSERT INTO jobs(source_key, external_id, company, title, job_family,
+               cities, recruit_type, grad_year, apply_url, apply_system,
+               fingerprint, first_seen_at, last_seen_at)
+           VALUES('tencent_join',?,'腾讯','产品运营','operations','["深圳"]',
+                  'campus',?,'https://join.qq.com/x','tencent_join','fp',?,?)""",
+        (ext_id, grad_year, db.now(), db.now()),
+    )
+    conn.execute(
+        """INSERT INTO snapshots(run_id, source_key, external_id, fingerprint,
+               raw_json, captured_at)
+           VALUES(?,'tencent_join',?, 'fp', ?, ?)""",
+        (run_id, ext_id, json.dumps({"projectId": project_id}), db.now()),
+    )
+    conn.commit()
+
+
+def gy(conn, ext_id: str) -> str | None:
+    return conn.execute(
+        "SELECT grad_year FROM jobs WHERE external_id=?", (ext_id,)
+    ).fetchone()["grad_year"]
+
+
+class TestRefreshGradYear:
+    """`refresh-grad-year` 的 CLI 形状。函数层不变量见 test_ingest.py。"""
+
+    def test_dry_run_is_the_default(self, tmp_db) -> None:
+        """不带 --apply 不写库。**硬约束**，把 apply 默认改成 True 时红。
+
+        一次改几百行的命令，闸门必须在 API 形状上 —— 而不是靠用户记得
+        先预演一次。
+        """
+        seed(tmp_db, "1", 4, "27")  # pid=4 日常实习 → 不限
+
+        r = runner.invoke(cli.app, ["refresh-grad-year", "--source", "tencent_join"])
+
+        assert r.exit_code == 0, r.output
+        assert gy(tmp_db, "1") == "27", "预演写了库"
+        assert "会更新" in r.output
+        assert "--apply" in r.output, "预演必须告诉用户怎么才能真写"
+
+    def test_apply_writes(self, tmp_db) -> None:
+        """--apply 真写库，且按 009 的规则写。
+
+        断言库里的值，不是 rowcount —— rowcount 只说明走了 UPDATE 分支。
+        """
+        seed(tmp_db, "1", 1, "27")   # pid=1 应届毕业生 → 26
+        seed(tmp_db, "2", 2, "27")   # pid=2 应届实习（本地例外）→ 26
+        seed(tmp_db, "3", 4, "27")   # pid=4 日常实习 → 不限
+
+        r = runner.invoke(
+            cli.app, ["refresh-grad-year", "--source", "tencent_join", "--apply"]
+        )
+
+        assert r.exit_code == 0, r.output
+        assert (gy(tmp_db, "1"), gy(tmp_db, "2"), gy(tmp_db, "3")) == ("26", "26", "不限")
+        assert "已更新" in r.output
+
+    def test_output_reports_transitions_not_just_a_total(self, tmp_db) -> None:
+        """输出要有「从什么改成什么、多少条」。
+
+        只报「改了 N 行」的话用户没法判断这次刷新对不对 —— 441 这个数字
+        本身不携带任何可核对的信息，而 `'27' → '不限' 348 条` 可以当场看出
+        是不是自己想要的那次改动。
+        """
+        seed(tmp_db, "1", 4, "27")   # pid=4 日常实习 → 不限
+        seed(tmp_db, "2", 4, "27")   # pid=4 日常实习 → 不限
+        seed(tmp_db, "3", 1, "27")   # pid=1 应届毕业生 → 26
+
+        r = runner.invoke(cli.app, ["refresh-grad-year", "--source", "tencent_join"])
+
+        assert "'27'" in r.output and "'不限'" in r.output and "'26'" in r.output
+        assert "2 条" in r.output and "1 条" in r.output
+
+    def test_idempotent_second_run_says_nothing_to_do(self, tmp_db) -> None:
+        """跑第二次报「已是最新」，不是报「改了 0 行」那种含糊话。"""
+        seed(tmp_db, "1", 4, "27")   # pid=4 日常实习 → 不限
+
+        runner.invoke(cli.app, ["refresh-grad-year", "--source", "tencent_join", "--apply"])
+        r = runner.invoke(cli.app, ["refresh-grad-year", "--source", "tencent_join", "--apply"])
+
+        assert r.exit_code == 0
+        assert "已是最新" in r.output
+        assert gy(tmp_db, "1") == "不限"
+
+    def test_reports_skipped_would_null(self, tmp_db) -> None:
+        """重算掉成空值时，跳过并**明说**。
+
+        静默保留旧值和静默覆盖一样坏：两者都让人看不出源站已经改了标签。
+        这条断言的是「有没有说」，方向性守卫本身在 test_ingest.py 里。
+        """
+        seed(tmp_db, "1", 999, "不限")   # pid=999 认不出 → None，但库里有值
+
+        r = runner.invoke(
+            cli.app, ["refresh-grad-year", "--source", "tencent_join", "--apply"]
+        )
+
+        assert gy(tmp_db, "1") == "不限"
+        assert "跳过" in r.output
+        assert "不拿空值覆盖好值" in r.output
+
+    def test_reports_rows_without_snapshot(self, tmp_db) -> None:
+        """没有快照的行重算不了，要报出来而不是当成「本来就对」。"""
+        # 只插 jobs 行，故意不给它快照
+        tmp_db.execute(
+            """INSERT INTO jobs(source_key, external_id, company, title, job_family,
+                   cities, recruit_type, grad_year, apply_url, apply_system,
+                   fingerprint, first_seen_at, last_seen_at)
+               VALUES('tencent_join','9','腾讯','产品运营','operations','["深圳"]',
+                      'campus','27','https://join.qq.com/x','tencent_join','fp',?,?)""",
+            (db.now(), db.now()),
+        )
+        tmp_db.commit()
+
+        r = runner.invoke(cli.app, ["refresh-grad-year", "--source", "tencent_join"])
+
+        assert r.exit_code == 0
+        assert "没有快照" in r.output
+
+    def test_unsupported_source_exits_zero_with_explanation(
+        self, tmp_db, monkeypatch
+    ) -> None:
+        """源站本来就没有届别通道时，说清楚并正常退出。
+
+        「没得刷」和「认不出这个源」是两件事，退出码必须分开：前者 0，后者 1
+        （下一条守后者）。用非零退出码表达「没得刷」会让脚本以为刷新失败了。
+
+        **这个场景现在得用假适配器构造。** 2026-08-10 之前它是拿飞书当例子的
+        —— 飞书那时确实没有届别通道。plan 011 给飞书加了 `job_subject` 通道
+        （`grad_year_from_raw`），两个真实适配器现在都支持刷新了，
+        所以这条分支只剩「将来新增的源」会走。留着它是因为那条分支还在，
+        而它静默跳过的后果（被当成不支持刷新）比报错难查。
+        """
+
+        class NoGradYearAdapter:
+            """没有 grad_year_from_raw 的适配器 —— 将来新增源的最小形状。"""
+
+            source_key = "feishu:nio:campus"
+
+            def fetch(self):
+                return []
+
+        monkeypatch.setattr(
+            cli.routing, "get_adapter", lambda *a, **k: NoGradYearAdapter()
+        )
+        tmp_db.execute(
+            """INSERT INTO sources(source_key, company, system, entry_url, enabled, tenant)
+               VALUES('feishu:nio:campus','蔚来','feishu',
+                      'https://nio.jobs.feishu.cn',1,'nio')"""
+        )
+        tmp_db.commit()
+
+        r = runner.invoke(
+            cli.app, ["refresh-grad-year", "--source", "feishu:nio:campus"]
+        )
+
+        assert r.exit_code == 0, r.output
+        assert "不需要刷新" in r.output
+
+    def test_feishu_now_supports_refresh(self, tmp_db) -> None:
+        """反向用例：飞书**有**届别通道了，不许再走「不需要刷新」那条路。
+
+        plan 011 加了 `job_subject` 通道。谁哪天把 `grad_year_from_raw` 从
+        FeishuAdapter 上删掉（或改成实例方法），这条会红 —— 而如果只靠上一条
+        用例，删掉之后它反而变绿，通道没了却没人知道。
+        """
+        from jobagent.adapters.feishu import FeishuAdapter
+
+        assert getattr(FeishuAdapter, "grad_year_from_raw", None) is not None
+        # 类上直取，不经实例 —— refresh_grad_year 就是这么取的
+        assert FeishuAdapter.grad_year_from_raw(
+            {"job_subject": {"name": {"zh_cn": "2027届校园招聘"}}}
+        ) == "27"
+
+    def test_unknown_source_fails_loudly(self, tmp_db) -> None:
+        """认不出的源用非零退出码 —— 这个是真的错，不能和上一条混。"""
+        r = runner.invoke(cli.app, ["refresh-grad-year", "--source", "no_such_src"])
+
+        assert r.exit_code == 1
+        assert "认不出这个源" in r.output
+
+    def test_source_is_required(self, tmp_db) -> None:
+        """不许省略 --source。
+
+        默认 all 会让「刷新腾讯」这个动作在不知不觉中扫过所有源。
+        这条命令是批量写库的，作用域必须由调用方明确说出来。
+        """
+        r = runner.invoke(cli.app, ["refresh-grad-year"])
+
+        assert r.exit_code != 0
+
+
+def app_row(
+    conn,
+    *,
+    ext_id: str = "j1",
+    status: str = "blocked",
+    job_id: int | None = None,
+    orphan: bool = False,
+    error: str | None = None,
+    company: str = "腾讯",
+    created_at: str | None = None,
+    filled: str | None = None,
+    skipped: str | None = None,
+    submitted_at: str | None = None,
+) -> int:
+    """直接插一行 applications。
+
+    不走 db.record_blocked 是故意的：本测试要造 record_* 造不出来的形状
+    （孤儿行、第 8 个状态、乱序 created_at），那些正是渲染层会出错的地方。
+
+    默认会顺手建一条对应的 jobs 行（正常形状）。`orphan=True` 才造孤儿行，
+    **而造孤儿需要临时关掉 FK**：`job_id` 上有 `REFERENCES jobs(id)`，而
+    `db.connect()` 会 `PRAGMA foreign_keys=ON`，所以正常情况下孤儿行根本
+    插不进来（这是好事）。关掉 FK 插进去，模拟的是**唯一真能产生孤儿的路径**：
+    有人手工修库 / 从备份恢复时把 jobs 重建了一遍。见 012 §4 的更正。
+    """
+    if orphan:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        job_id = 99999
+    elif job_id is None:
+        # 同一个 ext_id 重复调用要复用同一条 jobs 行 —— 「一个岗位被投了多次」
+        # 是真实形状（腾讯那个岗位重试了 7 次），不是异常。
+        row = conn.execute(
+            "SELECT id FROM jobs WHERE source_key='tencent_join' AND external_id=?",
+            (ext_id,),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """INSERT INTO jobs(source_key, external_id, company, title,
+                       fingerprint, first_seen_at, last_seen_at)
+                   VALUES('tencent_join',?,?,?,?,?,?)""",
+                (ext_id, company, f"岗位-{ext_id}", f"fp-{ext_id}",
+                 db.now(), db.now()),
+            )
+            row = conn.execute(
+                "SELECT id FROM jobs WHERE source_key='tencent_join' AND external_id=?",
+                (ext_id,),
+            ).fetchone()
+        job_id = int(row["id"])
+    cur = conn.execute(
+        """INSERT INTO applications(
+               job_id, source_key, external_id, company, status, error,
+               filled_fields, skipped_fields, submitted_at, created_at)
+           VALUES(?,'tencent_join',?,?,?,?,?,?,?,?)""",
+        (
+            job_id,
+            ext_id, company, status, error, filled, skipped,
+            submitted_at, created_at or db.now(),
+        ),
+    )
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=ON")  # 只关这一次插入，别泄漏到别的用例
+    return int(cur.lastrowid)
+
+
+def job_id_of(conn, ext_id: str) -> int:
+    return conn.execute(
+        "SELECT id FROM jobs WHERE external_id=?", (ext_id,)
+    ).fetchone()["id"]
+
+
+class TestApplications:
+    """`applications` 的 CLI 形状。方案见 docs/plans/012。
+
+    这条命令是只读的，所以这里测的全是「读出来的东西对不对」，
+    重点在两处渲染层的坑：孤儿行会不会消失、NULL 的 JSON 列会不会炸。
+    """
+
+    def test_lists_rows(self, tmp_db) -> None:
+        seed(tmp_db, "j1", 100, "2026")
+        app_row(tmp_db, job_id=job_id_of(tmp_db, "j1"), error="需要登录")
+
+        r = runner.invoke(cli.app, ["applications"])
+
+        assert r.exit_code == 0
+        assert "投递记录 1 条" in r.output
+        assert "被拦" in r.output
+
+    def test_empty_says_so(self, tmp_db) -> None:
+        """空表要明说「没有」，不是打一张空表框。"""
+        r = runner.invoke(cli.app, ["applications"])
+
+        assert r.exit_code == 0
+        assert "没有" in r.output
+
+    def test_orphan_application_still_listed(self, tmp_db) -> None:
+        """孤儿行照样出现。**这条是「做一半会红」的那条。**
+
+        把 LEFT JOIN 写成 JOIN 时，正常数据全绿，只有这条静默消失 ——
+        而投递记录消失比岗位消失严重得多：它是不可撤销动作的唯一凭证。
+        """
+        seed(tmp_db, "j1", 100, "2026")
+        app_row(tmp_db, ext_id="j1", job_id=job_id_of(tmp_db, "j1"))
+        app_row(tmp_db, ext_id="gone-job", orphan=True)  # jobs 里没有这行
+
+        r = runner.invoke(cli.app, ["applications"])
+
+        assert r.exit_code == 0
+        assert "投递记录 2 条" in r.output, "孤儿行被 JOIN 吃掉了"
+
+    def test_orphan_shows_external_id(self, tmp_db) -> None:
+        """孤儿行的标题退化成 external_id，不是空白也不是 None。
+
+        空白会被读成「这条记录坏了」，而它其实是完好的记录 + 消失的岗位。
+        """
+        app_row(tmp_db, ext_id="gone-job", orphan=True)
+
+        r = runner.invoke(cli.app, ["applications"])
+
+        assert "None" not in r.output
+        # 表格会按列宽截断，所以只断言前缀能看见
+        assert "gone-job" in r.output or "岗位行已不在" in r.output
+
+    def test_null_json_columns_render(self, tmp_db) -> None:
+        """filled_fields / skipped_fields 是 NULL 时不炸。
+
+        blocked 行这两列必然是 NULL（表单根本没见到过，无从填起），
+        直接 json.loads(None) 会抛 TypeError。
+        """
+        app_row(tmp_db, status="blocked", filled=None, skipped=None)
+
+        r = runner.invoke(cli.app, ["applications"])
+
+        assert r.exit_code == 0, r.output
+        assert r.exception is None
+
+    def test_ordering_uses_created_at(self, tmp_db) -> None:
+        """按 created_at 倒序，不是 submitted_at。
+
+        submitted_at 在 blocked/prefilled 行全是 NULL，拿它排序等于让这些行
+        的顺序变成未定义。这里故意让「早创建的那条有 submitted_at」，
+        用 submitted_at 排序就会把它排到前面。
+        """
+        app_row(tmp_db, ext_id="older", created_at="2026-08-01T00:00:00+08:00",
+                status="submitted", submitted_at="2026-08-09T23:00:00+08:00")
+        app_row(tmp_db, ext_id="newer", created_at="2026-08-09T00:00:00+08:00")
+
+        r = runner.invoke(cli.app, ["applications"])
+
+        assert r.output.index("newer") < r.output.index("older"), \
+            "排序用了 submitted_at"
+
+    def test_funnel_buckets_all_statuses(self, tmp_db) -> None:
+        """7 个状态各自归到正确的档，尤其 duplicate/closed 不算失败。
+
+        把它们混进失败档会让「代投不好用」这个结论凭空多出两类本来正常的
+        记录：duplicate 是「已经投过了」，closed 是「岗位关了」。
+        """
+        for st in cli.APP_STATUSES:
+            app_row(tmp_db, ext_id=f"j-{st}", status=st)
+
+        r = runner.invoke(cli.app, ["applications", "--funnel"])
+
+        assert r.exit_code == 0, r.output
+        assert "警告" not in r.output, "7 个已知状态不该触发未知告警"
+        # 失败档只该有 failed 那 1 条；duplicate+closed 归在无需投递（2 条）
+        lines = [ln for ln in r.output.splitlines() if "失败" in ln]
+        assert lines and "1" in lines[0], lines
+        no_need = [ln for ln in r.output.splitlines() if "无需投递" in ln]
+        assert no_need and "2" in no_need[0], no_need
+
+    def test_unknown_status_is_surfaced(self, tmp_db) -> None:
+        """库里出现第 8 个状态时显式报出。**这条是「做一半会红」的那条。**
+
+        静默归进「其他」桶的话，这个 weird 状态会被算进某一档，测试照样全绿,
+        而口径已经错了。见 012 §6：静默归类就是下一次口径事故。
+        """
+        app_row(tmp_db, status="weird_new_status")
+
+        r = runner.invoke(cli.app, ["applications", "--funnel"])
+
+        assert r.exit_code == 0, r.output
+        assert "警告" in r.output
+        assert "weird_new_status" in r.output
+
+    def test_bad_status_option_lists_choices(self, tmp_db) -> None:
+        """不认识的 --status 要报错并列出可选值，不能给一张空表。
+
+        空表会被读成「确实没有这个状态的记录」，而真相是参数拼错了。
+        """
+        r = runner.invoke(cli.app, ["applications", "--status", "nonsense"])
+
+        assert r.exit_code != 0
+        assert "blocked" in r.output, "报错信息里没列可选值"
+
+    def test_funnel_has_no_percentage(self, tmp_db) -> None:
+        """--funnel 不输出百分比。见 012 §7。
+
+        今天是 14 尝试 / 0 提交，成功率算出来 0%，但那些记录全部停在登录门，
+        提交逻辑一次都没执行过 —— 0% 的分母里装的全是「还没试到那一步」。
+        blocked 是信息不全，不是不命中。
+        """
+        app_row(tmp_db, status="blocked", error="需要登录")
+        app_row(tmp_db, status="blocked", error="未找到申请按钮，页面结构可能已变")
+
+        r = runner.invoke(cli.app, ["applications", "--funnel"])
+
+        assert "%" not in r.output, "漏斗里出现了比率"
+
+    def test_funnel_groups_blocked_reasons(self, tmp_db) -> None:
+        """被拦的原因要分开报，别把不同原因混成一个数。
+
+        实测 14 条 blocked 里 10 条是登录门、4 条是找不到投递按钮，
+        后者比同一岗位的登录记录更早（说明当时已修掉）。混成一个数会让
+        「卡在登录」被高估，也看不出哪个原因还活着。
+        """
+        for _ in range(3):
+            app_row(tmp_db, status="blocked", error="需要登录 腾讯 的招聘账号。")
+        app_row(tmp_db, status="blocked", error="未找到申请按钮，页面结构可能已变")
+
+        r = runner.invoke(cli.app, ["applications", "--funnel"])
+
+        assert "要登录" in r.output
+        assert "找不到投递按钮" in r.output
+        reason_lines = [ln for ln in r.output.splitlines() if "要登录" in ln]
+        assert reason_lines and "3" in reason_lines[0], reason_lines
+
+    def test_funnel_separates_attempts_from_jobs(self, tmp_db) -> None:
+        """尝试次数和岗位数要分开报。
+
+        实测 14 次尝试只覆盖 7 个岗位（腾讯一个岗位重试了 7 次）。
+        把 14 读成「14 个岗位试过了」是翻倍高估覆盖面。
+        """
+        for _ in range(3):
+            app_row(tmp_db, ext_id="same-job", status="blocked", error="需要登录")
+
+        r = runner.invoke(cli.app, ["applications", "--funnel"])
+
+        assert "3 次尝试" in r.output
+        assert "1 个岗位" in r.output
+
+    def test_no_status_mutation_flags(self, tmp_db) -> None:
+        """这条命令不许有改状态的开关。见 012 §5/§8。
+
+        状态变更必须走 apply 的 prepare/execute 两阶段闸门（001 定的硬约束），
+        从一个查看命令里改终态等于给那条闸门开后门。
+        """
+        # 只看 typer 真正注册的参数名，不看 --help 的正文：docstring 里就写着
+        # 「`--mark-abandoned` 之类都没有」，扫全文会被自己的说明文字骗到。
+        params = {
+            opt
+            for c in cli.app.registered_commands
+            if c.callback.__name__ == "applications"
+            for p in c.callback.__annotations__
+            for opt in (f"--{p.replace('_', '-')}",)
+        }
+        for flag in ("--mark", "--retry", "--delete", "--submit", "--abandon"):
+            assert not any(p.startswith(flag) for p in params), f"{flag} 不该存在"
+
+    def test_filtered_title_says_it_is_filtered(self, tmp_db) -> None:
+        """筛过的表要在标题里写明筛了什么。
+
+        `--status blocked` 打出「投递记录 14 条」时，截图里看不出这是筛过的，
+        会被当成全表读 —— 那就是凭空少了一批记录。
+        """
+        app_row(tmp_db, ext_id="a", status="blocked")
+        app_row(tmp_db, ext_id="b", status="abandoned")
+
+        r = runner.invoke(cli.app, ["applications", "--status", "blocked"])
+
+        assert "投递记录 1 条" in r.output
+        assert "筛选" in r.output and "status=blocked" in r.output

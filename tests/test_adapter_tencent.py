@@ -44,6 +44,7 @@ def _position(post_id: str = "1", title: str = "后端开发工程师", **over) 
         "workCities": "深圳",
         "categoryName": "技术",
         "positionFamily": 40001,
+        "projectId": 1,  # 默认应届桶
         "recruitLabelName": "应届毕业生",
         "bgs": "腾讯云与智慧产业事业群",
     }
@@ -83,7 +84,7 @@ def _fetch(monkeypatch, handler) -> tuple:
 
 
 class TestRecruitType:
-    """recruit_type 和 grad_year：认不出的标签写 None，不兜底。
+    """recruit_type 和 grad_year：认不出的标签/projectId 写 None，不兜底。
 
     飞书那边 `test_adapter_feishu.py:410` 的 docstring 原话：
     > 认不出的 parent 写 None。谁加 `or "social"` 兜底，这条红。
@@ -93,19 +94,20 @@ class TestRecruitType:
     只是没人给腾讯写这条测试。现在补齐。
     """
 
-    def test_known_labels_still_work(self, monkeypatch):
-        """已知的标签（应届毕业生/实习）仍然正确识别。
+    def test_known_project_ids_still_work(self, monkeypatch):
+        """已知的 projectId 正确识别届别。
 
-        这是反向用例：防止改成「无条件返回 None」时绿灯。
+        应届桶（pid=1, 14）→ 26（当前入口年份）
+        实习桶（pid=4, 5, 12, 20）→ "不限"（在读即可）
         """
-        campus_pos = _position("1", recruitLabelName="应届毕业生")
-        intern_pos = _position("2", recruitLabelName="实习")
+        campus_pos = _position("1", projectId=1, recruitLabelName="应届毕业生")
+        intern_pos = _position("2", projectId=20, recruitLabelName="实习生 青云计划")
         _, jobs = _fetch(monkeypatch, _serve([_body([campus_pos, intern_pos])]))
         assert len(jobs) == 2
         assert jobs[0].recruit_type == "campus"
         assert jobs[0].grad_year == "26"
         assert jobs[1].recruit_type == "intern"
-        assert jobs[1].grad_year == "27"
+        assert jobs[1].grad_year == "不限"
 
     def test_unknown_label_returns_none(self, monkeypatch):
         """认不出的标签不兜底成 campus。谁加 `return "campus"` 兜底，这条红。
@@ -114,21 +116,34 @@ class TestRecruitType:
         那时候「静默按应届处理」会把一整批岗位标错，而 None 是能被发现的信号
         （填充率报告里 recruit_type 会掉下来）。
         """
-        row = _position(recruitLabelName="外星人招聘")
+        row = _position(projectId=1, recruitLabelName="外星人招聘")
         _, jobs = _fetch(monkeypatch, _serve([_body([row])]))
         assert jobs[0].recruit_type is None
 
-    def test_unknown_type_grad_year_none(self, monkeypatch):
-        """认不出 recruit_type 时，grad_year 也是 None。
+    def test_unknown_project_id_returns_none(self, monkeypatch):
+        """认不出的 projectId 不兜底。谁加 `return "26"` 兜底，这条红。
 
-        这条是回归锁：`GRAD_WINDOW.get(rtype)` 已经满足这个行为，
-        不需要额外的 `if rtype in GRAD_WINDOW`。
-        谁把 `.get` 改成 `[rtype]` 或者加兜底 `.get(rtype, "26")`，这条红。
+        站点今天有 6 个 projectId（1, 2, 4, 5, 14, 20），pid=2 是本地例外。
+        冒出第七个说明站点加了新项目，那时候静默兜底会把一整批岗位标错，
+        而 None 是能被发现的信号（填充率报告里 grad_year 会掉下来）。
         """
-        row = _position(recruitLabelName="博士后")
+        row = _position(projectId=999, recruitLabelName="博士后")
         _, jobs = _fetch(monkeypatch, _serve([_body([row])]))
         assert jobs[0].recruit_type is None
         assert jobs[0].grad_year is None
+
+    def test_pid_2_is_local_exception_returns_campus_year(self, monkeypatch):
+        """应届实习（projectId=2）站点返回 null，我们按标签推断是应届。
+
+        站点 renderProjectMeta 对 pid=2 返回 null（不在应届桶也不在实习桶），
+        但标签原文是「应届实习」，我们推断它跟应届生走。这是唯一一处本地例外。
+        如果它其实是「在读即可」，93 条会漏报（选漏报方向：宁可让它对当届可见，
+        也不放宽成不限）。详见 009 §3。
+        """
+        row = _position(projectId=2, recruitLabelName="应届实习")
+        _, jobs = _fetch(monkeypatch, _serve([_body([row])]))
+        assert jobs[0].recruit_type == "intern"
+        assert jobs[0].grad_year == "26"
 
 
 class TestPagingTruncation:

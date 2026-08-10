@@ -63,6 +63,182 @@ def _fp(job: RawJob) -> str:
     )
 
 
+class RefreshUnsupported(RuntimeError):
+    """这个源的适配器没有重算届别的规则。
+
+    和「刷新失败」分开：飞书四家 8594 条 `grad_year` 全是 NULL，因为源站
+    没有这个字段 —— 那不是坏了，是没有可重算的东西。混成一个错会让调用方
+    以为要去修飞书适配器。
+    """
+
+
+def refresh_grad_year(conn, adapter, *, apply: bool = False) -> dict:
+    """按适配器当前的推导规则，重算存量岗位的 `grad_year`。
+
+    为什么需要这条命令：`grad_year` 不在 `_fp()` 里（上面那个函数），所以
+    换季改了常量之后 `sync` 不更新存量 —— 指纹没变就走「只动 last_seen_at」
+    那条分支。实测 2026-08-09 真库：807 行里 804 行会被静默跳过，只有 1 行
+    因为别的字段也变了而搭上便车。表现是「改了代码、sync 说 updated=0、
+    库里没动」，而那 1 行会让人以为生效了。
+
+    输入取 `snapshots.raw_json` 的最新一条，**不联网**。快照是已经落库的原始
+    观测，用它重算就不必信任「现在的源站和当初抓的是同一批岗位」——
+    已下架的岗位在源站上取不到，但它的届别照样该修对。
+
+    三条硬约束（各有一条测试守着，见 tests/test_cli.py）：
+
+    1. **只写 `grad_year` 一列，不碰 `fingerprint`。** 顺手重算指纹会让全部
+       9401 行的哈希都变（实测：加一个键就全不等），造出 9401 条 diff 为空的
+       假 `job_updated` —— 那是 plan 006 问题 1 的同型放大。
+    2. **幂等。** 值相同的行不进 UPDATE，跑第二次报 0。
+    3. **有值不许被静默改成 NULL。** 源站改了 `recruitLabelName` 的字面量时，
+       重算会掉成 `None`；此时保留旧值并计入 `skipped_would_null` 报出来。
+       `ingest.py` 开头写着「宁可漏报，不可误报」，静默把 807 个好值抹成 NULL
+       是反方向。这条是本函数唯一一处「明知新值却不写」的地方。
+    """
+    recompute = getattr(type(adapter), "grad_year_from_raw", None)
+    if recompute is None:
+        raise RefreshUnsupported(
+            f"{type(adapter).__name__} 没有 grad_year_from_raw()，"
+            f"这个源的届别不是推导出来的（源站没有这个字段），没有可重算的东西"
+        )
+
+    src = adapter.source_key
+    # 每个 external_id 取最新一条快照。id 自增单调，所以 MAX(id) 就是最新。
+    # 不按 captured_at：同一轮里所有快照共用一个 ts，比不出先后。
+    snaps = {
+        r["external_id"]: r["raw_json"]
+        for r in conn.execute(
+            """SELECT s.external_id, s.raw_json FROM snapshots s
+               JOIN (SELECT external_id, MAX(id) AS mid FROM snapshots
+                     WHERE source_key=? GROUP BY external_id) t
+                 ON s.id = t.mid""",
+            (src,),
+        )
+    }
+
+    stats = {
+        "source": src,
+        "examined": 0,
+        "changed": 0,
+        "unchanged": 0,
+        "no_snapshot": 0,
+        "skipped_would_null": 0,
+        # (旧值, 新值) → 条数。报给用户看的是这个，不是一个总数 ——
+        # 「改了 441 行」不如「'27'→'不限' 348 条」能让人当场判断对不对。
+        "transitions": {},
+        "applied": apply,
+    }
+
+    # 已关闭的岗位也一起刷。它们的届别同样是错的，而 reopen 走的是
+    # sync 的 UPDATE 分支、不归这里管 —— 留着错值等 reopen 是碰运气。
+    rows = conn.execute(
+        "SELECT id, external_id, grad_year FROM jobs WHERE source_key=?", (src,)
+    ).fetchall()
+
+    for row in rows:
+        stats["examined"] += 1
+        raw = snaps.get(row["external_id"])
+        if raw is None:
+            stats["no_snapshot"] += 1
+            continue
+
+        old = row["grad_year"]
+        new = recompute(json.loads(raw))
+
+        if old == new:
+            stats["unchanged"] += 1
+            continue
+        if new is None and old is not None:
+            stats["skipped_would_null"] += 1
+            continue
+
+        stats["changed"] += 1
+        stats["transitions"][(old, new)] = stats["transitions"].get((old, new), 0) + 1
+        if apply:
+            # 只有这一列。fingerprint / last_seen_at 都不动：本命令不是一次观测，
+            # 它没有「又见到这个岗位」的语义。
+            conn.execute("UPDATE jobs SET grad_year=? WHERE id=?", (new, row["id"]))
+
+    if apply:
+        conn.commit()
+    return stats
+
+
+def repair_apply_url(conn, *, source_prefix: str = "feishu", apply: bool = False) -> dict:
+    """给存量飞书 `apply_url` 补上漏掉的 `/detail` 后缀。
+
+    为什么需要这条命令（而不是等 `sync` 自己修）：`apply_url` **在** `_fp()` 里
+    （见上面那个函数）。走 `sync` 的话 8594 行指纹全变，走 UPDATE 分支，
+    造出 8594 条 `job_updated` 事件，每条 diff 都是
+    `apply_url: 老形状 → 新形状`。那是**噪声不是信号** —— 用户订阅「岗位有变化」
+    是想知道岗位变了，不是想知道我们修了个 bug。
+
+    这和 `refresh_grad_year` 是镜像关系，值得写清楚免得下次搞混：
+
+        refresh_grad_year : 字段**不在**指纹里 → sync **不会**修 → 需要这条命令
+        repair_apply_url  : 字段**在**指纹里   → sync **会**修但会造假事件 → 需要这条命令
+
+    两个方向相反，但结论一样：单列原地改，不碰指纹。
+
+    **不联网、不读快照。** 修的是 URL 的拼接形状，老值里已经有全部素材
+    （host、门户段、id），加个后缀就行。读快照反而会把「源站现在还有没有这个
+    岗位」这个无关的问题混进来。
+
+    三条硬约束照抄 `refresh_grad_year`（各有测试守着，见 tests/test_ingest.py）：
+
+    1. **只写 `apply_url` 一列，不碰 `fingerprint` / `last_seen_at`。**
+       这条命令不是一次观测，它没有「又见到这个岗位」的语义。
+    2. **幂等。** 判据是逐行看结尾（`/detail` 结尾的跳过），不是按 source_key
+       整批拼。按批拼会把已修好的行拼成 `/detail/detail`，跑第二次就烂。
+    3. **形状不对的行保留原值并报出来，不写 NULL 也不硬拼。**
+       老源那批 `/index/position/<id>` 也是正常形状，照修；
+       但压根不含 `/position/` 的（将来源站改版）算不认识，计入
+       `skipped_unknown_shape`，宁可留个死链让人看见，也不静默编一个新的。
+
+    已关闭的岗位一起修：它们的链接同样是死的，而人工核对历史投递时照样要点开。
+    """
+    stats = {
+        "source_prefix": source_prefix,
+        "examined": 0,
+        "changed": 0,
+        "already_ok": 0,
+        "skipped_unknown_shape": 0,
+        "skipped_empty": 0,
+        "applied": apply,
+    }
+
+    rows = conn.execute(
+        "SELECT id, apply_url FROM jobs WHERE source_key LIKE ?",
+        (f"{source_prefix}%",),
+    ).fetchall()
+
+    for row in rows:
+        stats["examined"] += 1
+        old = row["apply_url"]
+
+        if not old:
+            # 空值本来就没链接可修。不编一个出来。
+            stats["skipped_empty"] += 1
+            continue
+        if old.endswith("/detail"):
+            stats["already_ok"] += 1
+            continue
+        if "/position/" not in old:
+            stats["skipped_unknown_shape"] += 1
+            continue
+
+        new = f"{old.rstrip('/')}/detail"
+        stats["changed"] += 1
+        if apply:
+            # 只有这一列。fingerprint 不动 —— 理由见 docstring。
+            conn.execute("UPDATE jobs SET apply_url=? WHERE id=?", (new, row["id"]))
+
+    if apply:
+        conn.commit()
+    return stats
+
+
 def _is_bootstrap(conn, source_key: str) -> bool:
     row = conn.execute(
         "SELECT COUNT(*) AS n FROM jobs WHERE source_key=?", (source_key,)
