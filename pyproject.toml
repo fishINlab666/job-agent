@@ -1,6 +1,6 @@
 [project]
 name = "job-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "校招 Agent —— 发现、筛选、代投、跟踪"
 readme = "README.md"
 requires-python = ">=3.13"
