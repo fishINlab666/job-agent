@@ -167,6 +167,81 @@ def init() -> None:
     console.print(f"[green]库已就绪[/green] {db.DB_PATH}")
 
 
+@app.command(name="source-add")
+def source_add(
+    source_key: str = typer.Argument(..., help="源 key，如 feishu:nio:campus"),
+    company: str = typer.Option(..., "--company", help="公司名，落到 jobs.company"),
+    entry_url: str = typer.Option(..., "--entry-url", help="该租户的招聘站入口"),
+    tenant: str = typer.Option(None, "--tenant", help="租户（默认从 source_key 第二段取）"),
+    notes: str = typer.Option("", "--notes", help="备注"),
+) -> None:
+    """登记一个多租户源，之后 `sync` 才看得见它。
+
+    这条命令原来不存在，后果是飞书系四家（422 行采集 + 1305 行代投）对用户完全
+    不可达：`sync --source all` 的源列表 = 自建系统 ∪ `sources` 表已有的行，
+    而多租户的键（`feishu`）不是合法源；`sync --source feishu:nio` 也不行 ——
+    `company` / `host` 只从 sources 行取，没那行就 `RouteError`。整条链路是通的，
+    只差把行写进去，而唯一的写入口是手敲 SQL。
+
+    **登记前先真造一次采集器**，不只是校验字段格式。造得出来才写库，理由是
+    `FeishuAdapter.__init__` 里已经有一道 host↔tenant 核对（`entry_url` 抄错行、
+    复制上一家忘改子域名），那道检查值钱：不核对的失败方式是静默的 —— 拿着这家
+    的配置去打另一家的接口，把别人的岗位落在这家名下。让它在登记时炸，比在
+    第一次 sync 时炸好，因为那时人还记得自己填了什么。
+
+    自建源（`tencent_join`）不用登记，`sync --source all` 从注册表直接取。
+    """
+    conn = db.connect()
+    db.init(conn)
+
+    key = source_key.strip()
+    system = key.split(":", 1)[0]
+    if system not in routing.registered_adapters():
+        known = "、".join(sorted(routing.registered_adapters()))
+        console.print(f"[red]没有 {system} 的采集器[/red]，现在有：{known}")
+        raise typer.Exit(1)
+    if (v := ats.BY_KEY.get(system)) is not None and v.self_built:
+        console.print(
+            f"[yellow]{system} 是自建源，不用登记[/yellow] —— "
+            f"`sync --source all` 从注册表直接取。"
+        )
+        raise typer.Exit(1)
+
+    # 租户默认从键里取，而不是让人重复输一遍：键里那段**就是**判据（见
+    # routing.portal_of）。显式给 --tenant 是为了北森/Moka 那种租户抠不出来、
+    # 只能人工配的系统。
+    who = (tenant or "").strip() or (key.split(":")[1] if ":" in key else "")
+    if not who:
+        console.print(
+            f"[red]取不到租户[/red] {key} 只有一段。"
+            f"多租户源的键至少两段（`feishu:nio`），或者显式给 --tenant。"
+        )
+        raise typer.Exit(1)
+
+    row = {
+        "source_key": key, "company": company.strip(),
+        "system": system, "entry_url": entry_url.strip(), "tenant": who,
+    }
+    try:
+        routing.get_adapter({"source_key": key}, row)
+    except Exception as exc:
+        # 原话往外传。这里的失败几乎都是「填错了哪一项」，而适配器的报错已经
+        # 指名了是哪一项对不上 —— 换成类名等于把最有用的部分丢掉。
+        console.print(f"[red]这行配置造不出采集器[/red]：{exc}")
+        raise typer.Exit(1)
+
+    existed = conn.execute(
+        "SELECT company FROM sources WHERE source_key=?", (key,)
+    ).fetchone()
+    db.register_source(conn, key, row["company"], system, row["entry_url"],
+                       notes, who)
+    verb = "更新" if existed else "登记"
+    console.print(
+        f"[green]已{verb}[/green] {key} · {row['company']} · 租户 {who}\n"
+        f"[dim]下一步：sync --source {key}[/dim]"
+    )
+
+
 @app.command()
 def sync(
     source: str = typer.Option("all", help="源 key，或 all"),

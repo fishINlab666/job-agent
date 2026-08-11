@@ -515,3 +515,106 @@ class TestApplications:
 
         assert "投递记录 1 条" in r.output
         assert "筛选" in r.output and "status=blocked" in r.output
+
+
+class TestSourceAdd:
+    """`source-add` —— 多租户源的登记入口。
+
+    这条命令补的是一个可达性缺口：飞书系四家的采集和代投全都写完了，但没有任何
+    命令能把 `sources` 行写进去，而 `sync` 两条路径都要那行（`--source all` 从表里
+    读，`--source feishu:nio` 要 `company`/`host`）。所以下面第一条用例钉的是
+    「登记完 sync 真能看见它」，不是「INSERT 执行了」—— 后者对不可达这件事不构成证据。
+    """
+
+    def test_registering_makes_the_source_visible_to_sync(self, tmp_db) -> None:
+        """登记完，`sync --source all` 的源列表里必须有它。
+
+        这是整条 issue 的复现点：在这条命令之前，唯一的写入口是手敲 SQL。
+        """
+        r = runner.invoke(cli.app, [
+            "source-add", "feishu:nio:campus", "--company", "蔚来",
+            "--entry-url", "https://nio.jobs.feishu.cn",
+        ])
+        assert r.exit_code == 0, r.output
+
+        # 直接复算 sync 的源列表判据（cli.sync 里那两行），而不是去 assert 库里
+        # 有行 —— 有行但 sync 看不见的话，用户的处境和没登记完全一样。
+        keys = {
+            row["source_key"] for row in
+            tmp_db.execute("SELECT source_key FROM sources WHERE enabled=1")
+        }
+        assert "feishu:nio:campus" in keys
+
+    def test_tenant_comes_from_the_key_so_it_is_not_typed_twice(self, tmp_db) -> None:
+        """不给 --tenant 时从键第二段取。键里那段就是判据，重复输一遍只多一次抄错机会。"""
+        runner.invoke(cli.app, [
+            "source-add", "feishu:xiaopeng:campus", "--company", "小鹏汽车",
+            "--entry-url", "https://xiaopeng.jobs.feishu.cn",
+        ])
+
+        row = tmp_db.execute(
+            "SELECT tenant FROM sources WHERE source_key='feishu:xiaopeng:campus'"
+        ).fetchone()
+        assert row["tenant"] == "xiaopeng"
+
+    def test_mismatched_host_and_tenant_is_refused(self, tmp_db) -> None:
+        """`entry_url` 的子域名和租户对不上就拒绝写库。
+
+        这是本命令存在的第二个理由。这行配置写进去不会立刻报错，它会在下一轮
+        sync 时拿着 nio 的租户去打小鹏的接口，把小鹏的岗位落在蔚来名下 ——
+        表现是「采集跑了」而不是「采集错了」。所以必须是拒绝，不是警告。
+        """
+        r = runner.invoke(cli.app, [
+            "source-add", "feishu:nio:campus", "--company", "蔚来",
+            "--entry-url", "https://xiaopeng.jobs.feishu.cn",   # 抄错行
+        ])
+
+        assert r.exit_code == 1
+        # 报错要指名是哪两项对不上，不然人不知道该改 entry_url 还是改 tenant。
+        assert "nio" in r.output and "xiaopeng" in r.output
+        assert tmp_db.execute(
+            "SELECT COUNT(*) n FROM sources WHERE source_key='feishu:nio:campus'"
+        ).fetchone()["n"] == 0, "拒绝了却把行写进去了"
+
+    def test_self_built_source_is_turned_away(self, tmp_db) -> None:
+        """自建源不用登记，直说，别让人以为漏了一步。"""
+        r = runner.invoke(cli.app, [
+            "source-add", "tencent_join", "--company", "腾讯",
+            "--entry-url", "https://join.qq.com",
+        ])
+
+        assert r.exit_code == 1
+        assert "自建" in r.output
+
+    def test_unknown_system_lists_what_exists(self, tmp_db) -> None:
+        """没采集器的系统要报出现有的有哪些 —— 光说「不支持」帮不上忙。"""
+        r = runner.invoke(cli.app, [
+            "source-add", "mokahr:youzan", "--company", "有赞",
+            "--entry-url", "https://youzan.mokahr.com",
+        ])
+
+        assert r.exit_code == 1
+        assert "feishu" in r.output
+
+    def test_single_segment_key_asks_for_a_tenant(self, tmp_db) -> None:
+        """`feishu` 一段的键取不到租户。这是老式注册留下的形状，得当场拦住。"""
+        r = runner.invoke(cli.app, [
+            "source-add", "feishu", "--company", "某公司",
+            "--entry-url", "https://x.jobs.feishu.cn",
+        ])
+
+        assert r.exit_code == 1
+        assert "租户" in r.output
+
+    def test_re_registering_updates_instead_of_erroring(self, tmp_db) -> None:
+        """同一个键再登记一次是改配置，不是报错（公司名写错了要能改回来）。"""
+        base = ["source-add", "feishu:nio:campus",
+                "--entry-url", "https://nio.jobs.feishu.cn"]
+        runner.invoke(cli.app, base + ["--company", "蔚来汽车"])
+        r = runner.invoke(cli.app, base + ["--company", "蔚来"])
+
+        assert r.exit_code == 0, r.output
+        row = tmp_db.execute(
+            "SELECT company FROM sources WHERE source_key='feishu:nio:campus'"
+        ).fetchone()
+        assert row["company"] == "蔚来"
