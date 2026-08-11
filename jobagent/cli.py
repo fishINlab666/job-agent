@@ -7,7 +7,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import ats, db, ingest, match, profile, routing
+from . import ats, db, ingest, match, profile, queries, routing
 from .submitters.base import SubmissionPlan
 
 app = typer.Typer(add_completion=False, help="校招 Agent")
@@ -435,34 +435,27 @@ def jobs(
 ) -> None:
     """看当前开放岗位。"""
     conn = db.connect()
-    rows = [
-        dict(r)
-        for r in conn.execute(
-            "SELECT * FROM jobs WHERE closed_at IS NULL ORDER BY first_seen_at DESC"
-        ).fetchall()
-    ]
 
     # --loose 是「全放开」的简写，保持老行为。两个都给时取并集。
     allowed = set(allow_missing or ())
-    if bad := allowed - set(match.MISSING_DIMS):
-        raise typer.BadParameter(
-            f"不认识的维度 {sorted(bad)}，可选：{'/'.join(match.MISSING_DIMS)}"
-        )
     if loose:
         allowed |= set(match.MISSING_DIMS)
-    if allowed and not matched:
-        console.print("[yellow]--allow-missing / --loose 只在 --matched 下生效，已忽略[/yellow]")
 
-    if matched:
-        rows = match.filter_jobs(
-            rows, match.load_profile().get("intent") or {}, allow_missing=allowed
+    # 查询和筛选都在 queries 里，这里只负责把它的报错翻成 CLI 的形式、把它的
+    # 提醒打出来。**不许在这儿再放一份筛选逻辑** —— 两处都在的时候常见路径照样
+    # 全绿，只有改了一边才会分叉，而分叉的表现是 CLI 和 MCP 对同一个问题给出
+    # 不同答案。守这条归属的测试见 tests/test_queries.py。
+    try:
+        rows, notes = queries.open_jobs(
+            conn,
+            family=family, city=city, recruit_type=recruit_type,
+            matched=matched, allow_missing=allowed,
+            intent=(match.load_profile().get("intent") or {}) if matched else None,
         )
-    if family:
-        rows = [r for r in rows if r["job_family"] == family]
-    if recruit_type:
-        rows = [r for r in rows if r["recruit_type"] == recruit_type]
-    if city:
-        rows = [r for r in rows if city in json.loads(r["cities"] or "[]")]
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    for note in notes:
+        console.print(f"[yellow]{note}[/yellow]")
 
     total = len(rows)
     table = Table(title=f"开放岗位 {total} 条" + (f"（显示前 {limit}）" if total > limit else ""))
@@ -713,21 +706,13 @@ def status(
     table = Table(title="数据源状态")
     for c in ("源", "公司", "开放岗位", "最近同步", "状态", "抓取数"):
         table.add_column(c)
-    for s in conn.execute("SELECT * FROM sources ORDER BY source_key").fetchall():
-        n = conn.execute(
-            "SELECT COUNT(*) n FROM jobs WHERE source_key=? AND closed_at IS NULL",
-            (s["source_key"],),
-        ).fetchone()["n"]
-        r = conn.execute(
-            """SELECT started_at, status, fetched FROM runs
-               WHERE source_key=? ORDER BY id DESC LIMIT 1""",
-            (s["source_key"],),
-        ).fetchone()
+    for s in queries.source_health(conn):
+        r = s["last_run"]
         style = {"ok": "green", "partial": "yellow", "failed": "red"}.get(
             r["status"] if r else "", "dim"
         )
         table.add_row(
-            s["source_key"], s["company"], str(n),
+            s["source_key"], s["company"], str(s["open_jobs"]),
             (r["started_at"] or "")[:16] if r else "-",
             f"[{style}]{r['status']}[/{style}]" if r else "-",
             str(r["fetched"]) if r else "-",
