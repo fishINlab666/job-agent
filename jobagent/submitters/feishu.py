@@ -600,7 +600,8 @@ class FeishuSubmitter:
             job_id=job_id,
             company=self.company,
             screenshot_path=shot,
-            skipped_fields=[f.model_dump() for f in fields],
+            # 见 tencent_join.discard 的同位注释：model_dump() 会漏明文身份证。
+            skipped_fields=[f.for_storage() for f in fields],
             note="用户在确认环节放弃",
         )
 

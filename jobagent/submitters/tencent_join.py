@@ -280,7 +280,13 @@ class TencentJoinSubmitter:
             job_id=job_id,
             company=self.company,
             screenshot_path=shot,
-            skipped_fields=[f.model_dump() for f in fields],
+            # 必须是 for_storage() 而不是 model_dump()：后者把明文手机号/邮箱连同
+            # selector 一起吐出来（`_fill` 填完还会从页面把值回读一遍，所以填成功的
+            # 字段 value 也是满的）。放弃这条路径和 `_result()` 走的是同一个
+            # SubmissionResult，落库形态必须一致，否则「放弃」反而比「提交」漏得多。
+            # 腾讯这张表没有身份证字段，飞书那边有（feishu.py:114），同一个毛病在
+            # 那边漏的是身份证 —— 所以两边一起改。
+            skipped_fields=[f.for_storage() for f in fields],
             note="用户在确认环节放弃",
         )
 

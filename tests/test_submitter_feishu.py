@@ -16,6 +16,7 @@
 页面用假 locator 模拟：按选择器文案返回命中数，而不是按调用顺序排一串
 side_effect。这样将来多加一次探测调用，老测试不会莫名其妙地错位。
 """
+import json
 import time
 from unittest.mock import MagicMock, patch
 
@@ -1067,3 +1068,70 @@ class TestConsent:
 
         assert "ud__checkbox__input" not in CONSENT_BOX
         assert "atsx-checkbox-input" in CONSENT_BOX
+
+
+class TestDiscardDoesNotLeakPlaintext:
+    """放弃这条路径的落库形态必须和提交一致，否则「放弃」比「提交」漏得多。
+
+    `discard()` 原来用 `f.model_dump()`，把明文身份证连同 selector 一起塞进
+    `SubmissionResult.skipped_fields`。腾讯那张表没有身份证字段，**这一份才是
+    身份证真正会漏的地方**（feishu.py:114 的 `个人证件`）。
+
+    当时没被发现是因为 CLI 两个调用点都把返回值丢了（`cli.py:847,861` 只调不接），
+    没真的入库 —— 但「现在没人接」不是安全边界。
+    """
+
+    def _seeded(self):
+        from jobagent.submitters.base import (
+            PLAN_TTL_SECONDS, SubmissionPlan, mint_token,
+        )
+        # 这个类要的画像必须带 id_card —— 文件顶上那个 profile fixture 没有，
+        # 用它的话身份证那条断言会恒真。
+        prof = P.from_dict({
+            "identity": {"name": "测试用户", "phone": "13800138000",
+                         "email": "test@example.com",
+                         "id_card": "110101200001011234"},
+            "education": [{"school": "清华大学", "major": "计算机科学与技术",
+                           "degree": "硕士", "end": "2027-06", "city": "北京"}],
+        })
+        sub = FeishuSubmitter(tenant="nio")
+        fields = sub._plan_fields(prof)
+        assert any(f.label == "个人证件" and f.value for f in fields), \
+            "计划里没有身份证字段，这个类测不到东西"
+        # 填成功的字段 value 也是满的 —— `_fill` 填完会把值从页面回读一遍。
+        for f in fields:
+            f.filled = True
+        plan = SubmissionPlan(
+            job_id="1", source_key="feishu:nio:campus", company="蔚来",
+            apply_url=JOB["apply_url"], fields=fields,
+            confirm_token=mint_token(), expires_at=time.time() + PLAN_TTL_SECONDS,
+        )
+        SESSIONS.put(LiveSession(plan, MagicMock(), lambda: None))
+        return sub, plan
+
+    def test_id_card_phone_and_email_are_masked(self):
+        sub, plan = self._seeded()
+
+        res = sub.discard(plan.confirm_token)
+
+        blob = json.dumps(res.skipped_fields, ensure_ascii=False)
+        # 断言真值不出现，而不是「有 * 号」—— 后者在明文和打码值
+        # 同时出现时照样成立。
+        assert "110101200001011234" not in blob
+        assert "13800138000" not in blob
+        assert "test@example.com" not in blob
+        # 正向确认打码了、不是整条被丢掉；非敏感字段照原样留着，
+        # 否则「都打码」和「都丢掉」两种错法不可分。
+        assert "11**************34" in blob
+        assert "清华大学" in blob
+
+    def test_selector_is_not_exposed(self):
+        """for_storage() 的白名单里没有 selector，model_dump() 有。
+
+        选择器不是隐私，但它是 model_dump/for_storage 之间最好认的指纹。
+        """
+        sub, plan = self._seeded()
+
+        res = sub.discard(plan.confirm_token)
+
+        assert all("selector" not in f for f in res.skipped_fields)
