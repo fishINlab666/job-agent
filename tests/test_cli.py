@@ -618,3 +618,40 @@ class TestSourceAdd:
             "SELECT company FROM sources WHERE source_key='feishu:nio:campus'"
         ).fetchone()
         assert row["company"] == "蔚来"
+
+
+class TestDigestEmptyState:
+    """digest 的空状态要分清「没新增」和「没同步过」。
+
+    这两句话对人的下一步动作要求不同：前者是「等着」，后者是「去跑 sync」。
+    原来两种情况都打印「没有新增。」，第二种把人留在原地。
+
+    判据取 `runs` 表有没有行，不取 `jobs` —— sync 跑了但源站关站、一条都没抓到
+    也是可能的，那种情况让人再跑一次 sync 是把人往错方向指。下面两条用例
+    钉的就是这个区分：有 run 无 jobs 时**不该**提示 sync。
+    """
+
+    def test_never_synced_points_at_sync(self, tmp_path, monkeypatch) -> None:
+        """runs 表空 —— 说清楚是没采集过，并给出下一步。"""
+        path = tmp_path / "fresh.db"
+        monkeypatch.setattr(db, "DB_PATH", path)
+        conn = db.connect(path)
+        db.init(conn)          # 建表，但不 start_run
+        conn.commit()
+
+        r = runner.invoke(cli.app, ["digest"])
+
+        assert r.exit_code == 0, r.output
+        assert "sync" in r.output
+        conn.close()
+
+    def test_synced_but_empty_does_not_say_sync(self, tmp_db) -> None:
+        """有 run、没岗位 —— 这是「真的没新增」，不能让人再跑一次 sync。
+
+        tmp_db 建了 run 但没插 jobs，正好是源站关站那种形状。
+        """
+        r = runner.invoke(cli.app, ["digest"])
+
+        assert r.exit_code == 0, r.output
+        assert "没有新增" in r.output
+        assert "sync" not in r.output

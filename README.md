@@ -77,8 +77,8 @@ uv run python -m jobagent.cli digest
 # 标记已读
 uv run python -m jobagent.cli digest --mark
 
-# M6: 自动投递岗位
-uv run python -m jobagent.cli apply <job_id> \
+# M6: 自动投递岗位（第一个参数是源站的 external_id，不是 jobs.id）
+uv run python -m jobagent.cli apply <external_id> \
   --profile-path profile.yaml \
   --user-data-dir ~/.cache/playwright-tencent
 

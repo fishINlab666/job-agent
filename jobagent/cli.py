@@ -597,7 +597,17 @@ def digest(mark: bool = typer.Option(False, "--mark", help="标记为已推送")
         _print_unsure(conn, unsure, limit=15)
 
     if not hits and not unsure and not highlights and not changed:
-        console.print("[dim]没有新增。[/dim]")
+        # 「没有新增」和「压根没同步过」对人的下一步动作要求不同，得分开说。
+        # 判据取 runs 表有没有行，不取 jobs —— sync 跑了但源站关站、抓到 0 条
+        # 也是可能的，那种情况让人再跑一次 sync 是把人往错的方向指。
+        ever_synced = conn.execute("SELECT 1 FROM runs LIMIT 1").fetchone()
+        if ever_synced:
+            console.print("[dim]没有新增。[/dim]")
+        else:
+            console.print(
+                "[dim]库里还没有任何一次采集记录。先跑 [/dim]"
+                "[cyan]sync[/cyan][dim]，再回来看 digest。[/dim]"
+            )
 
     if mark and shown:
         conn.executemany(
