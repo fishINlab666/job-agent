@@ -59,6 +59,33 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+def connect_readonly(path: Path | None = None) -> sqlite3.Connection:
+    """只读连接。给 MCP server 用。
+
+    这是**兜底**，不是主约束。主约束是「注册表里没有写动词」——模型调不到不存在
+    的工具。这一层管的是另一种情况：我在某个工具体里写错一句 SQL，SQLite 自己拒绝，
+    而不是等发现库被改了才知道。已实测挡住 INSERT / UPDATE / DELETE / CREATE。
+
+    两个坑，都是实测出来的，不是推的：
+
+    - **库是 WAL，只读打开需要目录可写**（SQLite 要建 `-shm`/`-wal` 旁文件）。
+      目录只读时报错点在**第一条 SELECT** 上而不是 connect 上 —— 所以「连上了」
+      不等于「能读」，别拿 connect 成功当健康检查。
+    - 不用 `immutable=1` 绕开旁文件：那是在承诺「没人在写」，而 sync 随时可能在跑，
+      承诺不成立时读到的是撕裂的页面，且不报错。
+
+    不建目录（`connect()` 会 mkdir）。库不存在时直接抛，不悄悄造一个空库 ——
+    「库不见了」和「库是空的」得分得开。
+    """
+    p = path or DB_PATH
+    if not p.exists():
+        raise FileNotFoundError(f"库不存在：{p}（先跑 jobagent sync）")
+    conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
 def init(conn: sqlite3.Connection) -> None:
     """建表 + 迁移老库。两者都幂等，可以反复跑。"""
     conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
