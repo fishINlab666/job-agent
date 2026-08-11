@@ -38,11 +38,15 @@
 
 ## 当前条目
 
+这张表的版本/生效**必须**和各文件 frontmatter 里的一致。
+`tests/test_kb_index.py` 守着这条 —— 手对了两次就会漏第三次，
+而漏掉的表现是「索引说 v1、文件是 v5」，读索引的人以为自己看的是最新口径。
+
 | 文件 | 内容 | 版本 | 生效 |
 |---|---|---|---|
 | [ats-endpoints.md](ats-endpoints.md) | 已实测通的招聘接口与调用口径 | v2 | 2026-08-05 |
-| [job-fields.md](job-fields.md) | 岗位字段口径与空值语义 | v1 | 2026-08-05 |
-| [company-portals.md](company-portals.md) | 已核实的公司 → 门户对应关系 | v1 | 2026-08-05 |
+| [job-fields.md](job-fields.md) | 岗位字段口径与空值语义 | v5 | 2026-08-10 |
+| [company-portals.md](company-portals.md) | 已核实的公司 → 门户对应关系 | v5 | 2026-08-10 |
 
 ## 更新时机
 
