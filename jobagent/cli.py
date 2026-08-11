@@ -60,6 +60,105 @@ def _fmt_cities(cities: list[str]) -> str:
     return "、".join(cities) if cities else "未写"
 
 
+# ---------- unsure 分组与整列降级检测 ----------
+
+DEGRADED_AT = 0.9  # 某列缺失率达到这个阈值，视为不可得
+DIM_COLUMNS = {
+    "grad_year": "grad_year",
+    "job_family": "job_family",
+    "cities": "cities",
+    "recruit_type": "recruit_type",
+}
+
+
+def _missing_dims(job: dict) -> list[str]:
+    """这条岗位缺哪几个可筛维度。看库里的列，不解析 `_why` 文案。"""
+    out = []
+    for dim, col in DIM_COLUMNS.items():
+        v = job.get(col)
+        if v is None or (isinstance(v, (list, tuple, dict)) and not v) or (
+            isinstance(v, str) and v.strip() in ("", "[]", "null")
+        ):
+            out.append(dim)
+    return out
+
+
+def _degraded_dims(conn) -> dict[tuple[str, str], tuple[int, int]]:
+    """哪些 (源, 维度) 已经整列不可得。只统计开放岗位。
+
+    返回 {(source_key, dim): (null_count, total)} 其中 null_ratio >= DEGRADED_AT。
+    """
+    rows = conn.execute(
+        "SELECT * FROM jobs WHERE closed_at IS NULL"
+    ).fetchall()
+
+    from collections import defaultdict
+    stats: dict[tuple[str, str], tuple[int, int]] = defaultdict(lambda: (0, 0))
+
+    for r in rows:
+        job = dict(r)
+        source_key = job["source_key"]
+        missing = _missing_dims(job)
+        for dim in DIM_COLUMNS:
+            null_count, total = stats[(source_key, dim)]
+            stats[(source_key, dim)] = (
+                null_count + (1 if dim in missing else 0),
+                total + 1,
+            )
+
+    return {
+        k: v
+        for k, v in stats.items()
+        if v[1] > 0 and v[0] / v[1] >= DEGRADED_AT
+    }
+
+
+def _print_unsure(conn, unsure: list[dict], limit: int = 15) -> None:
+    """整列缺失收成一行，其余按缺几维分组，只差一维的排前面。"""
+    degraded = _degraded_dims(conn)
+    degraded_sources = {src for (src, _) in degraded}
+
+    # 整列降级的源单独一行
+    from_degraded = [j for j in unsure if j["source_key"] in degraded_sources]
+    rest = [j for j in unsure if j["source_key"] not in degraded_sources]
+
+    if from_degraded:
+        sources_list = sorted(set(j["source_key"] for j in from_degraded))
+        console.print(
+            f"  [dim]整列缺失 {len(from_degraded)} 条（来自 {', '.join(sources_list)}）[/dim]"
+        )
+        for src in sources_list:
+            missing_dims_for_src = sorted(
+                {dim for (s, dim) in degraded if s == src}
+            )
+            console.print(
+                f"    [dim]{src}: {', '.join(missing_dims_for_src)} 不可得[/dim]"
+            )
+
+    # 按缺失维度数分组，少的排前
+    by_missing_count: dict[int, list[dict]] = {}
+    for j in rest:
+        count = len(_missing_dims(j))
+        by_missing_count.setdefault(count, []).append(j)
+
+    shown_count = 0
+    for count in sorted(by_missing_count.keys()):
+        jobs = by_missing_count[count]
+        if shown_count >= limit:
+            remaining = sum(len(js) for c, js in by_missing_count.items() if c >= count)
+            console.print(f"  [dim]…还有 {remaining} 条，见 jobs --matched --loose[/dim]")
+            break
+
+        for j in jobs[:limit - shown_count]:
+            cities = "/".join(match.city_list(j)[:3]) or "未写"
+            console.print(
+                f"  ? {j['company']} · {j['title']} · {cities}"
+                f"  [dim]{j['_why']}[/dim]"
+            )
+            console.print(f"    [dim]{j.get('apply_url') or '-'}[/dim]")
+            shown_count += 1
+
+
 @app.command()
 def init() -> None:
     """建库建表。"""
@@ -420,15 +519,7 @@ def digest(mark: bool = typer.Option(False, "--mark", help="标记为已推送")
             f"[yellow]信息不全 {len(unsure)} 条[/yellow]"
             "[dim]（源站没写清楚，没敢直接筛掉，你自己扫一眼）[/dim]"
         )
-        for d in sorted(unsure, key=lambda x: match.score(x, intent), reverse=True)[:15]:
-            cities = "/".join(match.city_list(d)[:3]) or "未写"
-            console.print(
-                f"  ? {d['company']} · {d['title']} · {cities}"
-                f"  [dim]{d['_why']}[/dim]"
-            )
-            console.print(f"    [dim]{d.get('apply_url') or '-'}[/dim]")
-        if len(unsure) > 15:
-            console.print(f"  [dim]…还有 {len(unsure) - 15} 条，见 jobs --matched --loose[/dim]")
+        _print_unsure(conn, unsure, limit=15)
 
     if not hits and not unsure and not highlights and not changed:
         console.print("[dim]没有新增。[/dim]")
