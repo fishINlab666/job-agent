@@ -1205,13 +1205,25 @@ def checkup(
                       note or "")
     console.print(table)
 
+    module = type(submitter).__module__.split(".")[-1]
     bad = [n for n, ok, _ in rows if not ok]
     if bad:
         console.print(f"\n[red]{len(bad)} 条判据失效[/red]：{'、'.join(bad)}")
-        console.print("[dim]这些字段代投会静默跳过。改 feishu.py 里对应的常量，"
-                      "改完再跑一次这个命令。[/dim]")
+        console.print(f"[dim]每条的后果见上面「实际」那一列。改 {module}.py 里对应的"
+                      "常量，改完再跑一次这个命令。[/dim]")
         raise typer.Exit(1)
+
+    # 全绿不等于「判据还认得页面」。有些判据（认『已关闭』『提交成功』这类只在
+    # 异常页面上出现的文案）在一个健康页面上核不动 —— 词换成什么都是 0 命中。
+    # 投递器把这层限制写在自己那一行的说明里，这里如实转述，不然「全部有效」
+    # 会被读成「站点没改过文案」。
+    caveats = [n for n, ok, note in rows if ok and "不代表" in note]
     console.print(f"\n[green]{len(rows)} 条判据全部有效[/green]")
+    if caveats:
+        console.print(f"[yellow]其中 {len(caveats)} 条只证明了判据自身没写坏，"
+                      "证明不了站点还在用这些文案[/yellow]")
+        console.print("[dim]这类判据只在异常页面上才触发（岗位已关闭、提交成功、"
+                      "重复投递），拿一个正常岗位页核不出文案有没有换。[/dim]")
 
 
 def _record_blocked(conn, job: dict, src: str, plan: SubmissionPlan) -> None:
