@@ -42,6 +42,34 @@ def tool_names() -> list[str]:
 
 
 @pytest.fixture
+def fake_submitter(monkeypatch):
+    """把 `routing.get_submitter` 换掉，让 checkup 不真开浏览器。
+
+    测试**绝不能**真访问对方招聘站：慢、要登录态、而且会给对方留访问记录。
+    这个替身记下拿到的 headless / user_data_dir，下面几条测试要查它们。
+    """
+    calls: list[dict] = []
+
+    class Fake:
+        def checkup(self, job):
+            return [
+                ("走到表单", True, ""),
+                ("姓名输入框", True, "命中 1 个"),
+                ("认『已关闭』的文案", True,
+                 "本页没有这个文案，只证明判据自身没写坏，不代表站点还在用它"),
+                ("城市下拉", False, "命中 0 个 —— 代投会交出一张缺城市的表单"),
+            ]
+
+    def fake_get(job, src, *, headless=None, user_data_dir=None, **kw):
+        calls.append({"headless": headless, "user_data_dir": user_data_dir,
+                      "job": job})
+        return Fake()
+
+    monkeypatch.setattr(mcp_server.routing, "get_submitter", fake_get)
+    return calls
+
+
+@pytest.fixture
 def db_with_data(tmp_path, monkeypatch):
     """临时库 + 一条岗位 + 一条代投侧事件。
 
@@ -133,7 +161,7 @@ class TestNoWriteVerbInTheRegistry:
         assert head in mcp_server.WRITE_VERBS, "判据认不出 execute 是写动词"
         assert head not in mcp_server.READ_VERBS
 
-    def test_registry_is_exactly_the_five_readonly_tools(self) -> None:
+    def test_registry_is_exactly_the_six_readonly_tools(self) -> None:
         """钉住全集。
 
         上一条是按动词黑名单查的，一个叫 `do_the_thing` 的写工具能绕过去。
@@ -141,8 +169,8 @@ class TestNoWriteVerbInTheRegistry:
         那一刻就是「你确认它是只读的吗」的检查点。
         """
         assert tool_names() == [
-            "explain_match", "job_changes", "list_jobs",
-            "list_sources", "list_sync_runs",
+            "check_form_selectors", "explain_match", "job_changes",
+            "list_jobs", "list_sources", "list_sync_runs",
         ], "注册表变了。新增工具时先答一句：它是只读的吗？"
 
     def test_prepare_and_execute_are_not_callable(self) -> None:
@@ -328,9 +356,10 @@ class TestIdentityDoesNotCrossTheBoundary:
         ("list_sources", {}),
         ("list_sync_runs", {}),
         ("job_changes", {}),
+        ("check_form_selectors", {"external_id": "J1", "user_data_dir": "/tmp/x"}),
     ])
     def test_no_identity_value_crosses_the_boundary(
-        self, db_with_data, profile_with_identity, tool, args
+        self, db_with_data, profile_with_identity, tool, args, fake_submitter
     ) -> None:
         blob = json.dumps(call(tool, args), ensure_ascii=False)
         for field, value in self.SENTINELS.items():
@@ -345,7 +374,7 @@ class TestIdentityDoesNotCrossTheBoundary:
         「守卫覆盖不全」本身就是静默失效。
         """
         swept = {"list_jobs", "explain_match", "list_sources",
-                 "list_sync_runs", "job_changes"}
+                 "list_sync_runs", "job_changes", "check_form_selectors"}
         assert set(tool_names()) == swept, (
             "有工具没进哨兵清单：" f"{set(tool_names()) ^ swept}"
         )
@@ -496,3 +525,172 @@ class TestToolContract:
         jobs = call("list_jobs", {"matched": True, "allow_missing": ["grad_year"]})["jobs"]
         unsure = [j for j in jobs if j["external_id"] == "U1"]
         assert unsure and unsure[0]["why_unsure"], "放宽进来的岗位没说明缺什么"
+
+
+class TestCheckFormSelectors:
+    """唯一对外的工具。它启真浏览器打对方招聘站，所以这些测试全部用替身。
+
+    真访问的代价不只是慢：要登录态、会给对方留访问记录。测试里绝不能真开。
+    """
+
+    def test_headless_defaults_to_true_here(self, db_with_data, fake_submitter) -> None:
+        """MCP 侧 headless=True，和 CLI 相反。
+
+        CLI 那边是 False 因为确认环节要人看着页面；MCP 没人看着屏幕，
+        弹一个看不见的窗口只是白占资源。
+        """
+        call("check_form_selectors",
+             {"external_id": "J1", "user_data_dir": "/tmp/prof"})
+        assert fake_submitter[0]["headless"] is True
+
+    def test_user_data_dir_is_passed_through(self, db_with_data, fake_submitter) -> None:
+        """登录态目录要原样传下去。
+
+        传丢了的表现是「所有判据都红」，而真实原因只是没带登录态 ——
+        一个看起来像站点大改版的假警报。
+        """
+        call("check_form_selectors",
+             {"external_id": "J1", "user_data_dir": "/tmp/prof"})
+        assert fake_submitter[0]["user_data_dir"] == "/tmp/prof"
+
+    def test_user_data_dir_is_required(self) -> None:
+        """它是必填参数，不给不许调。
+
+        给个默认值的后果是模型不带登录态就调，然后拿到一片红。
+        """
+        schema = next(
+            t.input_schema for t in asyncio.run(mcp_server.mcp.list_tools())
+            if t.name == "check_form_selectors"
+        )
+        assert "user_data_dir" in schema.get("required", []), (
+            "user_data_dir 变成可选的了。不带登录态调的结果是一片假红。"
+        )
+        assert "external_id" in schema.get("required", [])
+
+    def test_broken_checks_are_named(self, db_with_data, fake_submitter) -> None:
+        out = call("check_form_selectors",
+                   {"external_id": "J1", "user_data_dir": "/tmp/x"})
+        assert out["all_valid"] is False
+        assert out["broken"] == ["城市下拉"]
+        assert out["reached_form"] is True
+
+    def test_unprovable_checks_are_surfaced(self, db_with_data, fake_submitter) -> None:
+        """「只证明了判据自身没写坏」那类要单独列出来。
+
+        不列的后果是 all_valid=true 被读成「站点没改过文案」，而那几条判据
+        （认『已关闭』『提交成功』）在一个正常岗位页上核不动 —— 词换成什么都是
+        0 命中。这正是「体检全绿」最容易骗人的地方。
+        """
+        out = call("check_form_selectors",
+                   {"external_id": "J1", "user_data_dir": "/tmp/x"})
+        assert out["unprovable"] == ["认『已关闭』的文案"]
+
+    def test_no_login_reports_blocker_not_a_wall_of_false_reds(
+        self, db_with_data, monkeypatch
+    ) -> None:
+        """拿不到登录态时返回一条 blocker，`reached_form` 为 false。
+
+        投递器在这种情况下只返回一行（已核实：tencent_join.py:636-637），
+        不是把每条判据都标红 —— 后者会让人以为站点大改版，跑去改一堆没坏的选择器。
+        """
+        class NoLogin:
+            def checkup(self, job):
+                return [("走到表单", False, "撞到登录墙，本轮核不动后面的判据")]
+
+        monkeypatch.setattr(mcp_server.routing, "get_submitter",
+                            lambda *a, **k: NoLogin())
+        out = call("check_form_selectors",
+                   {"external_id": "J1", "user_data_dir": "/tmp/x"})
+        assert out["reached_form"] is False
+        assert out["all_valid"] is False
+        assert len(out["checks"]) == 1
+        assert "登录墙" in out["checks"][0]["detail"]
+
+    def test_all_green_without_caveats(self, db_with_data, monkeypatch) -> None:
+        """全绿且没有 caveat 时，unprovable 是空的。
+
+        反向对照：少了这条，`unprovable` 可以靠「永远返回空」假绿。
+        """
+        class AllGood:
+            def checkup(self, job):
+                return [("姓名输入框", True, "命中 1 个")]
+
+        monkeypatch.setattr(mcp_server.routing, "get_submitter",
+                            lambda *a, **k: AllGood())
+        out = call("check_form_selectors",
+                   {"external_id": "J1", "user_data_dir": "/tmp/x"})
+        assert out["all_valid"] is True
+        assert out["unprovable"] == []
+        assert out["reached_form"] is True
+
+    def test_missing_job_says_not_found(self, db_with_data, fake_submitter) -> None:
+        out = call("check_form_selectors",
+                   {"external_id": "没这条", "user_data_dir": "/tmp/x"})
+        assert out["found"] is False
+        assert not fake_submitter, "岗位都不存在还去开浏览器了"
+
+    def test_unroutable_source_says_so_instead_of_erroring(
+        self, db_with_data, monkeypatch
+    ) -> None:
+        """路由不到投递器时好好答，不抛。
+
+        抛出去模型只看到一句 traceback，而这件事的真相是「这个源还没有投递器」。
+        """
+        from jobagent import routing
+
+        def boom(*a, **k):
+            raise routing.RouteError("这个源还没有投递器")
+
+        monkeypatch.setattr(mcp_server.routing, "get_submitter", boom)
+        out = call("check_form_selectors",
+                   {"external_id": "J1", "user_data_dir": "/tmp/x"})
+        assert out["supported"] is False
+        assert "还没有投递器" in out["reason"]
+
+    def test_submitter_without_checkup_says_so(self, db_with_data, monkeypatch) -> None:
+        class Bare:
+            pass
+
+        monkeypatch.setattr(mcp_server.routing, "get_submitter",
+                            lambda *a, **k: Bare())
+        out = call("check_form_selectors",
+                   {"external_id": "J1", "user_data_dir": "/tmp/x"})
+        assert out["supported"] is False
+        assert "体检" in out["reason"]
+
+    def test_the_docstring_warns_about_the_cost(self) -> None:
+        """工具说明里必须写清它会访问对方站点、耗时几十秒。
+
+        这是这一层唯一对外发请求的工具。说明里不写的后果是模型把它当成
+        一个普通查询，为了「看看」反复调 —— 那是在对方站点上刷访问记录。
+        """
+        desc = next(
+            t.description for t in asyncio.run(mcp_server.mcp.list_tools())
+            if t.name == "check_form_selectors"
+        )
+        assert "真浏览器" in desc or "浏览器" in desc
+        assert "几十秒" in desc
+        assert "反复调" in desc
+
+    def test_it_does_not_write_anything(self, db_with_data, fake_submitter) -> None:
+        """体检不落库。
+
+        CLI 那条路径里没有 record_prefill / record_blocked（已核实），
+        MCP 这条更不该有 —— 而且连接是只读的，真写了会抛。
+        """
+        before = _table_counts(db_with_data)
+        call("check_form_selectors",
+             {"external_id": "J1", "user_data_dir": "/tmp/x"})
+        assert _table_counts(db_with_data) == before
+
+
+def _table_counts(path) -> dict:
+    c = db.connect_readonly(path)
+    try:
+        return {
+            t: c.execute(f"SELECT COUNT(*) n FROM {t}").fetchone()["n"]
+            for t in ("jobs", "sources", "runs", "events", "applications",
+                      "snapshots")
+        }
+    finally:
+        c.close()

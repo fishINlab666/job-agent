@@ -29,7 +29,7 @@ from typing import Any
 
 from mcp.server import MCPServer
 
-from . import db, match, queries
+from . import db, match, queries, routing
 
 mcp = MCPServer(
     name="job-agent",
@@ -243,6 +243,89 @@ def job_changes(
     # 会变成「每种最近 N 条拼在一起」——条数对，但不是最近的那些。
     events.sort(key=lambda e: (e["occurred_at"] or "", e["id"]), reverse=True)
     return {"events": events[:limit]}
+
+
+@mcp.tool()
+def check_form_selectors(
+    external_id: str,
+    user_data_dir: str,
+    source: str | None = None,
+) -> dict:
+    """核一遍投递表单的判据还认不认对方页面。**只读，不填不提交。**
+
+    ⚠️ **这个工具会启一个真浏览器访问对方招聘站，一次几十秒。** 不要连着反复调，
+    也不要为了「看看」而调 —— 改完选择器、或者隔一段时间没投过，才跑一次。
+    它是这一层唯一对外发请求的工具，其余五个都只读本地库。
+
+    参数：
+      external_id: 拿哪个岗位的表单来体检。
+      user_data_dir: 浏览器用户数据目录，**必填**。里面是招聘站的登录态。
+        拿不到登录态时会走到登录墙，那时返回一条 blocker 说明走不到表单
+        （不是一片假红），`reached_form` 为 false。
+      source: 指定源，默认从库里推断。
+
+    返回里 `all_valid` 为 true **不等于**「站点没改过文案」：有些判据只在异常页面
+    上才触发（岗位已关闭、提交成功、重复投递），拿一个正常岗位页核不动它们 ——
+    那几条在 `unprovable` 里列出来，转述结论时要一起说，别只说「全部有效」。
+    """
+    conn = _conn()
+    row = conn.execute(
+        "SELECT * FROM jobs WHERE external_id=?", (external_id,)
+    ).fetchone()
+    if not row:
+        return {"found": False, "external_id": external_id,
+                "hint": "库里没这条。external_id 要用 list_jobs 返回的那个值。"}
+
+    job = dict(row)
+    src = source or job["source_key"]
+    src_row = conn.execute(
+        "SELECT * FROM sources WHERE source_key=?", (src,)
+    ).fetchone()
+
+    lookup = dict(job)
+    if source:
+        lookup.pop("apply_system", None)
+        lookup["source_key"] = src
+
+    try:
+        submitter = routing.get_submitter(
+            lookup, dict(src_row) if src_row else None,
+            # headless 默认 True，和 CLI 相反。CLI 那边是 False 因为确认环节要人
+            # 看着页面；这里没人看着屏幕，弹一个看不见的窗口只是白占资源。
+            headless=True, user_data_dir=user_data_dir,
+        )
+    except routing.RouteError as exc:
+        return {"found": True, "external_id": external_id,
+                "supported": False, "reason": str(exc)}
+
+    if not hasattr(submitter, "checkup"):
+        return {"found": True, "external_id": external_id, "supported": False,
+                "reason": f"{type(submitter).__name__} 还没有体检实现"}
+
+    rows = submitter.checkup(job)
+    checks = [{"name": n, "ok": bool(ok), "detail": note or ""}
+              for n, ok, note in rows]
+    broken = [c["name"] for c in checks if not c["ok"]]
+    # 「只证明了判据自身没写坏」那类，投递器在自己那一行的说明里写了「不代表」。
+    # 如实转述，不然 all_valid=true 会被读成「站点没改过文案」。
+    unprovable = [c["name"] for c in checks
+                  if c["ok"] and "不代表" in c["detail"]]
+
+    return {
+        "found": True,
+        "external_id": external_id,
+        "company": job["company"],
+        "title": job["title"],
+        "supported": True,
+        # 走不到表单时 checkup 只返回一行 blocker（不是一片假红），
+        # 所以「就一条且是红的」就是没登录那种情况
+        "reached_form": not (len(checks) == 1 and broken),
+        "all_valid": not broken,
+        "broken": broken,
+        "unprovable": unprovable,
+        "checks": checks,
+        "submitter_module": type(submitter).__module__.split(".")[-1],
+    }
 
 
 def main() -> None:
