@@ -86,6 +86,7 @@ uv run python -m jobagent.cli apply <external_id> \
 uv run python -m jobagent.cli applications
 uv run python -m jobagent.cli applications --funnel          # 分档汇总 + 拦截原因
 uv run python -m jobagent.cli applications --status blocked  # 只看被拦的
+uv run python -m jobagent.cli applications --company 蔚来     # 一家公司的全部源
 ```
 
 **M7 是只读的**，没有任何改状态的开关：状态变更必须走 `apply` 的
@@ -102,6 +103,21 @@ prepare/execute 两阶段闸门，从查看命令里改终态等于给那条闸�
 6. 截图保存在 `screenshots/` 目录
 
 没有 `--yes` 这种开关，这是故意的：提交不可逆，对方系统里多一条记录撤不回来。
+
+**限投额度**：很多公司对校招投递有次数上限（腾讯这类通常 1~3 个岗位）。两阶段闸门
+保的是「这一次提交是你确认过的」，它保不了「这是这家公司的第几次」—— 挨个确认 5 个
+岗位，每一步看起来都正常。所以 `apply` 在开浏览器之前先查一次额度：
+
+```bash
+# 登记时给上限。拿不到真实上限就别填，留空 = 不限（不猜一个数）
+uv run python -m jobagent.cli source-add feishu:nio:campus \
+  --company 蔚来 --entry-url https://nio.jobs.feishu.cn/campus --apply-limit 2
+```
+
+用量按**公司**算，不按源算：一家公司在库里可以有多行（蔚来就有 `feishu:nio` 和
+`feishu:nio:campus` 两行），按源数会把用量拆成两份、每份都不到上限，于是投穿。
+算占用的是 `submitted` / `duplicate` / `failed` —— `failed` 也算，因为它全都写在
+点击提交之后，点击超时不代表没点上。
 
 ```bash
 # 只填表看清单，不提交（安全，可反复跑）

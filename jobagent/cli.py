@@ -173,6 +173,10 @@ def source_add(
     company: str = typer.Option(..., "--company", help="公司名，落到 jobs.company"),
     entry_url: str = typer.Option(..., "--entry-url", help="该租户的招聘站入口"),
     tenant: str = typer.Option(None, "--tenant", help="租户（默认从 source_key 第二段取）"),
+    apply_limit: int = typer.Option(
+        None, "--apply-limit",
+        help="该公司最多接受投几个岗位。不确定就别填，留空=不限",
+    ),
     notes: str = typer.Option("", "--notes", help="备注"),
 ) -> None:
     """登记一个多租户源，之后 `sync` 才看得见它。
@@ -234,10 +238,11 @@ def source_add(
         "SELECT company FROM sources WHERE source_key=?", (key,)
     ).fetchone()
     db.register_source(conn, key, row["company"], system, row["entry_url"],
-                       notes, who)
+                       notes, who, apply_limit)
     verb = "更新" if existed else "登记"
+    quota = f" · 限投 {apply_limit}" if apply_limit is not None else ""
     console.print(
-        f"[green]已{verb}[/green] {key} · {row['company']} · 租户 {who}\n"
+        f"[green]已{verb}[/green] {key} · {row['company']} · 租户 {who}{quota}\n"
         f"[dim]下一步：sync --source {key}[/dim]"
     )
 
@@ -783,6 +788,37 @@ def apply(
         raise typer.Exit(1)
     console.print(f"[dim]路由 {route.key}（{route.basis}）[/dim]")
 
+    # ---- 阶段零：限投额度 ----
+    # 放在开浏览器之前：拦下来的话不必启动 playwright，也不会在源站留下访问痕迹。
+    # 两阶段闸门保的是「这一次是你确认过的」，保不了「这是第几次」，这里补那一半。
+    used, limit = db.quota_state(conn, job["company"])
+    if limit is not None and used >= limit:
+        console.print(
+            f"[red]不投了[/red] 已达 {job['company']} 的投递上限 {limit}"
+            f"（已用 {used}）"
+        )
+        console.print(
+            "[dim]名额花在哪了：[/dim][cyan]applications --company "
+            f"{job['company']}[/cyan]"
+        )
+        console.print(
+            "[dim]上限记错了就改：[/dim][cyan]source-add … --apply-limit N[/cyan]"
+        )
+        db.record_blocked(
+            conn,
+            job_id=job["id"], source_key=src, external_id=job["external_id"],
+            company=job["company"],
+            error=f"已达该公司投递上限 {limit}（已用 {used}）",
+        )
+        db.add_event(conn, "apply_blocked", source_key=src, company=job["company"],
+                     job_id=job["id"],
+                     payload={"blocker": "quota_exhausted",
+                              "limit": limit, "used": used})
+        conn.commit()
+        raise typer.Exit(1)
+    if limit is not None:
+        console.print(f"[dim]额度 {used}/{limit}[/dim]")
+
     # ---- 阶段一：填表，停在提交按钮前 ----
     console.print(f"[dim]启动浏览器，填表但不提交…[/dim]")
     plan = submitter.prepare(job, form)
@@ -867,6 +903,7 @@ def apply(
 def applications(
     status: str = typer.Option(None, "--status", help=f"只看某个状态：{'/'.join(APP_STATUSES)}"),
     source: str = typer.Option(None, "--source", help="只看某个源"),
+    company: str = typer.Option(None, "--company", help="只看某家公司（跨该公司的所有源）"),
     limit: int = typer.Option(30),
     funnel: bool = typer.Option(False, "--funnel", help="只看分档汇总，不列明细"),
 ) -> None:
@@ -899,6 +936,11 @@ def applications(
     if source:
         where.append("a.source_key = ?")
         params.append(source)
+    if company:
+        # 按公司过滤而不是按源：限投额度是按公司算的（db.quota_state），一家公司
+        # 可以有多个 source_key，用 --source 看不全「名额花在哪了」。
+        where.append("a.company = ?")
+        params.append(company)
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY a.created_at DESC, a.id DESC"
@@ -907,7 +949,7 @@ def applications(
     if not rows:
         what = f"状态 {status} 的" if status else ""
         console.print(f"[dim]没有{what}投递记录。[/dim]")
-        if not status and not source:
+        if not status and not source and not company:
             console.print("[dim]代投还没跑过，先看 `cli jobs --matched` 挑一个岗位。[/dim]")
         return
 

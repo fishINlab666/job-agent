@@ -17,6 +17,11 @@ CREATE TABLE IF NOT EXISTS sources (
     -- 大多数情况能从 apply_url 里自动取到，这一列是给取不到的兜底：
     -- 北森/Moka 的租户页格式还没实测，可能不在 URL 里，只能人工配。
     tenant      TEXT,
+    -- 这家公司最多接受投几个岗位（校招常见 1~3 个）。NULL = 不限。
+    -- 只有人工来源：源站不声明自己的限投数。拿不到就留空，不许默认一个数——
+    -- 猜的上限比真上限大会白拦，比真上限小会照样投穿，两种都不如不猜。
+    -- 计数按 company 而不是 source_key，见 db.quota_state。
+    apply_limit INTEGER,
     entry_url   TEXT,
     notes       TEXT,
     enabled     INTEGER NOT NULL DEFAULT 1
