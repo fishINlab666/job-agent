@@ -8,7 +8,10 @@ from __future__ import annotations
 import pytest
 
 from jobagent.normalize import (
+    DESIGN_DOMAIN_WORDS,
+    TECH_FUNCTION_WORDS,
     TECH_MARKERS,
+    TITLE_RULES,
     family_from_title,
     normalize_city,
     split_cities,
@@ -93,25 +96,65 @@ class TestSynonymsOfDevelopmentAreAllTech:
         "多媒体处理平台后端实习生-音视频技术",
         "多媒体C++研发（AI创作方向）实习生-抖音用户产品基础",
         "3D视觉研发实习生-智能创作",
+        "多媒体图形/图像研发实习生-抖音-智能创作",
+        "多媒体图形/图像研发实习生-抖音用户产品基础",
+        "多媒体客户端研发实习生-抖音-智能创作",
     ])
-    def test_design_domain_word_still_beats_tech_function_word(self, title: str) -> None:
-        """**这条锁的是已知判错，不是期望行为。**
+    def test_design_domain_word_does_not_steal_tech_function_word(self, title: str) -> None:
+        """issue #9：这 6 条是工程岗，曾经判 design。
 
-        这些都是工程岗，现在判 design：`多媒体`/`视觉` 在第 2 层的 design 那条，
-        而 design 排在 tech 前面，域词就把职能词抢走了。同一个岗位带上「工程师」
-        （`多媒体研发工程师`）反而判对 —— 那个词在第 0 层，先于第 2 层生效。
-        说法不同、判据不同，和这个类里修的是同一种毛病。
+        `多媒体`/`视觉` 在第 2 层 design 那条，而 design 排在 tech 前面，域词就把
+        职能词抢走了。同一个岗位带上「工程师」（`多媒体研发工程师`）反而判对 ——
+        那个词在第 0 层，先于第 2 层生效。说法不同、判据不同，和这个类里修的是同
+        一种毛病。
 
-        没在这次一起修，是因为便宜的修法是错的：把 tech 挪到 design 前面会改判
-        99 条 distinct 标题，其中 75 条是 product → tech（`提前批-AI数据产品经理`
-        会变成技术岗），而「运营/产品不能和技术混」是这个模块 docstring 里写的
-        头号不变量。要修得加第 1 层复合规则，那是单独一件事 —— issue #9，
-        那里有复现这 99/75 的命令。
+        修法是第 1.5 层「域词在前 + 职能词在后 → tech」，不是把第 2 层 tech 提到
+        design 前面（那样改判 227 条，其中 product → tech 75 条，破模块头号不变
+        量）。口径和代价见 docs/plans/015。
 
-        写成断言而不是留空：不写的话，谁哪天顺手改动这一层的顺序，这 6 条会
-        静默换族而没人知道。
+        这 6 条是 distinct 标题数。库里对应 12 行（2026-08-12 快照，会随新抓取变；
+        这个数只在 docs/plans/015 §7 维护，别在这里跟着改）。
+        """
+        assert family_from_title(title) == "tech"
+
+    @pytest.mark.parametrize("title", [
+        "后台动画设计师",
+        "客户端UI动效设计",
+        "后端图形界面GUI设计",
+    ])
+    def test_tech_word_before_domain_word_stays_design(self, title: str) -> None:
+        """第 1.5 层判的是**有序对**，不是「两类词都在」。
+
+        这三条同时含技术职能词和设计域词，但技术词在**前** —— 那是修饰语，职能仍
+        是设计。判据弱化成纯 AND（`d is not None and f is not None`）时上面 6 条
+        全绿、只有这 3 条红，所以这条是「做一半会红」的那条。真库里没有这三个标
+        题，这个方向只能靠构造用例钉住。
         """
         assert family_from_title(title) == "design"
+
+    @pytest.mark.parametrize("title", [
+        "交互设计前端实习生",
+        "视觉设计客户端实习生",
+    ])
+    def test_explicit_compound_phrase_outranks_position_heuristic(self, title: str) -> None:
+        """第 1.5 层必须排在 `COMPOUND_RULES` **之后**。
+
+        这两条满足「域词在前、职能词在后」，但它们有显式复合短语 `交互设计`/
+        `视觉设计` —— 显式短语优先于位置启发式。新层挪到 COMPOUND_RULES 前面时，
+        上面 6 条仍全绿、只有这 2 条红。真库里「新层触发且含 design 复合短语」的
+        标题是 0 条，位置在当前数据上无差别，只能靠构造用例钉住。
+        """
+        assert family_from_title(title) == "design"
+
+    def test_domain_word_at_index_zero_is_a_hit(self) -> None:
+        """`_first_index` 返回 0 是合法命中，不许用真值判断。
+
+        目标 6 条里 5 条域词在下标 0。写 `if d and f` 时 `3D视觉研发`（域词在下标
+        2）还是绿的，另外 5 条全红 —— 单看一条会以为规则没生效，实际是漏了整类。
+        """
+        title = "多媒体客户端研发实习生-抖音-智能创作"
+        assert title.index("多媒体") == 0, "前提变了：这条标题的域词不再在下标 0"
+        assert family_from_title(title) == "tech"
 
     def test_same_role_two_spellings_agree(self) -> None:
         """这条是这批 bug 的形状本身：说法不同、职能相同，判据必须一致。"""
@@ -148,6 +191,70 @@ class TestRndStaysInLayerTwo:
         """
         assert "研发" not in TECH_MARKERS
         assert "后端" not in TECH_MARKERS
+
+
+class TestDomainAndFunctionWordListsStayDisjoint:
+    """第 1.5 层两张词表的结构约束。
+
+    行为侧的用例（上面那些标题）挡不住「有人补词**同时**改期望值」，这几条从结构
+    侧挡。两张表语义不同：域词说岗位作用在什么东西上，职能词说岗位干什么活。
+    """
+
+    def test_the_two_lists_do_not_overlap(self) -> None:
+        """交集必须为空。
+
+        非空意味着某个词既是域又是职能，那时 `domain_at < function_at` 里两个下标
+        会相等，判据退化成「这个词在标题里」—— 一个词就能把整层变成子串匹配。
+        """
+        assert set(DESIGN_DOMAIN_WORDS) & set(TECH_FUNCTION_WORDS) == set()
+
+    def test_function_list_excludes_the_four_words_that_break_operations(self) -> None:
+        """`数据`/`安全`/`硬件`/`模型` 不能进职能词表。
+
+        它们在第 2 层 tech 组里，但补进这张表会让 3 条运营岗判成技术（真库实测），
+        破模块 docstring 写的头号不变量。行为侧的挡在下一条。
+        """
+        for word in ("数据", "安全", "硬件", "模型"):
+            assert word not in TECH_FUNCTION_WORDS, \
+                f"{word} 进了职能词表，运营岗会被判成技术"
+
+    @pytest.mark.parametrize("title", [
+        "视觉生成策略运营（图片美感方向）实习生-AI数据与安全",
+        "视觉生成策略运营（图片评测方向）实习生-AI数据与安全",
+        "视觉生成策略运营（数据分析方向）实习生-AI数据与安全",
+    ])
+    def test_operations_jobs_with_visual_domain_stay_operations(self, title: str) -> None:
+        """上一条的行为侧：这 3 条真库标题域词在前，靠职能词表不含 `数据/安全` 才没被抢走。"""
+        assert family_from_title(title) == "operations"
+
+    def test_domain_list_excludes_function_words(self) -> None:
+        """`设计`/`美术` 不能进域词表 —— 它们是职能词。
+
+        补进去在真库上无差别（0 条改判），所以只有这条结构断言 + 下一条构造用例
+        能挡住。这是「真数据挡不住的改动」，见 docs/plans/015 §9 命令 E/F。
+        """
+        for word in ("设计", "美术"):
+            assert word not in DESIGN_DOMAIN_WORDS, \
+                f"{word} 是职能词，进域词表会让「设计师（前端方向）」判成技术"
+
+    @pytest.mark.parametrize("title", [
+        "设计师（前端方向）",
+        "美术资源-客户端支持",
+        "设计中台后端实习生",
+    ])
+    def test_design_function_word_with_tech_direction_stays_design(self, title: str) -> None:
+        """上一条的行为侧：职能是设计、技术词只是方向说明。真库里没有这些标题。"""
+        assert family_from_title(title) == "design"
+
+    def test_word_lists_contain_no_family_names(self) -> None:
+        """词表里放的是标题里出现的词，不是族名。
+
+        手滑把 `"design"` 写进词表时，判据会变成「标题里含 design 这个英文单词」——
+        真库上大概 0 命中，静默失效。
+        """
+        families = {fam for _, fam in TITLE_RULES}
+        for word in DESIGN_DOMAIN_WORDS + TECH_FUNCTION_WORDS:
+            assert word not in families, f"{word} 是族名，不是标题里的词"
 
 
 class TestCityNormalization:
