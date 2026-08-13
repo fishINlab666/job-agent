@@ -20,6 +20,17 @@
 ~/Library/Application Support/Claude/claude_desktop_config.json
 ```
 
+**先确认这台机器上的 App 真的读这个目录。** 不同发行版的支持目录名不一样
+（这台是 `3p` 构建，用的是 `Claude-3p/`），而写进没人读的那份配置，表现是
+「配好了但对话里看不见工具」—— 跟没配一模一样。问进程自己：
+
+```bash
+lsof -p "$(pgrep -x Claude | head -1)" | grep -o 'Application Support/Claude[^/]*' | sort -u
+```
+
+打出来的那个目录才是要改的。2026-08-13 在这台机器上：`Claude-3p`，而
+`Claude/` 一处句柄都没有 —— 之前配在 `Claude/` 里的那份从来没生效过。
+
 把 `job-agent` 这一段加进 `mcpServers`（文件不存在就整份写进去）：
 
 ```json
@@ -70,7 +81,8 @@ print('现有 server:', list(d['mcpServers'].keys()))
 **上面那节配的是 Claude Desktop，Claude Code 读不到它。** 两个客户端各有自己的配置：
 
 ```
-Claude Desktop  ~/Library/Application Support/Claude/claude_desktop_config.json
+Claude Desktop  ~/Library/Application Support/Claude<发行版后缀>/claude_desktop_config.json
+                后缀用上面那条 lsof 确认；这台机器是 Claude-3p
 Claude Code     ~/.claude.json 的 projects.<项目路径>.mcpServers（local scope）
                 或项目根的 .mcp.json（project scope）
 ```
