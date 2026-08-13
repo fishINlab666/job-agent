@@ -26,11 +26,17 @@
 「配好了但对话里看不见工具」—— 跟没配一模一样。问进程自己：
 
 ```bash
-lsof -p "$(pgrep -x Claude | head -1)" | grep -o 'Application Support/Claude[^/]*' | sort -u
+lsof -p "$(ps ax -o pid=,comm= | awk '/\/Claude\.app\/Contents\/MacOS\/Claude$/{print $1; exit}')" | grep -o 'Application Support/Claude[^/]*' | sort -u
 ```
 
-打出来的那个目录才是要改的。2026-08-13 在这台机器上：`Claude-3p`，而
+打出来的那个目录才是要改的。2026-08-13 在这台机器上：`Claude-3p`（85 个句柄），而
 `Claude/` 一处句柄都没有 —— 之前配在 `Claude/` 里的那份从来没生效过。
+
+> 取 pid 用 `ps` 而不是 `pgrep -x Claude`：后者在某些受限环境里查不到这个进程
+> （实测 `ps ax -o comm=` 看得见 `/Applications/Claude.app/Contents/MacOS/Claude`，
+> 而 `pgrep -x Claude`、`pgrep -f Claude.app/Contents/MacOS` 都返回空）。
+> 而 `pgrep` 返回空的时候，`lsof -p ""` 会去打**所有**进程的句柄，
+> 那一大堆输出里 grep 到什么都不奇怪 —— 结论会变成随机的。
 
 把 `job-agent` 这一段加进 `mcpServers`（文件不存在就整份写进去）：
 
@@ -51,16 +57,33 @@ lsof -p "$(pgrep -x Claude | head -1)" | grep -o 'Application Support/Claude[^/]
 - **`command` 用 venv 里的绝对路径。** 不写 `python` ——
   客户端不走你的 shell，`PATH` 里那个 python 大概没装 `mcp` 和 `httpx`。
 - **`args` 用 `-m`。** 模块方式启动，相对 import 才成立。
-- **`cwd` 填上。** 库路径是 `db.ROOT / "data" / "jobagent.db"`（`ROOT` 从
-  `__file__` 解析，所以和 `cwd` 无关）。但 MCP 规范里 `cwd` 是建议提供的，
-  且某些将来的命令可能需要它解析相对路径。
+- **`cwd` 填上，但它已经不再是承重的那根柱子。** 库路径是
+  `db.ROOT / "data" / "jobagent.db"`（`ROOT` 从 `__file__` 解析，和 `cwd` 无关）。
+  真正曾经靠 `cwd` 活着的是 **import**：`pyproject.toml` 长期缺 `[build-system]`，
+  包从来没装进 venv，`-m jobagent.mcp_server` 只在 cwd 恰好是仓库根时找得到模块。
+  方案 021 修完之后从任意目录都能起（判据：`tests/test_packaging.py` 那几条
+  带 cwd 变化的守卫）。`cwd` 现在留着是因为 MCP 规范建议提供，
+  **而不是因为少了它就起不来**。
 
 一条命令写进去（**会覆盖 `mcpServers` 里的同名项，其余保留**）：
 
 ```bash
 cd "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent" && .venv/bin/python -c "
-import json, pathlib
-p = pathlib.Path.home()/'Library/Application Support/Claude/claude_desktop_config.json'
+import json, pathlib, subprocess
+# 目录不写死 —— 从**运行中的进程**问出来，问不出来就停下，不猜。
+# 上一版这里硬编码着 'Claude/'，而这台机器读的是 'Claude-3p/'，
+# 于是这条命令自己就是「配进了没人读的那份文件」的成因。
+ps = subprocess.run(['ps','ax','-o','pid=,comm='], capture_output=True, text=True).stdout
+pid = [l.split()[0] for l in ps.splitlines()
+       if l.rstrip().endswith('/Claude.app/Contents/MacOS/Claude')]
+assert pid, 'Claude 没在跑 —— 起来之后再跑这条，否则问不出它读哪个目录'
+lsof = subprocess.run(['lsof','-p',pid[0]], capture_output=True, text=True).stdout
+dirs = {l.split('Application Support/')[1].split('/')[0]
+        for l in lsof.splitlines() if 'Application Support/Claude' in l}
+assert len(dirs) == 1, f'问出来 {dirs} 不是恰好一个，别猜，人工确认'
+support = dirs.pop()
+print('这台机器读的是:', support)
+p = pathlib.Path.home()/f'Library/Application Support/{support}/claude_desktop_config.json'
 d = json.loads(p.read_text()) if p.exists() else {}
 root = str(pathlib.Path.cwd())
 d.setdefault('mcpServers', {})['job-agent'] = {
