@@ -57,13 +57,18 @@ lsof -p "$(ps ax -o pid=,comm= | awk '/\/Claude\.app\/Contents\/MacOS\/Claude$/{
 - **`command` 用 venv 里的绝对路径。** 不写 `python` ——
   客户端不走你的 shell，`PATH` 里那个 python 大概没装 `mcp` 和 `httpx`。
 - **`args` 用 `-m`。** 模块方式启动，相对 import 才成立。
-- **`cwd` 填上，但它已经不再是承重的那根柱子。** 库路径是
-  `db.ROOT / "data" / "jobagent.db"`（`ROOT` 从 `__file__` 解析，和 `cwd` 无关）。
-  真正曾经靠 `cwd` 活着的是 **import**：`pyproject.toml` 长期缺 `[build-system]`，
-  包从来没装进 venv，`-m jobagent.mcp_server` 只在 cwd 恰好是仓库根时找得到模块。
-  方案 021 修完之后从任意目录都能起（判据：`tests/test_packaging.py` 那几条
-  带 cwd 变化的守卫）。`cwd` 现在留着是因为 MCP 规范建议提供，
-  **而不是因为少了它就起不来**。
+- **`cwd` 填上，但这个客户端根本不读它 —— 别指望它。** 实测（2026-08-13，
+  Claude Desktop `3p` 构建）：配置里写着仓库根，起来的两个 server 进程
+  `lsof -p <pid> | grep cwd` **都是 `/`**。所以下面这两件事都不能靠 `cwd`：
+  - 库路径 —— 本来就没靠：`db.ROOT / "data" / "jobagent.db"`，`ROOT` 从
+    `__file__` 解析。
+  - **import —— 曾经完全靠它活着**：`pyproject.toml` 长期缺 `[build-system]`，
+    包从来没装进 venv，`-m jobagent.mcp_server` 只在 cwd 恰好是仓库根时
+    找得到模块。既然客户端把 cwd 扔在 `/`，**方案 021 那个修复就是这条链路
+    能通的前提，不是顺手做的加固**。判据：`tests/test_packaging.py` 里
+    那几条跨 cwd 的守卫。
+
+  留着 `cwd` 是因为 MCP 规范建议提供、换个客户端可能会读，**不是因为它在起作用**。
 
 一条命令写进去（**会覆盖 `mcpServers` 里的同名项，其余保留**）：
 
