@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import ast
 import os
 import re
 import subprocess
@@ -131,6 +132,29 @@ class TestSpecKnowsEveryModule:
             f"比一份没人信的文档危险，因为 §9 的验收命令是从它抄出去跑的。"
         )
 
+    def test_exemptions_are_only_for_empty_modules(self) -> None:
+        """豁免只许给**真的没内容**的模块，理由字符串不算理由。
+
+        改坏验出来的：把 `mcp_server.py` 加进 `NOT_REQUIRED`、理由写「懒得写」，
+        上面那条判据一声不响就绿了。一个能靠写字绕开的判据，在它被绕开的那天
+        和不存在没区别 —— 而绕开它的动作恰好发生在「新模块没进文档」的时候，
+        也就是这条判据唯一有用的时刻。
+
+        所以豁免的依据换成文件自己的属性：没有任何 `def` / `class`。
+        `__init__.py` 满足；任何有实现的模块都不满足，写什么理由都不行。
+        """
+        for name in self.NOT_REQUIRED:
+            src = (ROOT / "jobagent" / name)
+            assert src.exists(), f"{name} 在豁免表里但文件不存在，表该清一清"
+            tree = ast.parse(src.read_text(encoding="utf-8"))
+            defs = [n.name for n in ast.walk(tree)
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+            assert not defs, (
+                f"{name} 被豁免了，但它有实现：{defs}。\n"
+                f"豁免只给空模块。有实现的模块必须进 SPEC —— 理由写得再好，"
+                f"读 SPEC 的人也还是不知道它存在。"
+            )
+
 
 class TestTestCountHasOneHome:
     """「当前有多少个用例」在文档里只许有一个出处。
@@ -176,14 +200,18 @@ class TestTestCountHasOneHome:
         text = README.read_text(encoding="utf-8")
         m = re.search(r"\*\*(\d{3,})\s*个测试用例\*\*", text)
         assert m, "README 里找不到「**N 个测试用例**」—— 唯一出处不该消失"
-        window = text[max(0, m.start() - 400):m.end() + 200]
+        window = text[max(0, m.start() - 120):m.end() + 240]
         assert "pytest" in window, (
-            "README 的用例数附近 400 字内没有 pytest 命令。"
+            "README 的用例数附近没有 pytest 命令。"
             "数字和产生它的命令要放在一起，否则它只能被相信、没法被验证。"
         )
-        assert re.search(r"20\d\d-\d\d-\d\d", window), (
-            "README 的用例数旁边没有日期。没有日期的数字是在宣称「现在就是这个数」，"
-            "而它只在写下的那一刻为真。"
+        # 日期必须**紧跟**这个数（同一行、30 字内），不是「附近有个日期」。
+        # 改坏验出来的：拿 600 字窗口找日期时，判据被正文里另一处引用的
+        # `2026-08-13` 满足了 —— 日期被拿掉它照样绿。窗口越宽，判据越容易
+        # 被无关内容喂饱。
+        assert re.search(r"\*\*\d{3,}\s*个测试用例\*\*[^\n]{0,30}?20\d\d-\d\d-\d\d", text), (
+            "README 的用例数后面 30 字内没有日期。没有日期的数字是在宣称"
+            "「现在就是这个数」，而它只在写下的那一刻为真。"
         )
 
     def test_readme_count_is_actually_true(self) -> None:
