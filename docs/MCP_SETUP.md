@@ -67,9 +67,47 @@ print('现有 server:', list(d['mcpServers'].keys()))
 
 ### Claude Code（CLI）
 
-```bash
-cd "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent" && claude mcp add job-agent -- "$PWD/.venv/bin/python" -m jobagent.mcp_server
+**上面那节配的是 Claude Desktop，Claude Code 读不到它。** 两个客户端各有自己的配置：
+
 ```
+Claude Desktop  ~/Library/Application Support/Claude/claude_desktop_config.json
+Claude Code     ~/.claude.json 的 projects.<项目路径>.mcpServers（local scope）
+                或项目根的 .mcp.json（project scope）
+```
+
+配 Claude Code：
+
+```bash
+cd "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent" && claude mcp add job-agent -s local -- "$PWD/.venv/bin/python" -m jobagent.mcp_server
+```
+
+**`-s local` 不能省。** 省了虽然也默认 local，但写清楚是为了和下面那条对照 ——
+`-s project` 会把配置写进项目根的 `.mcp.json`，而那条路有两个坑：
+
+1. `command` 是**绝对路径**，钉着写它的人的家目录。这个仓库是公开的，
+   别人 clone 下来那条路径不存在，server 直接起不来。
+2. project scope 的 server **首次使用要人工批准**（`⏸ Pending approval`），
+   防的是「clone 一个仓库就自动跑它配置里的进程」。批准动作只能人做。
+
+个人项目用 local：不进仓库、不用批准。要团队共享再考虑 project scope，
+那时候得先解决相对路径怎么写。
+
+配完当场确认，**不要等到进对话才发现没连上**：
+
+```bash
+cd "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent" && claude mcp list
+```
+
+要看到 `job-agent: ... - ✔ Connected`。其他两种状态的意思：
+
+```
+⏸ Pending approval   project scope 的 server 还没被批准，去跑 claude 批一下
+✘ Failed to connect  路径不对 / 依赖缺了，去看 claude mcp get job-agent
+```
+
+**配完要重启 Claude Code 会话**，工具才会出现在当前对话里 ——
+`claude mcp list` 显示 `Connected` 只说明进程能拉起来，
+不代表**已经开着的**那个会话已经加载了它。
 
 ---
 
@@ -106,6 +144,20 @@ check_form_selectors
 不证明客户端连上了。随便问一句「现在库里有多少开放岗位」，
 看模型是不是真调了 `list_jobs`（界面上会显示工具调用）。
 没看到工具调用就是没连上，去看客户端日志。
+
+**这一步 2026-08-13 第一次真跑，当场发现前面全绿而它是坏的。**
+经过值得写下来，因为失败形状不显眼：
+
+问的是「蔚来还有几个开放岗位」（就是 §2 那句原话），模型**没有**调
+`list_jobs`，而是直接开只读连接查了库 —— 答案是对的，611 行 / 336 个岗位型。
+**答案对，恰恰是这个失效最难发现的地方**：没有报错、没有空结果，
+只有「工具调用」那一行没出现。如果当时只看答案对不对，会以为它通了。
+
+真因不是「忘了重启」，是**配错了客户端**：当时只跑过 Claude Desktop 那一节，
+本节这条 `claude mcp add` 写在文档里但从没执行过，
+`~/.claude.json` 里那一项是空的。所以：
+
+> 写进文档的命令 ≠ 跑过的命令。这份文档能同时是「完整的」和「没用的」。
 
 ---
 
