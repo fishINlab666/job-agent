@@ -257,6 +257,123 @@ class TestDomainAndFunctionWordListsStayDisjoint:
             assert word not in families, f"{word} 是族名，不是标题里的词"
 
 
+class TestAdvisorIsSales:
+    """方案 017：`顾问` 判 sales。
+
+    这批是 nio 的门店销售岗，占判不出族的 233 行 / 21 个岗位型（2026-08-13 快照，
+    会随新抓取变；这个数只在 docs/plans/017 §7 维护，别在这里跟着改）。
+    """
+
+    @pytest.mark.parametrize("title", [
+        "校招实习-蔚来顾问-上海",
+        "校招实习-乐道顾问-重庆",
+        "ONVO-乐道行销顾问-重庆",
+        "企业效能顾问实习生-飞书",
+    ])
+    def test_advisor_is_sales(self, title: str) -> None:
+        assert family_from_title(title) == "sales"
+
+    def test_advisor_with_city_suffix_still_hits(self) -> None:
+        """城市写在标题尾巴上不影响判定。
+
+        nio 把城市拼进标题（`蔚来顾问` 116 个城市、`乐道顾问` 90 个），
+        判据是子串匹配所以本来就不受影响 —— 这条钉的是「以后有人改成
+        按段切分标题」时不许把这批弄丢。
+        """
+        for city in ("上海", "乌鲁木齐", "遵义仁怀市", "蔚来广州"):
+            assert family_from_title(f"校招实习-蔚来顾问-{city}") == "sales"
+
+    def test_marketing_class_still_wins_over_advisor(self) -> None:
+        """`蔚来顾问-"未来星"营销管训班` 仍判 marketing，不是 sales。
+
+        marketing 组在 TITLE_RULES 里排在 sales 之前，所以含两类词时 marketing 先赢。
+        这条不是「期望的语义」——它其实更像销售管培 —— 而是**钉住现状**：
+        加 `顾问` 这条规则改判 0 行，这两行属于「改判 0」里的 0。
+        哪天要改这个顺序，这条会红，提醒去重新量改判数。
+        """
+        t = '校招实习-蔚来顾问-"未来星"营销管训班-合肥'
+        assert family_from_title(t) == "marketing"
+
+
+class TestProcurementIsOther:
+    """方案 017：`采购` 判 other，且必须在第 2 层末尾。"""
+
+    @pytest.mark.parametrize("title", [
+        "【27届校招】采购专业培训生（综合采购）",
+        "IT品类采购实习生-Corporate Services",
+        "【27届校招】备件采购培训生",
+    ])
+    def test_procurement_is_other(self, title: str) -> None:
+        assert family_from_title(title) == "other"
+
+    @pytest.mark.parametrize("title,expected", [
+        ("AI产品经理（采购方向） - Corporate Services", "product"),
+        ("采购AI产品实习生 - Corporate Services", "product"),
+        ("采购政策与合规 - Corporate Services", "finance"),
+        ("硬件采购实习生", "tech"),
+    ])
+    def test_procurement_direction_does_not_steal(
+        self, title: str, expected: str
+    ) -> None:
+        """`采购方向` 里 `采购` 是域词，职能是产品/财务/硬件。
+
+        把 `采购` 挪进 COMPOUND_RULES（第 2 层之前）这四条立刻红 —— 实测会
+        改判 5 条，这是其中 4 条。第 5 条是 `AI应用研发工程师（采购方向）`，
+        它有第 0 层的 `工程师` 兜着，所以不在这个清单里。
+        """
+        assert family_from_title(title) == expected
+
+    def test_other_group_is_last_in_layer_two(self) -> None:
+        """守归属，不是守行为：`other` 组必须是 TITLE_RULES 的最后一条。
+
+        行为测试挡不住「往前挪一格」—— 挪到 tech 之前，`硬件采购实习生`
+        才会红，而挪到 tech 之后、marketing 之前，上面那些用例全绿，
+        只有别的域词组合会挂。「供应链」是所有具体职能都没命中之后的兜底，
+        这个语义只能由位置表达。
+        """
+        assert TITLE_RULES[-1][1] == "other", "other 组不在末尾，兜底语义没了"
+        assert "采购" in TITLE_RULES[-1][0]
+        assert sum(1 for _, fam in TITLE_RULES if fam == "other") == 1, \
+            "other 在第 2 层只该有一组"
+
+
+class TestServiceIsDeliberatelyNotSales:
+    """反向用例：`服务` 是域词，**故意不加**进任何组。
+
+    这条钉的是一个「决定不做的事」。数据上 `服务 → sales` 能救 59 行，
+    看着比 `采购` 的 14 行划算，所以下一个人很可能会去加它 ——
+    而加进 sales 组会把 28 行 tech 改判成 sales，没有别的测试拦得住。
+    判据：`服务` 在真标题里绝大多数是业务线名（`抖音生活服务`）或者被修饰的
+    对象（`服务工程` 是技术岗、`服务大区管理` 是管理岗），不指干什么活。
+    """
+
+    @pytest.mark.parametrize("title,expected", [
+        ("数据分析实习生-抖音生活服务", "tech"),
+        ("后端研发（企业服务系统）实习生-集团信息系统", "tech"),
+        ("AI数据服务平台数据实习生-国际化", "tech"),
+        ("产品设计师 - 抖音生活服务", "design"),
+        ("战略经营分析师 - 抖音生活服务", "marketing"),
+    ])
+    def test_service_does_not_steal_the_real_function(
+        self, title: str, expected: str
+    ) -> None:
+        assert family_from_title(title) == expected
+
+    def test_service_alone_stays_undecidable(self) -> None:
+        """只有 `服务` 没有别的职能词时判不出，不许兜底成 sales。
+
+        判不出（None）比判错好：None 会进 digest 的「信息不全」让人看见，
+        判错会静默地把岗位筛掉。
+        """
+        assert family_from_title("实习-NSC售后服务代表") is None
+        assert family_from_title("售后服务-增值服务（西安）") is None
+
+    def test_service_is_in_no_word_list(self) -> None:
+        """`服务` 不在任何词表里 —— 守的是「有人偷偷加进去」。"""
+        for words, fam in TITLE_RULES:
+            assert "服务" not in words, f"服务 被加进了 {fam} 组，见方案 017 §6"
+
+
 class TestCityNormalization:
     def test_strips_headquarters_suffix(self) -> None:
         assert normalize_city("深圳总部") == "深圳"
