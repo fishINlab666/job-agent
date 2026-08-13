@@ -204,7 +204,7 @@ fingerprint = hashlib.sha256(
 2. **复合职能特例**：员工福利+薪酬 → `hr`，投资+风险 → `finance`
 3. **常规职能词**：运营 → `operations`，产品 → `product`
 
-**已知修正**（31 个测试用例锁定）：
+**已知修正**（由 `tests/test_normalize.py` 锁定，条数见下面「测试覆盖」那节的命令）：
 - ✅ "混元基座模型-视觉理解大模型研究" 曾误判为 `design`，现在正确识别为 `tech`
 - ✅ "腾讯营销—广告推荐基础大模型" 曾误判为 `marketing`，已修正
 - ✅ "运营开发" 曾误判为 `operations`，现在识别为 `tech`
@@ -224,24 +224,49 @@ fingerprint = hashlib.sha256(
 
 ## 测试覆盖
 
+**853 个测试用例**（截至 2026-08-13），跑这条看最后一行：
+
 ```bash
-uv run pytest -xvs
+uv run pytest -q
 ```
 
-**504 个测试用例**（截至 2026-08-10）：
+这个数只写在这里一处。`docs/SPEC.md` 的验收标准那一节以前也钉过一个，两处对不上过
+（详见该文件文末 `2026-08-13` 那条变更记录），所以现在别处一律不写当前值。
+`tests/test_docs_match_code.py` 会核这里的数和 `--collect-only` 是否一致 —— 加了测试
+不改这里，测试会红。
 
-| 文件 | 数量 | 覆盖 |
-|---|---|---|
-| `test_match.py` | 98 | 硬过滤、软打分、排除词 |
-| `test_adapter_feishu.py` | 69 | 四租户解析、分页、字段缺失 |
-| `test_submitter_feishu.py` | 64 | 两阶段闸门、歧义守卫、回读摘要、判据体检 |
-| `test_ingest.py` | 63 | 变更检测、安全防护、事件产出 |
-| `test_ats.py` | 54 | ATS 识别与路由判据 |
-| `test_routing.py` | 39 | 投递器选择 |
-| `test_normalize.py` | 31 | 岗位族分类、城市标准化 |
-| `test_cli.py` | 24 | 命令行出口，含 `apply` 的两阶段与 `checkup` |
-| `test_submitter_tencent.py` | 23 | 腾讯表单填充与结果判据 |
-| 其余 6 个文件 | 39 | 迁移、摘要、探针分桶、端到端 |
+下面这张表故意不写每个文件多少条：23 个数字没人守，会跟上面那个 504 一样烂掉。
+要数就跑：
+
+```bash
+uv run pytest -q --collect-only | grep '::' | sed 's/::.*//' | sort | uniq -c | sort -rn
+```
+
+| 文件 | 覆盖 |
+|---|---|
+| `test_normalize.py` | 岗位族分类、城市标准化、届别推导 |
+| `test_match.py` | 硬过滤、软打分、排除词 |
+| `test_adapter_feishu.py` | 四租户解析、分页、字段缺失 |
+| `test_ingest.py` | 变更检测、安全防护、事件产出 |
+| `test_submitter_feishu.py` | 两阶段闸门、歧义守卫、回读摘要、判据体检 |
+| `test_mcp_server.py` | 只读 MCP 工具层，含事件白名单对齐 `ingest.py` 发射点 |
+| `test_ats.py` | ATS 识别与路由判据 |
+| `test_routing.py` | 投递器选择 |
+| `test_cli.py` | 命令行出口，含 `apply` 的两阶段与 `checkup` |
+| `test_measure_family_gaps.py` | `scripts/measure_family_gaps.py` 的试算函数 |
+| `test_queries.py` | 只读查询层 |
+| `test_checkup_tencent.py` | 腾讯投递器的判据体检 |
+| `test_health.py` | 链接形状与正文判据（SPA 的 404 在渲染层） |
+| `test_submitter_tencent.py` | 腾讯表单填充与结果判据 |
+| `test_kb_index.py` | `docs/kb/README.md` 索引表与各文件 frontmatter 对齐 |
+| `test_db_migrate.py` | 迁移 |
+| `test_apply_quota.py` | 限投额度的计数与闸门 |
+| `test_digest.py` | digest 的 `job_updated` 渲染 |
+| `test_probe_buckets.py` | 探测脚本的分桶口径 |
+| `test_unsure_grouping.py` | unsure 分组与整列降级检测（issue #7） |
+| `test_adapter_tencent.py` | 腾讯适配器，全假 transport 不打网络 |
+| `test_docs_match_code.py` | 本文档与 `docs/SPEC.md` 是否还跟代码对得上 |
+| `test_e2e.py` | M1→M6 端到端串一遍 |
 
 **测试验不到的东西**（写在这里免得数字给人虚假安全感）：所有投递器测试都跑在
 假页面上，真页面的判据靠 `checkup` 命令在线核；`execute()` 的提交点击**没有任何

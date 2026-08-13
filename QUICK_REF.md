@@ -1,5 +1,9 @@
 # 校招 Agent - 快速参考
 
+> **历史文档（写于 M1–M6 阶段）。命令清单以 `docs/SPEC.md` §2 为准**，那份有守卫测试
+> （`tests/test_docs_match_code.py`）盯着它和 `cli --help` 对齐；这份没有，M7/M8 和
+> MCP 只读层的命令它不知道。
+
 ## 完整工作流（M1-M6）
 
 ### 1. 初始化
