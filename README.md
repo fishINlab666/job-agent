@@ -224,7 +224,7 @@ fingerprint = hashlib.sha256(
 
 ## 测试覆盖
 
-**856 个测试用例**（截至 2026-08-13），跑这条看最后一行：
+**865 个测试用例**（截至 2026-08-13），跑这条看最后一行：
 
 ```bash
 uv run pytest -q
@@ -266,6 +266,7 @@ uv run pytest -q --collect-only | grep '::' | sed 's/::.*//' | sort | uniq -c | 
 | `test_unsure_grouping.py` | unsure 分组与整列降级检测（issue #7） |
 | `test_adapter_tencent.py` | 腾讯适配器，全假 transport 不打网络 |
 | `test_docs_match_code.py` | 本文档与 `docs/SPEC.md` 是否还跟代码对得上 |
+| `test_packaging.py` | 包真装进了环境（不是 cwd 恰好在仓库根）、入口点与文档里的子命令都真存在 |
 | `test_e2e.py` | M1→M6 端到端串一遍 |
 
 **测试验不到的东西**（写在这里免得数字给人虚假安全感）：所有投递器测试都跑在

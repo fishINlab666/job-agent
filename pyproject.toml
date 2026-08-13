@@ -1,3 +1,14 @@
+# 没有这一段的时候 uv 把这个项目当「虚拟项目」：只装依赖，不装它自己。
+# 表现是 `import jobagent` 只在 cwd 恰好是仓库根时成立 —— 测试全绿（pytest 的
+# `pythonpath = ["."]` 是相对 cwd 的），而 MCP server 被客户端从别的目录启起来
+# 就 ModuleNotFoundError。见方案 021。
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["jobagent"]
+
 [project]
 name = "job-agent"
 version = "0.2.0"
