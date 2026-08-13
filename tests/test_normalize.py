@@ -9,6 +9,7 @@ import pytest
 
 from jobagent.normalize import (
     DESIGN_DOMAIN_WORDS,
+    FAMILIES,
     TECH_FUNCTION_WORDS,
     TECH_MARKERS,
     TITLE_RULES,
@@ -323,18 +324,45 @@ class TestProcurementIsOther:
         """
         assert family_from_title(title) == expected
 
-    def test_other_group_is_last_in_layer_two(self) -> None:
-        """守归属，不是守行为：`other` 组必须是 TITLE_RULES 的最后一条。
+    def test_procurement_precedes_the_018_words(self) -> None:
+        """守归属：`采购` 必须排在 018 加的 31 个职能词**之前**。
 
-        行为测试挡不住「往前挪一格」—— 挪到 tech 之前，`硬件采购实习生`
-        才会红，而挪到 tech 之后、marketing 之前，上面那些用例全绿，
-        只有别的域词组合会挂。「供应链」是所有具体职能都没命中之后的兜底，
-        这个语义只能由位置表达。
+        这条测试改过一次，原本断言的是「`采购` 组是 TITLE_RULES 最后一条」。
+        018 往它后面加了一批职能词（量的时候 31 个，删掉边际为 0 的 `仓储` 后 30 个），那个断言就红了 —— 红得对，它拦住了一次真实的
+        位置变化，这正是它存在的意义。但它守的**理由**站不住：017 的原话是
+        「`采购` 必须是最后一条」，而量过之后，绝对位置不是约束，层级才是。
+
+        量法和结果（`measure_family_gaps.py rule-order` 的前身，方案 018 §5）：
+        当时那 31 个词插在 `采购` 之前 vs 之后，6635 条在架标题里只有 1 条判定不同 ——
+            IoT采购履行经理（结构件方向） - AI算力基础设施
+            在采购之前 → tech（`结构` 命中）   在采购之后 → other（`采购` 命中）
+        职能是采购，`结构件` 是它作用的对象，所以 other 对、tech 错。方向和 017
+        记的 `采购方向` 那个病一样，只是镜像：那次是 `采购` 当域词，这次是
+        `结构` 当域词。
+
+        所以现在守两件事：`采购` 在这 30 个词之前，且 `other` 兜底仍在具体职能之后。
         """
-        assert TITLE_RULES[-1][1] == "other", "other 组不在末尾，兜底语义没了"
-        assert "采购" in TITLE_RULES[-1][0]
-        assert sum(1 for _, fam in TITLE_RULES if fam == "other") == 1, \
-            "other 在第 2 层只该有一组"
+        fams = [fam for _, fam in TITLE_RULES]
+        words = [ws for ws, _ in TITLE_RULES]
+        proc = next(i for i, ws in enumerate(words) if "采购" in ws)
+        for w in ("软件", "结构", "物流", "备件"):
+            idx = next(i for i, ws in enumerate(words) if w in ws)
+            assert proc < idx, f"`采购` 必须在 `{w}` 之前，否则 IoT采购履行经理 判 tech"
+        assert fams[-1] == "other", "第 2 层末尾不是 other，兜底语义没了"
+        # `other` 现在有 3 组（采购/物流/备件），不再是 1 组。断言「恰好 3」
+        # 而不是「>= 1」：多出第 4 组说明有人又加了供应链词，那要走 018 §6 的判据
+        # （先跑 measure_family_gaps.py db-effect，再看边际贡献是不是 0）。
+        assert sum(1 for f in fams if f == "other") == 3, \
+            "other 组数变了 —— 加供应链词要先跑 measure_family_gaps.py db-effect"
+
+    def test_procurement_beats_domain_words_after_it(self) -> None:
+        """`采购` 在前的具体后果，用真标题钉住。
+
+        上一条守位置，这一条守行为。两条都要有：只守位置挡不住「把 `结构` 也挪到
+        `采购` 前面」，只守行为挡不住「两个词一起往前挪」。
+        """
+        assert family_from_title(
+            "IoT采购履行经理（结构件方向） - AI算力基础设施") == "other"
 
 
 class TestServiceIsDeliberatelyNotSales:
@@ -359,19 +387,213 @@ class TestServiceIsDeliberatelyNotSales:
     ) -> None:
         assert family_from_title(title) == expected
 
-    def test_service_alone_stays_undecidable(self) -> None:
+    @pytest.mark.parametrize("title", [
+        "救援服务实习生",
+        "【27届校招】AI智能服务培训生",
+        "【27届校招】服务工程培训生",
+        "服务策略 - 体验与服务",
+    ])
+    def test_service_alone_stays_undecidable(self, title: str) -> None:
         """只有 `服务` 没有别的职能词时判不出，不许兜底成 sales。
 
         判不出（None）比判错好：None 会进 digest 的「信息不全」让人看见，
         判错会静默地把岗位筛掉。
+
+        用例换过一次。原本钉的是 `实习-NSC售后服务代表` 和
+        `售后服务-增值服务（西安）`，018 加了 `售后 → sales` 之后这两条判 sales ——
+        **那是对的**，售后服务代表确实是 sales 岗，蔚来那 12 条 `售后` 标题现在
+        10 条判 sales、2 条判 operations（`海外售后运营` 里 `运营` 先命中，也对）。
+        变的是用例不是结论：`服务` 单独出现仍然判不出，库里还有 15 条这样的标题。
+        挑用例的时候要挑**只含 `服务`、不含 `售后`** 的，否则钉的是 `售后` 不是 `服务`。
         """
-        assert family_from_title("实习-NSC售后服务代表") is None
-        assert family_from_title("售后服务-增值服务（西安）") is None
+        assert family_from_title(title) is None
+
+    @pytest.mark.parametrize("title,expected", [
+        ("实习-NSC售后服务代表", "sales"),
+        ("售后服务-增值服务（西安）", "sales"),
+        ("【27届校招】海外售后运营培训生-东南亚", "operations"),
+    ])
+    def test_after_sales_is_sales_but_ops_still_wins(
+        self, title: str, expected: str
+    ) -> None:
+        """`售后` 判 sales，但 `运营` 在表里更靠前，所以售后运营岗仍判 operations。
+
+        这条和上面那条是一对：`服务` 不定族、`售后` 定族。分开钉是为了让「哪个词
+        在起作用」这件事在测试层面就分得清 —— 合在一起写，`售后` 哪天被删掉，
+        红的会是「服务」那条测试，人会去改错的地方。
+        """
+        assert family_from_title(title) == expected
 
     def test_service_is_in_no_word_list(self) -> None:
         """`服务` 不在任何词表里 —— 守的是「有人偷偷加进去」。"""
         for words, fam in TITLE_RULES:
             assert "服务" not in words, f"服务 被加进了 {fam} 组，见方案 017 §6"
+
+
+# 018 加的 30 个词，在测试里**独立写一遍**。
+#
+# 这是第三份副本（normalize.py、measure_family_gaps.py、这里），是故意的：
+# 测试不能读它要检验的那个值。写 `for w, f in normalize.NEW_WORDS` 的话，
+# 有人删掉一个词，循环少跑一圈，测试照样绿 —— 那种「改坏了但不咬」正是
+# 这批测试要防的东西。副本漂移由 test_word_count_matches 兜住。
+NEW_018: tuple[tuple[str, str], ...] = (
+    ("软件", "tech"), ("系统", "tech"), ("SRE", "tech"), ("嵌入式", "tech"),
+    ("结构", "tech"), ("材料", "tech"), ("热管理", "tech"), ("品质", "tech"),
+    ("电控", "tech"), ("仿真", "tech"), ("传感", "tech"),
+    ("交付", "operations"), ("履约", "operations"), ("产销", "operations"),
+    ("咨询", "sales"), ("售后", "sales"), ("零售", "sales"), ("商家", "sales"),
+    ("渠道", "sales"), ("达人", "sales"),
+    ("结算", "finance"), ("税务", "finance"), ("资金", "finance"),
+    ("内控", "finance"), ("成本", "finance"), ("定价", "finance"),
+    ("传播", "marketing"), ("法规", "legal"),
+    ("物流", "other"), ("备件", "other"),
+)
+
+# 量边际贡献时删掉的词。这里也钉一遍，防止有人「补全」回去。
+ZERO_MARGIN_018: tuple[str, ...] = ("仓储",)
+
+
+class TestVocabGapWords018:
+    """方案 018：补 30 个能定族的职能词。
+
+    这个类钉四件事，分开写是因为改坏一件不该让另外三件跟着红：
+      ① 每个词各自救回的真标题（删词就红）
+      ② 30 个词的位置（挪进前面的层就红）
+      ③ 被**否决**的 16 个词不许被加回来（加了就红）
+      ④ 边际贡献为 0 的 `仓储` 不许被「补全」回来
+
+    ③ 是最容易被下一个人破坏的：那些词在「救回条数」上看着都很划算，
+    `培训` 一个词能救 94 个岗位型 —— 而其中约 91 个是错的。
+    """
+
+    # 每条都是库里的真标题。写全称不写片段：片段测不出「词在标题的哪个位置」，
+    # 而位置决定它是职能还是部门名（见 issue #13）。
+    @pytest.mark.parametrize("title,expected", [
+        ("BMS软件培训生", "tech"),
+        ("【27届校招】整车软件培训生", "tech"),
+        # 这两条挑过一次。原本用的是 `智驾系统安全培训生` 和 `嵌入式软件培训生`，
+        # 它们**测不出**对应的词：前者有 `安全`（早就在 tech 组里）、后者有 `软件`
+        # （018 的另一个词），删掉 `系统`/`嵌入式` 照样判 tech。用例要挑「这个词是
+        # 唯一决定者」的标题，验法见 scripts/mutate_018.sh。
+        ("【27届校招】BMS系统培训生", "tech"),
+        ("【27届校招】嵌入式EMC培训生", "tech"),
+        ("【27届校招】车身结构培训生", "tech"),
+        ("【27届校招】材料工程培训生", "tech"),
+        ("【27届校招】热管理培训生", "tech"),
+        ("【27届校招】整车品质培训生", "tech"),
+        ("【27届校招】电控培训生", "tech"),
+        ("【27届校招】仿真分析培训生", "tech"),
+        ("【27届校招】传感器培训生", "tech"),
+        ("交付实习生（上海大区）", "operations"),
+        ("【27届校招】履约培训生", "operations"),
+        ("【27届校招】产销培训生", "operations"),
+        ("【27届校招】海外售后赋能培训生-东南亚", "sales"),
+        ("新零售实习生（上海大区）", "sales"),
+        ("【27届校招】渠道拓展培训生", "sales"),
+        ("税务实习生", "finance"),
+        ("【27届校招】资金培训生", "finance"),
+        ("【27届校招】内控培训生", "finance"),
+        ("【27届校招】成本培训生", "finance"),
+        ("【27届校招】备件培训生", "other"),
+    ])
+    def test_word_rescues_its_target(self, title: str, expected: str) -> None:
+        """删掉对应的词，这条就从 expected 掉回 None。"""
+        assert family_from_title(title) == expected
+
+    def test_all_words_are_in_layer_two(self) -> None:
+        """30 个词必须在第 2 层，不许出现在第 0 层或 COMPOUND_RULES。
+
+        守的是「有人为了让某条标题判对，把词往前挪一层」。往前挪一层的代价在
+        017 量过：第 0 层盖住所有其他规则，`研发` 放第 0 层会改判 69 条。
+        """
+        from jobagent.normalize import COMPOUND_RULES
+
+        layer2 = {w for ws, _ in TITLE_RULES for w in ws}
+        for word, _fam in NEW_018:
+            assert word in layer2, f"`{word}` 不在第 2 层了"
+            assert word not in TECH_MARKERS, f"`{word}` 被挪进第 0 层"
+            for ws, fam in COMPOUND_RULES:
+                assert word not in ws, f"`{word}` 被挪进 COMPOUND_RULES 的 {fam} 组"
+
+    @pytest.mark.parametrize("word,why", [
+        ("培训", "招聘类型不是职能，救 94 个岗位型约 91 个错"),
+        ("计划", "`培养计划` 里是「项目」的意思，救 9 个错 6 个"),
+        ("质量", "字节 `内容质量` 是运营岗，救 13 个错 3 个"),
+        ("分析", "跨族：数据分析/商业分析/财务分析"),
+        ("策略", "域词：策略产品/策略运营/广告策略 三族都有"),
+        ("基础设施", "11 个救回里 10 个只命中在部门名上，见 issue #13"),
+        ("内容", "腾讯是域词，库级改族 5 行"),
+        ("治理", "同 `内容`，合计 7 行改族"),
+    ])
+    def test_rejected_words_stay_out(self, word: str, why: str) -> None:
+        """否决的词不许进任何词表。理由跟着用例走，免得下一个人只看到断言。"""
+        for ws, fam in TITLE_RULES:
+            assert word not in ws, f"`{word}` 被加进 {fam} 组，但它{why}（方案 018 §6）"
+        assert word not in TECH_MARKERS, f"`{word}` 被加进第 0 层，但它{why}"
+
+    @pytest.mark.parametrize("title", [
+        "【27届校招】NVH培训生",
+        "【27届校招】CFD培训生",
+        "【27届校招】EMC&射频培训生",
+    ])
+    def test_training_shaped_titles_still_undecidable(self, title: str) -> None:
+        """`培训` 被否决的直接后果：这批仍然判不出。
+
+        这是 issue #8 方向 ② 的料，**故意留着**。判不出会进 digest 的
+        「信息不全」让人看见；靠 `培训` 兜底会把它们静默判成 hr，那是判错。
+        """
+        assert family_from_title(title) is None
+
+    @pytest.mark.parametrize("word", ZERO_MARGIN_018)
+    def test_zero_margin_words_stay_out(self, word: str) -> None:
+        """`仓储` 判得对，但边际贡献是 0 —— 不许因为「看着该有」加回来。
+
+        它和 `test_rejected_words_stay_out` 那批不是一类：那些加了会**判错**，
+        这个加了只是不出力。两种否决混在一起会让人以为 `仓储` 会判错，
+        然后拿一条 `仓储` 判对的标题来「反驳」，从而把它加回来。
+
+        库里含 `仓储` 的标题只有 2 条：`备件仓储物流培训生`（`备件`/`物流` 先接住）、
+        `仓储库存链路运营`（`运营` 先接住，判 operations 是对的）。
+        """
+        for ws, fam in TITLE_RULES:
+            assert word not in ws, \
+                f"`{word}` 被加回 {fam} 组，但它边际贡献是 0（方案 018 §6）"
+
+    def test_zero_margin_word_would_change_nothing(self) -> None:
+        """把「它加了也没用」这件事本身钉住，而不是只钉「它不在表里」。
+
+        只钉「不在表里」的话，下一个人有权问「凭什么」。这条给出可运行的答案：
+        这 2 条标题的判定和 `仓储` 在不在表里无关。
+        """
+        assert family_from_title("【27届校招】备件仓储物流培训生") == "other"
+        assert family_from_title("仓储库存链路运营 - TikTok Shop") == "operations"
+
+    def test_no_new_family_value(self) -> None:
+        """30 个词没有引入新的族名。物流/备件归 other，同 `采购` 的理由。"""
+        for _ws, fam in TITLE_RULES:
+            assert fam in FAMILIES, f"{fam} 不在 FAMILIES 里"
+        for _word, fam in NEW_018:
+            assert fam in FAMILIES, f"{fam} 不在 FAMILIES 里"
+
+    def test_word_count_matches(self) -> None:
+        """副本漂移的兜底：测试里这份 30 个词必须和 normalize.py 里的一致。
+
+        上面每条测试都只查「这个词在不在」，查不出「normalize.py 多了个词」。
+        多出来的词是没经过 018 §6 判据的，必须红。
+        """
+        layer2 = [w for ws, _ in TITLE_RULES for w in ws]
+        assert len(layer2) == len(set(layer2)), \
+            f"第 2 层有重复词：{[w for w in layer2 if layer2.count(w) > 1]}"
+        declared = {w for w, _ in NEW_018}
+        assert len(declared) == 30, f"测试里这份不是 30 个，是 {len(declared)}"
+        # 反向：normalize.py 第 2 层里，凡是单词条且在 017 之后的组，都该在 NEW_018 里。
+        singles = [ws[0] for ws, _ in TITLE_RULES if len(ws) == 1]
+        unexpected = [w for w in singles if w not in declared and w != "采购"]
+        assert not unexpected, \
+            f"normalize.py 第 2 层多了没在测试里声明的单词条：{unexpected}"
+        for word, fam in NEW_018:
+            hit = [f for ws, f in TITLE_RULES if word in ws]
+            assert hit == [fam], f"`{word}` 在 normalize.py 里判 {hit}，测试期望 {fam}"
 
 
 class TestCityNormalization:
