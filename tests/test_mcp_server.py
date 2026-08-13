@@ -8,13 +8,15 @@
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
-from jobagent import db, mcp_server
+from jobagent import cli, db, ingest, mcp_server
 
 
 def call(tool: str, args: dict | None = None) -> dict:
@@ -397,11 +399,21 @@ class TestOnlyJobSideEvents:
     """
 
     def test_apply_events_are_filtered_out(self, db_with_data) -> None:
-        evs = call("job_changes", {"limit": 100})["events"]
-        kinds = {e["kind"] for e in evs}
-        assert "job_opened" in kinds, "岗位侧事件被一起挡掉了，那就是挡过头"
-        assert not [k for k in kinds if k.startswith("apply")]
-        assert "LEAKCANARY" not in json.dumps(evs, ensure_ascii=False)
+        """不带 kind 时一条 apply_* 都不许出来。**查行为，不查常量。**
+
+        这条和 `test_whitelist_is_a_whitelist_not_a_blacklist` 不重复：
+        `queries.job_changes(kind=None)` 会返回**整张表**（`queries.py` 里 kind 为空
+        就不加 WHERE 条件），所以「白名单内容对」和「代投侧没漏出去」是两件事，
+        中间隔着 `mcp_server` 逐个 kind 查这个动作。把 `kind=None` 直接透传给下一层，
+        常量测试全绿而 PII 全出去了 —— 这条是那个「不透传」的唯一守卫。
+        整个返回值（不只 events）都过一遍哨兵：字段是我加的，也可能是我漏的那个。
+        """
+        r = call("job_changes", {"limit": 100})
+        kinds = {e["kind"] for e in r["events"]}
+        assert "job_opened" in kinds, "采集侧事件被一起挡掉了，那就是挡过头"
+        assert not [k for k in kinds if k.startswith("apply")], \
+            f"代投侧事件漏出来了：{sorted(k for k in kinds if k.startswith('apply'))}"
+        assert "LEAKCANARY" not in json.dumps(r, ensure_ascii=False)
 
     def test_asking_for_an_apply_kind_is_refused(self, db_with_data) -> None:
         """点名要 apply_blocked 要被拒，不是静默返回空。
@@ -423,8 +435,188 @@ class TestOnlyJobSideEvents:
 
         黑名单在这里一定会漏：代投侧的 kind 是 `f"apply_{status}"` 拼出来的，
         grep 数不出全集，将来多一个状态就多一个漏出去的 kind。
+
+        【这条只查一个方向，查不出「少了一个」】它遍历的是白名单自己，
+        所以白名单少三种事件的时候它照样绿 —— 019 修的就是那个缺陷。
+        管「少了一个」的是下面 `TestWhitelistCoversEveryIngestKind`。
         """
         assert not [k for k in mcp_server.JOB_EVENT_KINDS if k.startswith("apply")]
+
+    def test_docstring_does_not_promise_everything(self) -> None:
+        """docstring 不许承诺「省略则全要」。
+
+        这条守的是**文档**，不是行为，因为这个修法会被做一半：把三种事件加进
+        白名单之后，`job_changes()` 返回 7 种，看着就对了 —— 但 docstring 还写着
+        「省略则全要」，而这一层永远不给代投侧。模型按承诺办事，会把一份被裁过的
+        结果当成整张表转述。行为测试查不出这个，因为行为本身没错，是承诺错了。
+        """
+        doc = mcp_server.job_changes.__doc__ or ""
+        assert "省略则全要" not in doc, \
+            "docstring 还在承诺「全要」，但这一层永远排除代投侧"
+        assert "不是这张表" in doc, \
+            "docstring 得说清「全部采集侧事件」≠「events 表的全部」"
+
+    def test_excluded_kinds_is_reported(self, db_with_data) -> None:
+        """返回值里要有 `excluded_kinds`，让「没给什么」看得见。
+
+        白名单上面那段注释为自己辩护的理由是「漏的方向是少给一类事件，看得见」。
+        那句话只在调用方会去数少了什么的时候成立。返回值里不带这个字段，
+        调用方**没有任何依据**能发现结果被裁过。
+        """
+        r = call("job_changes", {"limit": 5})
+        assert "excluded_kinds" in r, "返回值里没有 excluded_kinds，被裁掉的部分看不见"
+        assert any("apply" in k for k in r["excluded_kinds"]), \
+            f"excluded_kinds 没说清排除的是代投侧：{r['excluded_kinds']}"
+
+    def test_excluded_kinds_is_reported_even_for_one_kind(self, db_with_data) -> None:
+        """点名要单个 kind 时也要带 `excluded_kinds`。
+
+        它说的是「这一层永远不给什么」，不是「这一次筛掉了什么」。写成后者的话，
+        `kind='job_opened'` 的返回里就没有这个字段了 —— 而那正是模型最常走的路径。
+        """
+        r = call("job_changes", {"kind": "job_opened", "limit": 5})
+        assert r.get("excluded_kinds"), \
+            "指定单个 kind 时 excluded_kinds 丢了，等于常见路径上没有这个提示"
+
+    def test_excluded_kinds_is_never_empty(self) -> None:
+        """`EXCLUDED_KINDS` 不许是空的，也不许是算出来的差集。
+
+        差集（表里所有 kind 减白名单）在白名单补全之后会变成空 —— 空列表会被读成
+        「什么都没排除」，那正是这次要修掉的误读。代投侧一条不给是这一层的固定边界，
+        不是某次快照的结果。
+        """
+        assert mcp_server.EXCLUDED_KINDS, "EXCLUDED_KINDS 空了，等于宣布什么都没排除"
+
+
+class TestWhitelistCoversEveryIngestKind:
+    """白名单必须盖住采集侧发的**每一种**事件 —— 能查出「少了一个」。
+
+    锚点是 `jobagent/ingest.py` 的 AST，**不是白名单自己**。拿白名单当锚点是自证
+    （`set(w) <= set(w)` 恒真），遍历被检对象也只查得出「多了一个」；
+    而 019 要修的缺陷正是「少了三个」（`job_reopened` / `family_first_seen` /
+    `batch_started`），库里当时丢着 8 条事件。
+
+    **这一组只覆盖采集侧，覆盖不了代投侧。** 代投侧的 kind 有一处是
+    `f"apply_{result.status}"`（`cli.py:877`）拼出来的，AST 里是个 `JoinedStr`，
+    数不出全集 —— 那一侧靠的是「白名单形状」本身，不是这里的枚举。
+    不写这句的话，下一个人会以为这一组守住了整张 `events` 表。
+    """
+
+    @staticmethod
+    def _add_event_kinds(module) -> tuple[set[str], list[tuple[int, str]]]:
+        """扫一个模块里所有 `*.add_event(conn, <kind>, ...)`，分成能枚举的和不能的。
+
+        返回 `(字面量 kind 集合, [(行号, 节点类型)])`。第二个是「数不出全集」的调用点
+        —— 它们不能进锚点，但**必须被数出来**，否则锚点会悄悄退化成「只覆盖一部分」
+        还全绿。
+        """
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        literal: set[str] = set()
+        dynamic: list[tuple[int, str]] = []
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "add_event"):
+                continue
+            arg = node.args[1] if len(node.args) > 1 else None
+            # `"job_reopened" if reopened else "job_updated"` 一处出两个 kind。
+            # 不摊开的话它整个是个 IfExp，会被当成「数不出全集」，
+            # 而实际上两臂都是字面量。
+            branches = ([arg.body, arg.orelse] if isinstance(arg, ast.IfExp)
+                        else [arg])
+            for b in branches:
+                if isinstance(b, ast.Constant) and isinstance(b.value, str):
+                    literal.add(b.value)
+                else:
+                    dynamic.append((node.lineno, type(b).__name__))
+        return literal, dynamic
+
+    def test_every_ingest_kind_is_whitelisted(self) -> None:
+        """采集侧发的每一种 kind 都要在白名单里。**这条查的是「少了一个」。**"""
+        emitted, _ = self._add_event_kinds(ingest)
+        missing = sorted(emitted - set(mcp_server.JOB_EVENT_KINDS))
+        assert not missing, (
+            f"`ingest.py` 会发这些事件，但白名单没有它们：{missing}。\n"
+            f"模型调 job_changes() 拿不到它们，而 docstring 承诺的是「全部采集侧事件」"
+            f"—— 于是「没给」会被读成「没发生」。"
+        )
+
+    def test_whitelist_has_no_kind_ingest_never_emits(self) -> None:
+        """反方向：白名单里不许有采集侧根本不发的 kind。
+
+        查这个方向是为了拼错的词。`job_reopend` 少个 `e` 加进白名单，
+        上一条测试照样绿（它只查漏），而这个 kind 永远查不到任何事件 ——
+        一个「配好了但永远返回空」的选项，比没配更难发现。
+        """
+        emitted, _ = self._add_event_kinds(ingest)
+        # 代投侧的 kind 不该出现在这张表里，但那由
+        # `test_whitelist_is_a_whitelist_not_a_blacklist` 管；
+        # 这里只比采集侧，免得两条测试红在同一个原因上。
+        stray = sorted(k for k in mcp_server.JOB_EVENT_KINDS
+                       if k not in emitted and not k.startswith("apply"))
+        assert not stray, (
+            f"白名单里这些 kind `ingest.py` 从来不发：{stray}。"
+            f"拼错了，或者发射点被删了 —— 它们是永远返回空的选项。"
+        )
+
+    def test_anchor_sees_every_add_event_site(self) -> None:
+        """锚点自己没漏掉调用点 —— 数 AST 数出的调用点，和源码里的行数对齐。
+
+        锚点退化的方向是**假绿**：AST 匹配条件写窄了（比如只认
+        `db.add_event` 而 `ingest.py` 改成了 `from .db import add_event`），
+        它数出 0 个调用点，于是「采集侧减白名单」是空集，上面两条全绿。
+        「一条都没匹配上」和「全都合规」在集合运算里长得一模一样。
+        """
+        src = Path(ingest.__file__).read_text(encoding="utf-8")
+        in_source = src.count("add_event(")
+        literal, dynamic = self._add_event_kinds(ingest)
+        # 调用点数 ≠ kind 数：`:452` 一处出两个 kind（三元）。所以这里比的是
+        # 「AST 找到的调用点」和「源码里的 `add_event(` 次数」，不是 kind 个数。
+        tree = ast.parse(src)
+        found = sum(
+            1 for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "add_event"
+        )
+        assert found > 0, "锚点一个调用点都没找到 —— 它已经退化成假绿了"
+        assert found == in_source, (
+            f"AST 找到 {found} 个 add_event 调用点，源码里出现 {in_source} 次。"
+            f"不相等说明有调用点不是 `x.add_event(...)` 的形状，锚点漏了它。"
+        )
+        assert len(literal) > found, (
+            f"kind 数 {len(literal)} 应当大于调用点数 {found}："
+            f"`ingest.py` 有一处三元表达式一次发两种 kind。"
+            f"两个数相等说明那处三元没被摊开。"
+        )
+
+    def test_ingest_kinds_are_all_enumerable(self) -> None:
+        """采集侧的 kind 必须全是字面量 —— 这是锚点成立的前提。
+
+        前提单独钉一条，因为它会**过期**：将来有人在 `ingest.py` 里写
+        `f"job_{state}"`，锚点就数不出全集了，而上面几条会继续绿（它们比的是
+        数出来的那部分）。那时候要红的是这条，它会指着「锚点不再可信」这一层，
+        而不是让人去查白名单。
+        """
+        _, dynamic = self._add_event_kinds(ingest)
+        assert not dynamic, (
+            f"`ingest.py` 这些调用点的 kind 不是字面量：{dynamic}。"
+            f"AST 数不出全集了，`test_every_ingest_kind_is_whitelisted` 从此"
+            f"只覆盖一部分 —— 它不会因此变红，所以由这条来喊。"
+        )
+
+    def test_apply_side_is_the_one_that_cannot_be_enumerated(self) -> None:
+        """代投侧确实有数不出全集的调用点 —— 白名单那段注释的理由要站得住。
+
+        注释说「代投侧的 kind 是拼出来的，grep 数不出全集，黑名单一定会漏」。
+        这条把那个理由变成可查的：真有一处 `JoinedStr`。哪天代投侧改成枚举了，
+        这条会红，提醒去重新读那段注释 —— 那时候黑名单方案重新可行，
+        而注释还在拿一个不再成立的理由说话。
+        """
+        _, dynamic = self._add_event_kinds(cli)
+        assert dynamic, (
+            "`cli.py` 里已经没有拼出来的 kind 了。白名单注释里"
+            "「grep 数不出全集」这个理由不再成立，去重读那段注释。"
+        )
 
     def test_limit_means_the_most_recent_overall(self, db_with_data) -> None:
         """跨 kind 合并后要重新排序再截断。
