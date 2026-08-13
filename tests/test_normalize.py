@@ -5,8 +5,11 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from jobagent import normalize
 from jobagent.normalize import (
     DESIGN_DOMAIN_WORDS,
     FAMILIES,
@@ -594,6 +597,42 @@ class TestVocabGapWords018:
         for word, fam in NEW_018:
             hit = [f for ws, f in TITLE_RULES if word in ws]
             assert hit == [fam], f"`{word}` 在 normalize.py 里判 {hit}，测试期望 {fam}"
+
+    def test_rejected_comment_matches_the_table(self) -> None:
+        """`normalize.py` 那段注释里手写的否决词，必须都在 `REJECTED_018` 里。
+
+        这条是因为一个真缺陷加的：注释里原本列着「分析/供应链/基建/商务/增长/激励/
+        工艺/绩效/版权/**猎聘**」，而 `猎聘` 从没被度量过、也不在 `REJECTED_018` 的
+        16 条里 —— 全 repo 只有那一行提到它，是写注释时凭空多出来的。
+
+        `REJECTED_018` 这个常量存在的目的就是防止否决理由只活在注释里（否则下一个人
+        会重新发现那些词「能救很多」然后加回来）。但**注释本身没人查**，所以绕开它
+        毫无阻力。散文里的清单要么删掉，要么加一条测试盯着 —— 这条是后者。
+
+        反方向（表里有、注释没写）故意不查：注释只说「剩下 9 个同理」，本来就不是全集。
+        """
+        import re
+
+        from scripts.measure_family_gaps import REJECTED_018
+
+        src = Path(normalize.__file__).read_text(encoding="utf-8")
+        m = re.search(r"# 剩下 9 个（([^）]+)）同理否决", src)
+        assert m, (
+            "没在 normalize.py 里找到那段否决词注释 —— 如果是有意改写的，"
+            "把这条测试的正则一起改；如果注释被删了，这条测试也该删。"
+        )
+        in_comment = m.group(1).split("/")
+        table = {w for w, _fam, _why in REJECTED_018}
+        ghosts = [w for w in in_comment if w not in table]
+        assert not ghosts, (
+            f"注释里这些词不在 REJECTED_018 里：{ghosts}。"
+            "要么它们真被否决过 —— 那就连理由一起写进 REJECTED_018；"
+            "要么是凭空写上去的 —— 那就从注释里删掉。`猎聘` 是后一种。"
+        )
+        assert len(in_comment) == len(table) - 7, (
+            f"注释说「剩下 9 个」但列了 {len(in_comment)} 个，"
+            f"而表里共 {len(table)} 个、上面已逐条写了 7 个。三个数要自洽。"
+        )
 
 
 class TestCityNormalization:
