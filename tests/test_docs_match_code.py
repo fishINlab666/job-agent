@@ -156,6 +156,56 @@ class TestSpecKnowsEveryModule:
             )
 
 
+class TestReadmeTableCoversEveryTestFile:
+    """README 的分文件表必须覆盖 `tests/test_*.py` 全部文件。
+
+    这张表烂过一次，而且烂得很有教育意义：在发布 commit `9d6ffb1` 上跑分文件收集，
+    它点名的 9 行数字 **98/69/64/63/54/39/31/24/23 全对**，「其余」桶的 39 也对，
+    **合计正好等于当时真实的 504**。它不是写错了 —— 是写完之后新增的 8 个测试文件
+    从没进过它。
+
+    顺带那天它也确实错了一处：「其余 **6** 个文件」实际是 **5** 个。
+    数字列合计对上给了整张表虚假的可信度，而错的是**文件数**那一列 ——
+    另一个维度。所以这条判据两个方向都查。
+    """
+
+    @staticmethod
+    def _named() -> set[str]:
+        text = README.read_text(encoding="utf-8")
+        assert "| 文件 | 覆盖 |" in text, (
+            "README 里找不到分文件表的表头「| 文件 | 覆盖 |」—— 是不是改了列？"
+        )
+        body = text.split("| 文件 | 覆盖 |")[1].split("\n\n")[0]
+        return set(re.findall(r"^\|\s*`(test_[a-z0-9_]+\.py)`", body, re.M))
+
+    @staticmethod
+    def _actual() -> set[str]:
+        got = {p.name for p in (ROOT / "tests").glob("test_*.py")}
+        assert len(got) >= 20, f"只找到 {len(got)} 个测试文件，锚点可疑：{sorted(got)}"
+        return got
+
+    def test_every_test_file_is_in_the_table(self) -> None:
+        """锚点是 `ls tests/test_*.py`，不是表本身。
+
+        拿表当锚点只查得出「表里有不存在的文件」，查不出「文件没进表」——
+        而这次烂掉的正是后者，8 个文件。
+        """
+        missing = sorted(self._actual() - self._named())
+        assert not missing, (
+            f"这些测试文件不在 README 的表里：{missing}。\n"
+            f"表以前是靠一个「其余 N 个文件」的桶兜着的，新文件进不进桶没人知道 ——"
+            f"于是 8 个文件在表外待了三个月。现在一个都不许兜。"
+        )
+
+    def test_table_has_no_file_that_does_not_exist(self) -> None:
+        """反方向：表里不许有已经删掉/改名的文件。"""
+        stale = sorted(self._named() - self._actual())
+        assert not stale, (
+            f"README 的表里这些文件已经不存在了：{stale}。\n"
+            f"删测试文件时顺手改表 —— 指向空气的行比没有行更误导。"
+        )
+
+
 class TestTestCountHasOneHome:
     """「当前有多少个用例」在文档里只许有一个出处。
 
