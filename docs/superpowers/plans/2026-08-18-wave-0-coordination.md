@@ -20,20 +20,20 @@
 | Q3 CI/#32 顺序 | 已核实 | 用户批准 CI 先行；#32 落地前禁止调用 `check_form_selectors` |
 | Q4 strict 分支同步 | 已核实 | 用户批准保留 strict/up-to-date；每层 retarget 后把锁定的最新 `main` 以 merge commit 合入 topic，普通 push 单独审批，随后清空旧证据并重建候选 |
 | PR/Issue/CI 快照 | 已核实 | 2026-08-18 执行 `gh api`：10 个 open PR、17 个 open Issue、0 个 workflow；执行前必须刷新，不把本行当永久事实 |
-| 协调文档版本化 | 进行中 | 本行是 Step 4 pre-commit snapshot：W0-00 隔离 worktree 与本地分支已创建，两份文档处于未提交候选；Step 4 成功后以 §4.2 的 local live-state 为准。Issue、远端分支和 PR 尚未创建，不得提交或推送现有 PR #21 head 分支 |
+| 协调文档版本化 | fixed-on-branch | W0-00 Issue #34、远端分支 `docs/wave0-coordination` 与 draft PR #35 已创建；W0-00 当前状态和实时 base/head/merge SHA 只从 GitHub API 与 PR #35 live-state 读取，本文件不把历史观察当当前真值 |
 | Wave 0 子计划 | 未开始 | 只允许按 W0-01 → W0-06 顺序逐份创建、审批和执行 |
 
 ### 0.1 实时 WIP 台账
 
 | Key | Owner | Issue / Plan | Branch → Target | 状态 | Base / Head / Merge SHA | Freeze reason | 未验证项 | 最后核实 |
 |---|---|---|---|---|---|---|---|---|
-| W0-00 | 主 agent | 新建协调文档 Issue / 本文件 | `docs/wave0-coordination` → 先以 PR #21 head 分支为 draft base，W0-06 完成后最终 retarget `main` | active | local base=`c2be0c2fb81a1c9eaf46f7516b87592d1fa5cf7c`；pre-commit observed head=`c2be0c2fb81a1c9eaf46f7516b87592d1fa5cf7c` at `2026-08-18`；当前 head 必须实时读取，不写回自身；merge=`not-created` | none | local branch/worktree 已创建；`w0_docs_root=/private/tmp/job-agent-wave0-docs.WS8DnV`；`checkout=/private/tmp/job-agent-wave0-docs.WS8DnV/checkout`；Issue、远端分支、draft PR=`not-created`；初始 docs commit 由 Step 4 创建并外部 readback；当前停在候选复核 | `git -C /private/tmp/job-agent-wave0-docs.WS8DnV/checkout branch --show-current`；`git -C /private/tmp/job-agent-wave0-docs.WS8DnV/checkout rev-parse HEAD`；`git ls-remote --heads origin refs/heads/docs/wave0-coordination`；GitHub REST readback |
-| W0-01 | 主 agent | 新建 CI Issue / Plan 022 | `chore/wave0-clean-ci` → `release/0.2.0-two-phase-apply` | not-started | expected base=`50f5e35d2f32b171a5684de83be17070eeb8b1d5`; head/merge=`not-created` | none | 执行前刷新 PR #1 与 release head 并要求相等 | `gh pr view 1 --json headRefOid` |
+| W0-00 | 主 agent | #34 / 本文件 | `docs/wave0-coordination` → 先以 PR #21 head 分支为 draft base，W0-06 完成后最终 retarget `main` | fixed-on-branch | PR #35；当前 base/head/merge SHA 必须从 GitHub API 与 PR live-state 同次 readback，不从本文件恢复 | 等待下一次 ledger/子计划 sync；最终 retarget 要等 W0-06 verified-on-target | W0-01–W0-06 尚未执行；六份子计划尚未起草或批准 | `gh pr view 35 --repo fishINlab666/job-agent --json state,isDraft,baseRefOid,headRefOid,potentialMergeCommit`；PR #35 live-state readback |
+| W0-01 | 主 agent | #36 / Plan 022 | `chore/wave0-clean-ci` → `release/0.2.0-two-phase-apply` | not-started | expected base=`50f5e35d2f32b171a5684de83be17070eeb8b1d5`; head/merge=`not-created` | none | 执行前刷新 PR #1 与 release head 并要求相等 | `gh pr view 1 --json headRefOid` |
 | W0-02 | 主 agent | #32 / Plan 023 | `fix/issue-32-mcp-read-only` → updated release | not-started | base/head/merge=`not-created` | none | 等 W0-01 verified-on-target | 依赖 W0-01 |
-| W0-03 | 主 agent | 新建 PR 栈 Issue / Plan 024 | 逐层 retarget + merge 锁定的 `main` 到 topic → `main` | not-started | base/head/merge=`not-created` | none | 等 W0-02 verified-on-target | 依赖 W0-02 |
-| W0-04 | 主 agent | 新建工作区规则 Issue / Plan 025 | change package → 仓库根目录相对路径 `../CLAUDE.md` | not-started | base/head/merge=`not-created` | none | 等 W0-03 verified-on-target | 依赖 W0-03 |
-| W0-05 | 主 agent | 新建仓库治理 Issue / Plan 026 | `docs/wave0-repo-governance` → `main` | not-started | base/head/merge=`not-created` | none | 等 W0-04 verified-on-target | 依赖 W0-04 |
-| W0-06 | 主 agent | 新建反馈交接 Issue / Plan 027 | `docs/wave0-feedback-ledger` → `main` | not-started | base/head/merge=`not-created` | none | 等 W0-05 verified-on-target | 依赖 W0-05 |
+| W0-03 | 主 agent | #37 / Plan 024 | 逐层 retarget + merge 锁定的 `main` 到 topic → `main` | not-started | base/head/merge=`not-created` | none | 等 W0-02 verified-on-target | 依赖 W0-02 |
+| W0-04 | 主 agent | #38 / Plan 025 | change package → 仓库根目录相对路径 `../CLAUDE.md` | not-started | base/head/merge=`not-created` | none | 等 W0-03 verified-on-target | 依赖 W0-03 |
+| W0-05 | 主 agent | #39 / Plan 026 | `docs/wave0-repo-governance` → `main` | not-started | base/head/merge=`not-created` | none | 等 W0-04 verified-on-target | 依赖 W0-04 |
+| W0-06 | 主 agent | #40 / Plan 027 | `docs/wave0-feedback-ledger` → `main` | not-started | base/head/merge=`not-created` | none | 等 W0-05 verified-on-target | 依赖 W0-05 |
 
 台账中的 `not-created` 是明确状态：对象尚不存在，不能填写 SHA。每次状态变化必须按 §4 的控制面换槽协议更新本表；同时最多一行可为 `active`，所有 frozen 行必须写明 Freeze reason。
 
@@ -254,13 +254,13 @@ branch push、PR 创建、Issue 评论/关闭、Ruleset 或仓库设置变更都
 
 | Key | 顺序 | Issue | 子计划 | 目标/分支 | 完成定义 |
 |---|---:|---|---|---|---|
-| W0-00 | 0 | 新建：`[Wave 0] 协调规格与执行台账版本化` | 本文件 | `docs/wave0-coordination` → draft base 为 PR #21 head 分支；W0-06 完成后 retarget `main` | 当前规格和计划不污染 #21；持续承载台账，最终以独立 merge commit 进入 `main` |
-| W0-01 | 1 | 新建：`[Wave 0] 干净交付测试自包含与 GitHub Actions 强制门禁` | `docs/plans/022-干净交付测试与CI.md` | `chore/wave0-clean-ci` → `release/0.2.0-two-phase-apply` | CI 与 Ruleset 生效，候选通过并以 merge commit 进入 release |
+| W0-00 | 0 | #34：`[Wave 0] 协调规格与执行台账版本化` | 本文件 | `docs/wave0-coordination` → draft base 为 PR #21 head 分支；W0-06 完成后 retarget `main` | 当前规格和计划不污染 #21；持续承载台账，最终以独立 merge commit 进入 `main` |
+| W0-01 | 1 | #36：`[Wave 0] 干净交付测试自包含与 GitHub Actions 强制门禁` | `docs/plans/022-干净交付测试与CI.md` | `chore/wave0-clean-ci` → `release/0.2.0-two-phase-apply` | CI 与 Ruleset 生效，候选通过并以 merge commit 进入 release |
 | W0-02 | 2 | 现有 #32 | `docs/plans/023-MCP越界体检移除.md` | `fix/issue-32-mcp-read-only` → updated release | MCP 注册表、守卫和文档通过，merge commit 进入 release |
-| W0-03 | 3 | 新建：`[Wave 0] 叠加 PR 候选审计与逐层合入` | `docs/plans/024-叠加PR审计与逐层合入.md` | 逐层 retarget，并把锁定的 `main` merge 到 topic 后进入 `main` | 10 个 PR 逐个验证并以 merge commit 进入 `main` |
-| W0-04 | 4 | 新建：`[Wave 0] 工作区协作规则落地` | `docs/plans/025-工作区协作规则.md` | `../CLAUDE.md`，非 Git 目标 | 规则应用并通过 readback/hash 核实 |
-| W0-05 | 5 | 新建：`[Wave 0] 仓库完成状态与方案模板规则落地` | `docs/plans/026-仓库治理规则.md` | `docs/wave0-repo-governance` → `main` | 仓库规则、模板、清单进入并验证于 `main` |
-| W0-06 | 6 | 新建：`[Wave 0] 技术反馈台账、文档索引与交接收口` | `docs/plans/027-反馈台账与交接收口.md` | `docs/wave0-feedback-ledger` → `main` | 台账、索引和脱敏交接进入并验证于 `main` |
+| W0-03 | 3 | #37：`[Wave 0] 叠加 PR 候选审计与逐层合入` | `docs/plans/024-叠加PR审计与逐层合入.md` | 逐层 retarget，并把锁定的 `main` merge 到 topic 后进入 `main` | 10 个 PR 逐个验证并以 merge commit 进入 `main` |
+| W0-04 | 4 | #38：`[Wave 0] 工作区协作规则落地` | `docs/plans/025-工作区协作规则.md` | `../CLAUDE.md`，非 Git 目标 | 规则应用并通过 readback/hash 核实 |
+| W0-05 | 5 | #39：`[Wave 0] 仓库完成状态与方案模板规则落地` | `docs/plans/026-仓库治理规则.md` | `docs/wave0-repo-governance` → `main` | 仓库规则、模板、清单进入并验证于 `main` |
+| W0-06 | 6 | #40：`[Wave 0] 技术反馈台账、文档索引与交接收口` | `docs/plans/027-反馈台账与交接收口.md` | `docs/wave0-feedback-ledger` → `main` | 台账、索引和脱敏交接进入并验证于 `main` |
 
 GitHub 为新 Issue 分配的数字不是占位符。创建后立即把真实编号回写本表和对应子计划；在编号产生前使用稳定 Key，不猜编号。
 
