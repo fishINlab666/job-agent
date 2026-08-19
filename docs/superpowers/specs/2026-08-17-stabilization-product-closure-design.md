@@ -2,7 +2,7 @@
 
 > 日期：2026-08-17
 >
-> 状态：2026-08-18 已按用户选择的验收方案 1 修订并获批准；Wave 0 的 PR 顺序、CI/#32 顺序、强制门禁、merge-commit 策略，以及 strict/up-to-date 下的逐层主线同步方案均已由用户批准，进入协调计划编制
+> 状态：2026-08-18 的稳定化方向、merge-commit、strict/up-to-date 与强制门禁已获批准；2026-08-19 用户进一步批准路线 A：冻结 Transaction Gate 候选，先核验 MCP 实际暴露，暴露时把 #32 紧急注销移到 CI 前，并在 W0-03 后转为发现闭环优先。本次精确文字仍须固定 SHA Review Gate 后方可应用
 >
 > 对账基准：`fix/plan-021-package-never-installed`，`c2be0c2`
 >
@@ -180,15 +180,23 @@ StatusProbe.observe(JobRef) -> ReconciliationObservation
 
 ## 5. MCP 安全边界
 
-MCP 的目标边界是严格只读：
+MCP 的目标边界是严格只读，并以运行时注册表而不是提示词或工具名作为安全 seam：
 
 - 不提供 `prepare`、`execute`、画像 identity 更新或任何状态写入。
-- `check_form_selectors` 从 MCP 注册表移除；体检暂时保留在 CLI。
-- 后续若重新开放浏览器体检，必须先有一个独立 `check()` interface：不能 mint token、不能写 `SESSIONS`、不能接受模型给出的任意目录，只能使用人工配置的目录键。
+- `check_form_selectors` 从 MCP 注册表和面向用户的工具文档移除；CLI `checkup` 的浏览器体检 Implementation 保留。
+- MCP Module 不再导入 `routing` 或 Submitter，不接受 `user_data_dir`、cookie、浏览器 profile、截图目录等登录态输入；五个保留工具只读本地数据库与白名单 intent。
+- 后续若重新开放浏览器体检，必须另立安全设计和独立 `check()` Interface：不能 mint token、不能写 `SESSIONS`、不能接受模型给出的任意目录，只能使用人工配置的目录键。
 - 所有工具拒绝未知参数；不存在的 `grad_year` 等筛选能力不得出现在文档里。
 - 返回值携带数据新鲜度、缺画像和排除范围，禁止用“正常空结果”掩盖降级。
 
-在 #32 落地前，不从 MCP 调用 `check_form_selectors`，也不把当前六工具状态描述成“严格只读”；代码边界只有在该工具移出注册表并通过守卫测试后才成立。
+2026-08-19 的只读核验已确认：本机 Claude 的项目配置与 Desktop 配置都注册了 `job-agent`，Claude 同时保持两组 `python -m jobagent.mcp_server` stdio 进程；运行时注册表仍有六个工具，且 `check_form_selectors` 强制接收 `user_data_dir`。因此“禁止调用”的文字禁令已被证实不是物理隔离。
+
+在 #32 进入 `main` 并完成真实客户端五工具 readback 前执行两层收口：
+
+1. **本机临时隔离**：先由 W0-00 把唯一 active 写租约交给 W0-02 并 readback，再记录并完整退出 Claude，确认旧 app PID 和后代全部消失；只在 app 关闭态从项目配置和 Desktop 配置同时移除 `job-agent` 条目。每份写后立即校验全文 SHA/JSON pointer，两份均通过才可重开 Claude；新 app PID 必须不同于旧 PID，两客户端列表无该 server，连续三次结构化进程树/全局 argv 扫描均无 `jobagent.mcp_server`。只改一处、app 未退出就写、写失败后重开，或仍看到任一模块进程，都不算隔离成功；W0-02 必须以 `active/local-isolation-partial` 持续占槽。若重开后 readback 失败，同一批准包只允许再退出新 app 一次并确认相关进程为零，随后停线。
+2. **仓库永久收口**：#32 从注册表删除工具与 Submitter seam，并用注册表、不可调用、敏感入参和导入图守卫阻止回归。本机隔离不代签代码修复；代码合入 release 也不自动授权恢复客户端。
+
+恢复 MCP 必须等 #32 随 PR #1 进入并验证于 `main`，再对一个明确客户端、一个已验证 clean checkout 单独设计和批准；不得自动恢复原来的双配置，也不得重新暴露第六个工具。
 
 这一定义优先于结项报告中“把可撤销 prepare 提到 MCP”的建议；该建议保留为待真人验证的产品假设，不进入当前主线。
 
@@ -196,19 +204,24 @@ MCP 的目标边界是严格只读：
 
 本设计是项目级路线，不允许作为一个大改动实施。用户复核后，先写 Wave 0 协调计划，只记录顺序、门槛和子 Issue；每个可写改动继续单独使用 `docs/plans/NNN-*.md`，协调计划本身不承载实现。W0-00 文档 PR 统一版本化本规格、协调计划、六份逐一批准的子计划和逐 PR 审计台账，任何业务代码、workflow 或工作区规则实现仍进入各自执行载体，不混入 W0-00。
 
-### Wave 0：基线治理
+### Wave 0：安全与可交付基线
 
-Wave 0 是协调波次，不是一个大 PR。每个可写改动仍绑定一个 Issue、一份方案和一组可独立回滚的提交，活动 WIP 始终为 1。已经到达 `fixed-on-branch`、因硬门槛等待验证/合入的冻结分支不占活动 WIP，但在重新取得唯一活动槽位前不得继续修改；协调计划必须显式列出所有冻结项，避免用“暂停”暗中并行开发。
+Wave 0 是协调波次，不是一个大 PR。每个可写改动仍绑定一个 Issue、一份方案和一组可独立回滚的提交，活动 WIP 始终为 1。已经到达 `fixed-on-branch`、因硬门槛等待验证/合入的冻结分支不占活动 WIP，但在重新取得唯一活动槽位前不得继续修改；只读审计、测试矩阵和后续依赖调查可以并行，不得并行修改第二个分支、计划或远端状态。
 
-1. 在 #32 落地前，把“不调用 `check_form_selectors`、不把当前 MCP 描述成严格只读”作为临时运行禁令；该禁令不等于代码边界已修复。
-2. 按真实 base/head 依赖只读审计 PR：#1 → #15 → #10 → #12 → #16 → #17 → #18 → #19 → #20 → #21。此时不得向 `main` merge，先记录每个 PR 的目标分支、对应 Issue、`base SHA + head SHA`、平台生成的 merge candidate SHA 和未验证项；任何 retarget、前序合入或 head 变化都会产生新候选，必须重新运行门槛验证。
-3. **CI 先行。** 为测试自包含与 CI 建独立 Issue/方案，并从 PR #1 head 建分支、以 `release/0.2.0-two-phase-apply` 为父目标：真实数据库/真实页面检查改成显式 opt-in 集成测试；默认测试不得依赖 gitignore 文件。GitHub Actions 只使用 `pull_request`，覆盖 `opened/synchronize/reopened/edited`，目标包含该 release 父分支和 `main`，不使用路径过滤；验证平台生成的 merge candidate，并记录 base/head/merge SHA。禁止 `pull_request_target`、secrets 和写权限，顶层 `permissions` 只能是 `contents: read`，外部 Action 固定到完整 commit SHA。
-4. CI PR 首次产生稳定 check 名后，对 `release/0.2.0-two-phase-apply` 和 `main` 启用 required status check，要求分支保持最新，管理员不得绕过。CI 变更自身必须在本地干净归档和其 PR merge candidate 的 workflow 上通过，才可使用 **Create a merge commit** 合入 release 父分支；没有远端强制规则时只能称人工门禁，不得称硬门槛。
-5. CI 生效后处理 #32：从更新后的 PR #1 head 建修复分支，以 `release/0.2.0-two-phase-apply` 为父目标；从 MCP 注册表和面向用户的工具文档移除 `check_form_selectors`，增加注册表守卫测试，不重新设计浏览器体检。#32 候选通过本地干净归档与 required check 后，使用 **Create a merge commit** 合入父分支；此时 PR #1 的新候选同时包含 CI 与安全收口。
-6. **全链合入硬门槛**：本地干净归档和 CI clean checkout 在精确候选 commit 上全部通过之前，任何 PR 都不得进入 `main`。PR #1 及后续各层一律使用 **Create a merge commit**；前序合入后先运行 `git merge-base --is-ancestor <前序获批 head SHA> origin/main`，返回 0 才能把下一层 retarget 到 `main`。由于 required check 使用 strict/up-to-date，retarget 后还必须锁定最新 `origin/main` SHA，在隔离 worktree 中把这个精确 SHA 以普通 merge commit 合入当前 topic head；禁止 rebase、force-push 和冲突自动裁决。验证锁定的 main 与原 topic head 均为新 head 的祖先后，展示同步 commit、影响范围和回退方式，取得该次普通 push 的单独批准。push 后同时 readback main/topic；若 main 在窄竞态中已移动，push 已发生但证据立即作废，从新 head 重新同步，不得继续候选 Gate。只有 readback 一致时才清空旧 base/head/merge/check/archive/merge-approval 证据，再为新 head 生成候选并逐个合入。若 topic 远端 head 改变、发生冲突或 push 非 fast-forward，立即停线；不得降低 strict 门禁绕过。W0-00 文档 PR 最终 retarget `main` 时遵循同一同步协议。
-7. 为技术反馈台账与文档规则分别建立小范围 Issue/方案，依次落地完成四级、WIP、模板、README、索引和交接；区分“开放未修”“已在未合并分支修复”“已进入 main 并验证”。
+2026-08-19 的实际暴露核验触发以下批准顺序；稳定 Key 不改名，但执行序列改为 **W0-02 → W0-01 → W0-03**：
 
-Wave 0 完成前不开发调度、批量投递或新 ATS。
+本次路线修订本身必须先由 W0-00 独占 active：规格、协调计划与 Plan 023 三个固定 SHA 经 Review Gate/批准后形成 allowlisted 文档 commit，普通 push 与 PR #35 live-state readback 分别批准并完成。只有 W0-00 随后 frozen，才允许用另一条精确 live-state 更新把唯一写租约持久交给 W0-02；不得先改客户端配置再补文档真值。
+
+1. **先做本机临时隔离。** W0-00 先通过批准/readback 的 live-state 更新把唯一 active 写租约交给 W0-02；再完整退出 Claude，记录旧 app PID/后代并确认它们全部退出。只在 app 已停止时，对项目配置和 Desktop 配置使用同一精确 allowlist 事务。写前锁定两文件 SHA，每份写后立即解析 JSON/核对候选 SHA；只有两份均通过才可重开 Claude。重开后断言新 app PID 不同于旧 PID、两个客户端 registry 无 `job-agent`、连续观测无 `jobagent.mcp_server` 后代或孤儿进程。任一失败都让 W0-02 以 `active/local-isolation-partial` 持续占槽；重开后失败只允许再退出新 app 一次并读回进程为零，随后只读报告，不得自动重试、补偿、恢复或继续实现。
+2. **#32 紧急注销先行。** 从刷新后且彼此相等的 PR #1 head / release head 建 `fix/issue-32-mcp-read-only`，目标仍是 `release/0.2.0-two-phase-apply`。exact base 只改已存在的 `jobagent/mcp_server.py` 与 `tests/test_mcp_server.py`，从 MCP 注册表和守卫测试移除 `check_form_selectors`；保留 CLI `checkup`，不从后续叠加栈复制文档，不设计新浏览器 Interface，不改 Submitter、`SESSIONS` 或投递状态机。
+3. **#32 使用 pre-CI 手工差分门槛。** 因 required check 尚不存在，不能伪称 CI 通过。精确 base 与 candidate 都在独立 `git archive` 中执行 `uv sync --frozen` 和默认全量测试；candidate 不得新增任何失败/错误，新增和保留的 MCP 安全边界 nodeid 必须零失败。整份 `tests/test_mcp_server.py` 在 clean archive 中已知有一个属于 W0-01 的画像缺失基线红，只允许该精确 nodeid 在 base/candidate 中保持同形失败，不得由 #32 越界修复。再锁定 base/head/merge SHA、diff allowlist、隐私扫描和人工 merge 批准，使用 **Create a merge commit** 合入 release。#32 保持 open，本机隔离保持有效，直到该修复随 PR #1 进入并验证于 `main`。
+4. **随后 W0-01 建立可移植测试与 CI。** 从已包含 #32 的最新 PR #1/release head 建 `chore/wave0-clean-ci`：真实数据库/真实页面检查改成显式 opt-in；默认测试不得依赖 gitignored 文件。GitHub Actions 只使用 `pull_request`，覆盖 `opened/synchronize/reopened/edited`，目标包含 release 与 `main`，不使用路径过滤；验证平台生成的 merge candidate 并记录 base/head/merge SHA。禁止 `pull_request_target`、secrets 和写权限，顶层 `permissions` 只能是 `contents: read`，外部 Action 固定到完整 commit SHA。
+5. CI PR 首次产生稳定 check 名后，对 release 与 `main` 启用 required status check，要求 strict/up-to-date、管理员不得绕过。CI 变更自身必须在本地干净归档和其 PR merge candidate 的 workflow 上通过，才可使用 **Create a merge commit** 合入 release；没有远端强制规则时只能称人工门禁。
+6. **W0-03 全链合入。** 先按真实 base/head 依赖只读审计 `#1 → #15 → #10 → #12 → #16 → #17 → #18 → #19 → #20 → #21`。PR #1 的新候选必须同时包含已验证的 #32 与 CI。PR #15 首次引入 `docs/MCP_SETUP.md`；处理该层前必须单独展示/批准只把当前工具清单同步为五工具的兼容补丁，禁止临场顺手修改。各层一律使用 **Create a merge commit**；前序合入后验证其获批 head 已成为 `main` 祖先，再 retarget 下一层。strict/up-to-date 下继续执行“锁定 main → merge main 到 topic → 单独批准普通 push → 清空旧证据 → 重建候选”；冲突、main/topic 移动或非 fast-forward 都立即停线。
+7. **W0-03 后立即建立快速产品反馈检查点。** 从干净 clone 安装，连接真实 MCP 客户端，只验证五个严格只读工具；不调用浏览器、登录态或真实投递，也不把演示成功冒充连续三天或 Wave 5 验收。
+8. W0-04–W0-06 继续作为治理 lane，但不再阻塞产品纵向切片。它们仍受唯一写 WIP 约束、各自单独审批和目标验证；W0-00 可保持 frozen/open，待治理 lane 完成后再收口自身文档 PR。
+
+安全 tranche（本机隔离、W0-02、W0-01、W0-03、五工具 checkpoint）未完成前，不开发 Wave 1–5。安全 tranche 通过后，产品工作不再等待 W0-04–W0-06。
 
 ### Wave 1：数据、身份和画像 Interface
 
@@ -219,32 +232,34 @@ Wave 0 完成前不开发调度、批量投递或新 ATS。
 - #24 再统一 `JobRef`，为投递和查询提供稳定身份。
 - #25/#26 随后统一 `ProfileContext`、缺失/空 intent 语义和建档路径；这是 `ApplicationWorkflow` 的前置 Interface，不得延后到投递状态机之后。
 
-### Wave 2：投递安全
+### Wave 2：发现准备与用户可达性
 
-顺序：#27 → #28 → #29。
+顺序：#31 → #33 → 目标公司池与源登记可达性 → #30。
 
-- 先阻止重复投递和错误诱导。
-- 再实现额度预留、并发和崩溃恢复。
-- 再保证确认界面展示 warnings。
-- #32 的最小禁用已经在 Wave 0 完成；若以后恢复浏览器体检，另写安全设计，不纳入当前 MVP。
-
-### Wave 3：用户可达性
-
-顺序：#31 → #33 → 目标公司池与源登记可达性。
-
-- 严格拒绝 MCP 未知参数。
+- 严格拒绝 MCP 未知参数，避免调用方以为筛选已生效。
 - 让 CLI/MCP 都交付可复制的 `JobRef`。
 - 为目标公司池建立独立 Issue/方案，通过 `ProfileContext` 的唯一入口落地。
-- 补齐飞书公司源的可复制登记步骤和验证，使“工程覆盖 5 家”转为默认用户路径可达；未验证的公司不得计入产品覆盖。
+- 补齐飞书公司源的可复制登记步骤；未验证的公司不得计入产品覆盖。
+- 让 partial/failed 进入事件流和用户输出；“没有变化”与“没有可信数据”必须可区分。
 
-### Wave 4：主动发现闭环
+### Wave 3：主动发现闭环
 
-1. #30：partial/failed 进入事件流和用户输出。
-2. 增加单机调度；MVP 只选一个最小本地通知通道。
-3. 在观察开始前冻结候选版本、三个公司源和目标岗位判定规则；另建独立真值台账，由非试用用户的验收人员通过官网人工走查或官方数据快照记录岗位 URL、源站 ID 和时间戳，不复用 job-agent 的采集或匹配结果。
-4. 连续三天运行，把每轮输出与同期独立真值逐项对照，记录每个源的成功、降级、漏报、误报和新鲜度；没有真值记录的日期不计入三天窗口。
-5. #8/#13 只处理三天验收中真实影响目标岗位的分类缺口，不为追求全库百分比继续堆词表。任何会改变漏报或误报结果的修复都使旧观察失效，修复后的候选版本必须重新连续运行三天。
-6. 观察期结束后，由主验收用户确认是否已无需手动巡检官网，并列出仍关心但未覆盖的公司；不能形成短而可枚举的名单即不通过。独立验收人员建立真值不算主验收用户的日常巡检。
+1. 增加单机调度；MVP 只选一个最小本地通知通道。
+2. 在观察开始前冻结候选版本、三个公司源和目标岗位判定规则；另建独立真值台账，由非试用用户的验收人员通过官网人工走查或官方数据快照记录岗位 URL、源站 ID 和时间戳，不复用 job-agent 的采集或匹配结果。
+3. 连续三天运行，把每轮输出与同期独立真值逐项对照，记录每个源的成功、降级、漏报、误报和新鲜度；没有真值记录的日期不计入三天窗口。
+4. #8/#13 只处理三天验收中真实影响目标岗位的分类缺口。任何会改变漏报、误报、新鲜度或通知行为的修复都使旧观察失效，修复后的候选版本必须重新连续运行三天。
+5. 观察期结束后，由主验收用户确认是否已无需手动巡检官网，并列出仍关心但未覆盖的公司；不能形成短而可枚举的名单即不通过。
+
+### Wave 4：投递安全
+
+在写真实投递状态前，先经用户明确授权，对两家目标公司的真实表单做“不提交”的字段走查，确认必填折叠段、开放题、验证码和成功/重复观测点；登录态和页面内容不得进入 Git 或日志。
+
+实现顺序：#27 → #28 → #29。
+
+- 先阻止重复投递和错误诱导。
+- 再实现额度预留、并发、崩溃恢复和 `unknown → reconcile`。
+- 再保证确认界面展示 warnings。
+- #32 的最小禁用已经在 Wave 0 完成；若以后恢复浏览器体检，另写安全设计，不纳入当前 MVP。
 
 ### Wave 5：受监督产品验收
 
@@ -344,13 +359,14 @@ open/unfixed
 
 ## 11. 下一份实施计划的范围
 
-用户复核本规格后，下一份文档只写 **Wave 0 协调计划**。它必须列出：
+本次路线修订生效后，协调计划必须明确：
 
-1. WIP=1 的子 Issue 顺序、负责人、目标分支、`base/head/merge candidate` 组合和停止条件；#32 的目标分支与接入顺序必须明确。
-2. #32 最小禁用、干净测试/CI、逐 PR 合入、规则与台账分别对应哪一份独立方案。
-3. “本地干净归档 + CI clean checkout 在精确候选 commit 上通过”这一不可跳过的合入门槛。
-4. 每个子 Issue 的完成状态只按 `fixed-on-branch → merged-to-target → verified-on-target` 迁移。
-5. strict/up-to-date 下每层 retarget 后的“锁定 main → merge main 到 topic → 单独批准普通 push → 清空旧证据 → 重建候选”协议，以及冲突、main/topic 移动和非 fast-forward 时的停止条件。
-6. 六份子计划和逐 PR 审计台账统一由 W0-00 文档 PR 版本化；每份计划批准并完成远端 readback 后才能创建对应实现载体，W0-00 最终 diff 不含实现文件。
+1. 本机 Claude 双配置隔离的前置 SHA、typed pointer、先退出后写入的精确顺序、旧/新 app PID 与后代证据、两客户端 registry readback、partial-success 保持 app 关闭的停止条件和单独恢复批准；仓库候选只保存 redacted pointer/SHA。审批展示可以包含且只包含目标 `job-agent` object 的 exact target-only hunk（其中的本机 command/cwd 不得复制进仓库或其他持久化产物），不得带出相邻配置、secret 或其他 MCP object。
+2. 稳定 Key 保持 W0-01=CI、W0-02=#32，但执行顺序改为 W0-02 → W0-01 → W0-03；#32 的 branch/target/base 与 pre-CI 手工差分门槛必须完整。
+3. #32 合入 release 前不能声称 CI 通过；W0-01 必须从已经包含 #32 的 release 新 head 创建，并让随后 PR #1 候选同时通过 clean archive、required check 和 exact SHA Gate。
+4. W0-03 后的 clean-clone/真实 MCP 客户端五工具 checkpoint；它只提供技术反馈，不代签连续三天、真实投递或外部用户验收。
+5. W0-04–W0-06 仍按 WIP=1 独立执行，但不作为 Wave 1–4 产品纵向切片的入口 Gate；W0-00 可冻结等待其最终文档收口。
+6. 产品波次改为：数据/身份/画像 → 发现准备 → 连续三天主动发现 → 投递安全 → 受监督真实投递与外部用户。
+7. Transaction Gate 完整 schema/executor 不进入当前 critical path；若未来重启，须在产品首个真实证据后作为独立工具项目重新立项。
 
-协调计划获批后，第一个可写计划只处理 **测试自包含与 CI**；CI required check 和远端门禁生效后，第二个可写计划才处理 **#32 从 MCP 注册表移除**。两者不得同时修改。Wave 1–5 只保留依赖顺序，不在 Wave 0 提前实现。
+协调计划固定 SHA 获批后，第一个可写子计划只处理 **#32 从 MCP 注册表紧急移除**；本机临时隔离是另一个非 Git 安全事务，必须先完成。#32 在 pre-CI 手工差分门槛下进入 release 后，第二个可写计划才处理 **测试自包含与 CI**。两者不得同时修改。安全 tranche 与五工具 checkpoint 通过前，Wave 1–5 只保留依赖顺序而不实施；通过后按“发现闭环优先”启动产品 lane，不等待 W0-04–W0-06。

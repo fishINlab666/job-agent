@@ -4,7 +4,7 @@
 
 **Goal:** 把当前十层叠加 PR 收成一个有 CI 强制门禁、MCP 安全边界明确、状态可追溯的 `main` 基线，同时保持 WIP=1 和每项改动可独立审核、回滚。
 
-**Architecture:** 本文件只充当协调 Module：保存依赖图、状态机、合入门槛和停止条件，不承载任何业务或 CI Implementation。W0-00 文档 PR 是本规格、协调计划、六份已批准子计划 `docs/plans/022`–`027` 和 W0-03 PR 审计台账的唯一版本化载体；这些文档不混入各实现 PR。每份子计划先在 W0-00 独立 worktree 中单独起草、Review Gate 和批准，再作为单独协调提交 push；对应实现分支只能在该计划远端 readback 后创建。同一时间只有一个工作项可处于 active，达到 `fixed-on-branch` 后可以冻结并释放活动槽位，但冻结项在重新取得槽位前不得继续修改。
+**Architecture:** 本文件只充当协调 Module：保存依赖图、状态机、合入门槛和停止条件，不承载业务或 CI Implementation。2026-08-19 路线 A 将安全 tranche 固定为“Claude 双配置临时隔离 → W0-02/#32 紧急注销 → W0-01/CI → W0-03/PR 栈 → 五工具真实客户端 checkpoint”；稳定 Key 不改名。W0-00 文档 PR 继续版本化规格、协调计划、六份子计划 `docs/plans/022`–`027` 和 W0-03 ledger；W0-04–W0-06 是非阻塞治理 lane，W0-03 验证后产品纵向切片不等待它们。每次只有一个可写 Key 为 active，L0 只读审计与准备可并行。
 
 **Tech Stack:** zsh、Git、GitHub CLI、jq、GitHub Pull Requests / Actions / Rulesets、Python 3.11、uv、pytest、Markdown。
 
@@ -17,20 +17,21 @@
 | 产品与架构规格 | 已核实 | 用户于 2026-08-18 批准 `docs/superpowers/specs/2026-08-17-stabilization-product-closure-design.md` |
 | Q1 合并策略 | 已核实 | 用户批准 Wave 0 全链只使用 **Create a merge commit** |
 | Q2 GitHub 强制门禁 | 已核实 | 用户批准 release 与 `main` 均启用 required check、strict/up-to-date、管理员不得绕过 |
-| Q3 CI/#32 顺序 | 已核实 | 用户批准 CI 先行；#32 落地前禁止调用 `check_form_selectors` |
+| Q3 CI/#32 顺序 | 已核实（已被 2026-08-19 暴露证据触发条件分支） | 用户批准路线 A；已确认 Claude 双配置和两个活跃 server 仍暴露六工具，因此改为先临时隔离，再 W0-02/#32，随后 W0-01/CI |
 | Q4 strict 分支同步 | 已核实 | 用户批准保留 strict/up-to-date；每层 retarget 后把锁定的最新 `main` 以 merge commit 合入 topic，普通 push 单独审批，随后清空旧证据并重建候选 |
+| Transaction Gate | frozen-not-applied | 三份旧候选不进入当前 critical path，不创建 schema/executor/Plan 028/Issue/branch/PR；只能在产品首个真实证据后另行立项 |
 | PR/Issue/CI 快照 | 已核实 | 2026-08-18 执行 `gh api`：10 个 open PR、17 个 open Issue、0 个 workflow；执行前必须刷新，不把本行当永久事实 |
 | 协调文档版本化 | fixed-on-branch | W0-00 Issue #34、远端分支 `docs/wave0-coordination` 与 draft PR #35 已创建；W0-00 当前状态和实时 base/head/merge SHA 只从 GitHub API 与 PR #35 live-state 读取，本文件不把历史观察当当前真值 |
-| Wave 0 子计划 | 未开始 | 只允许按 W0-01 → W0-06 顺序逐份创建、审批和执行 |
+| Wave 0 子计划 | 未开始 | 安全 tranche 只允许按 W0-02 → W0-01 → W0-03；W0-04–W0-06 后续按唯一写 WIP 执行，但不阻塞产品纵向切片 |
 
 ### 0.1 实时 WIP 台账
 
 | Key | Owner | Issue / Plan | Branch → Target | 状态 | Base / Head / Merge SHA | Freeze reason | 未验证项 | 最后核实 |
 |---|---|---|---|---|---|---|---|---|
 | W0-00 | 主 agent | #34 / 本文件 | `docs/wave0-coordination` → 先以 PR #21 head 分支为 draft base，W0-06 完成后最终 retarget `main` | fixed-on-branch | PR #35；当前 base/head/merge SHA 必须从 GitHub API 与 PR live-state 同次 readback，不从本文件恢复 | 等待下一次 ledger/子计划 sync；最终 retarget 要等 W0-06 verified-on-target | W0-01–W0-06 尚未执行；六份子计划尚未起草或批准 | `gh pr view 35 --repo fishINlab666/job-agent --json state,isDraft,baseRefOid,headRefOid,potentialMergeCommit`；PR #35 live-state readback |
-| W0-01 | 主 agent | #36 / Plan 022 | `chore/wave0-clean-ci` → `release/0.2.0-two-phase-apply` | not-started | expected base=`50f5e35d2f32b171a5684de83be17070eeb8b1d5`; head/merge=`not-created` | none | 执行前刷新 PR #1 与 release head 并要求相等 | `gh pr view 1 --json headRefOid` |
-| W0-02 | 主 agent | #32 / Plan 023 | `fix/issue-32-mcp-read-only` → updated release | not-started | base/head/merge=`not-created` | none | 等 W0-01 verified-on-target | 依赖 W0-01 |
-| W0-03 | 主 agent | #37 / Plan 024 | 逐层 retarget + merge 锁定的 `main` 到 topic → `main` | not-started | base/head/merge=`not-created` | none | 等 W0-02 verified-on-target | 依赖 W0-02 |
+| W0-01 | 主 agent | #36 / Plan 022 | `chore/wave0-clean-ci` → 含 #32 的 updated release | not-started | base/head/merge=`not-created` | none | 等 W0-02 verified-on-target；执行前刷新 PR #1 与 release head 并要求相等 | 依赖 W0-02 |
+| W0-02 | 主 agent | #32 / Plan 023 | `fix/issue-32-mcp-read-only` → `release/0.2.0-two-phase-apply` | not-started；lease handoff 后 `active/local-isolation` | expected base=`50f5e35d2f32b171a5684de83be17070eeb8b1d5`; head/merge=`not-created` | Plan 023 批准 + W0-00 live-state 将唯一写租约交给 W0-02 | 无 CI；使用 §2.2A pre-CI 手工差分 Gate | lease/config/process readback + PR #1/release head equality |
+| W0-03 | 主 agent | #37 / Plan 024 | 逐层 retarget + merge 锁定的 `main` 到 topic → `main` | not-started | base/head/merge=`not-created` | none | 等 W0-02、W0-01 verified-on-target | 依赖 W0-02 与 W0-01 |
 | W0-04 | 主 agent | #38 / Plan 025 | change package → 仓库根目录相对路径 `../CLAUDE.md` | not-started | base/head/merge=`not-created` | none | 等 W0-03 verified-on-target | 依赖 W0-03 |
 | W0-05 | 主 agent | #39 / Plan 026 | `docs/wave0-repo-governance` → `main` | not-started | base/head/merge=`not-created` | none | 等 W0-04 verified-on-target | 依赖 W0-04 |
 | W0-06 | 主 agent | #40 / Plan 027 | `docs/wave0-feedback-ledger` → `main` | not-started | base/head/merge=`not-created` | none | 等 W0-05 verified-on-target | 依赖 W0-05 |
@@ -46,9 +47,10 @@
 - 不使用 squash/rebase，不批量合并，不删除远端分支。
 - 不把“只 retarget 后等待 strict check”当成可执行路径；每层必须先按 §2.2 同步锁定的 `main` 到 topic。
 - 不在候选 SHA 变化后复用旧检查结果。
-- 不在 #32 进入目标并验证前调用 `check_form_selectors` 或宣称 MCP 已严格只读。
+- 不在 #32 随 PR #1 进入 `main`、真实客户端只显示五工具前调用或恢复 `job-agent` MCP；不得把“配置已删除”“代码已进 release”单独称为严格只读。
+- 本机临时隔离必须先完整退出 Claude 并确认旧进程树消失，再同时覆盖项目配置和 Desktop 配置；只改一处、写失败后重开 app、仍有模块进程或恢复原双配置都 Gate BLOCK。
 - 不关闭尚未在目标验证的 Issue。
-- 不提前开发 Wave 1–5 的调度、批量投递、新 ATS 或业务 Issue。
+- 安全 tranche 与五工具 checkpoint 完成前，不开发 Wave 1–5；通过后按“发现闭环优先”执行，仍禁止并行写第二个 Key。
 
 本文所有 `bash` 代码块都作为完整 zsh 脚本执行，第一行必须保持 `set -euo pipefail`；不得抽取 `test` 后面的远端写命令单独运行。任一断言或测试非零即停止，后续命令不得执行。
 
@@ -63,7 +65,7 @@
 ### 2.1 Git 合并策略
 
 - W0-01、W0-02 和原叠加 PR 全部使用 **Create a merge commit**。
-- 第一次 merge 前记录仓库原始 merge 设置，并在用户确认精确设置后暂时设为 `allow_merge_commit=true`、`allow_squash_merge=false`、`allow_rebase_merge=false`；Wave 0 完成后是否恢复原设置必须再次由用户决定。
+- W0-02 是仓库 merge-setting 收口前唯一紧急例外：仓库当前仍允许三种方法，但 merge 命令必须显式使用 `--merge --match-head-commit`，并逐字 readback actual merge commit；不得 squash/rebase。W0-01 随后在任何其他 PR merge 前记录原始设置，再经用户单独批准收紧为 `allow_merge_commit=true`、`allow_squash_merge=false`、`allow_rebase_merge=false`；治理 lane 完成后是否恢复另行决策。
 - 每次合入后、retarget 下一层前，用获批的前序 PR/head 实际调用祖先检查：
 
 ```bash
@@ -157,6 +159,21 @@ case "$sync_root" in
 esac
 ```
 
+### 2.2A #32 pre-CI 手工差分 Gate
+
+路线 A 已确认 active MCP 暴露，因此 W0-02 必须在 W0-01 之前。此时没有 workflow、required check 或 Ruleset；不得把手工门槛称为 CI/hard-gate，也不得跳过候选验证。
+
+W0-02 候选必须满足：
+
+1. branch 只能从获批 Plan 固定的 `approved_base_sha` 创建；同次 readback 的 PR #1 head 与 release head 都必须逐字等于它。两远端值一起移动也不得自动采用；必须修订 Plan/重新批准。不复用当前脏工作树或旧 branch。
+2. 实现 PR 的 diff allowlist 恰为 `jobagent/mcp_server.py` 与 `tests/test_mcp_server.py`；固定基点尚无 `docs/MCP_SETUP.md`，`docs/SPEC.md` 也没有 MCP 工具清单，因此不得从后续叠加栈复制或新建文档。Plan 023 只属于 W0-00 文档 PR，不混入实现 PR。不修改 Submitter、`routing.py`、`SESSIONS`、CLI `checkup`、数据库或客户端配置。
+3. 新的注册表/定义面/递归敏感 schema/导入白名单测试先在未修实现上失败，再在候选上通过。candidate 的 MCP 边界 target suite 在精确 deselect 已知 W0-01 基线红后必须零失败；整份文件只允许 `TestToolContract::test_unsure_jobs_carry_their_reason` 在 base/candidate 中保持同形失败。
+4. exact base 与 candidate 分别从 `git archive` 解出并各自 `uv sync --frozen`。两边执行同一默认全量测试并生成 JUnit；failed/error nodeid 集合必须逐字相等，已知 W0-01 nodeid 必须在两边保持同形。任何失败新增、消失或改名都 BLOCK，不得把基线红改名、删除或冒充通过。
+5. `git diff --check`、secret/登录目录/截图/个人数据扫描和 base/head/merge SHA readback 通过。用户单独批准精确 merge candidate 后，才允许 **Create a merge commit** 进入 release。
+6. merge 后在 release 重跑 target test；#32 Issue 保持 open、本机隔离保持有效，等 PR #1 在 W0-03 进入并验证于 `main` 后再关闭。
+
+任何 base/candidate 环境不同、candidate 新增失败、JUnit 无法解析、diff 越界或 SHA 漂移都立即停止；不得因为“这是安全修复”而降低证据标准。
+
 ### 2.3 CI 自证契约
 
 - workflow 事件只用 `pull_request`，覆盖 `opened`、`synchronize`、`reopened`、`edited`。
@@ -175,7 +192,7 @@ esac
 
 ### 2.5 候选验证门槛
 
-每个准备合入的候选必须同时满足：
+除 §2.2A 明确定义的 W0-02 pre-CI 候选外，每个准备合入的候选必须同时满足：
 
 1. `git diff --check` 通过。
 2. 不含未跟踪文件的 `git archive` 隔离目录中，`uv sync --frozen` 与 `uv run pytest -q` 退出码为 0。
@@ -250,13 +267,23 @@ PR 不为 #1 时只改变 `candidate_pr_number`。`refs/pull/N/merge` 不存在�
 
 branch push、PR 创建、Issue 评论/关闭、Ruleset 或仓库设置变更都属于远端写；不能因为前一项获批而继承授权到下一项。
 
+### 2.7 本机 Claude 双配置临时隔离
+
+本操作不是仓库远端写，也不进入 Git；它仍是安全边界变更，必须作为一个精确本地事务单独批准。manifest 至少固定：两配置文件当前 SHA-256、两个 typed JSON Pointer、预期候选 SHA-256、旧 Claude app PID/后代快照、关闭态写入顺序、新 app PID、两客户端 registry readback、结构化进程树证据、固定 host adapter 和恢复记录。仓库候选只保存 redacted pointer/SHA；审批展示可以包含且只包含目标 `job-agent` object 的 exact target-only hunk，不得包含相邻配置、secret 或其他 MCP object。
+
+执行前，W0-00 必须通过单独批准/readback 的 live-state 更新把唯一 active 写租约交给 W0-02；W0-02 从此以 `active/local-isolation` 占槽。顺序必须是：记录旧 app PID 与所有后代 → 通过固定 Computer Use adapter 完整退出 Claude → 由非 TTY 只读进程 adapter 确认旧 PID/后代都不存在 → 在 app 关闭态下用 `functions.apply_patch` 逐份应用已展示的 target-only hunk并立即做全文 SHA/JSON pointer readback → 两份都通过后才通过固定 Computer Use adapter 重开一次。每次 patch 前后都必须重验 app 与全局 `jobagent.mcp_server` token 仍为零；若 Claude 外部自动拉起，只允许执行一次 shutdown-only containment，随后停线，不得继续第二份 patch 或 relaunch。任一 patch/readback 失败都使 W0-02 保持 `active/local-isolation-partial` 并持续阻断其他写；若 phase 6 在重开后失败，同一审批只允许再退出新 app 一次并读回其 PID/后代/global token 均为零，随后停线。不得重试、补偿、恢复或继续实现。
+
+事务成功定义是：两份 JSON 均可解析、目标 object 均不存在且全文 SHA 等于候选；新 Claude app PID 非空且不等于旧 PID；Claude Code 项目级列表和 Desktop 设置可见列表均无 `job-agent`；用结构化 `ps` 数据按 PID/PPID 重建新 app 后代树，并对全局 argv token 扫描，重开后连续三次都无 `jobagent.mcp_server`。单一 `pgrep -f` 不得代签这些证据。
+
+恢复不属于本事务。只有 #32 随 PR #1 进入并验证于 `main`，且一个 clean checkout 的真实客户端 registry 恰为五工具后，才能另行批准一个客户端的一条配置；禁止自动恢复原双配置。
+
 ## 3. 工作项与文件归属
 
 | Key | 顺序 | Issue | 子计划 | 目标/分支 | 完成定义 |
 |---|---:|---|---|---|---|
 | W0-00 | 0 | #34：`[Wave 0] 协调规格与执行台账版本化` | 本文件 | `docs/wave0-coordination` → draft base 为 PR #21 head 分支；W0-06 完成后 retarget `main` | 当前规格和计划不污染 #21；持续承载台账，最终以独立 merge commit 进入 `main` |
-| W0-01 | 1 | #36：`[Wave 0] 干净交付测试自包含与 GitHub Actions 强制门禁` | `docs/plans/022-干净交付测试与CI.md` | `chore/wave0-clean-ci` → `release/0.2.0-two-phase-apply` | CI 与 Ruleset 生效，候选通过并以 merge commit 进入 release |
-| W0-02 | 2 | 现有 #32 | `docs/plans/023-MCP越界体检移除.md` | `fix/issue-32-mcp-read-only` → updated release | MCP 注册表、守卫和文档通过，merge commit 进入 release |
+| W0-02 | 1 | 现有 #32 | `docs/plans/023-MCP越界体检移除.md` | `fix/issue-32-mcp-read-only` → current release | 本机先隔离；MCP 注册表、守卫和文档通过 pre-CI 手工差分 Gate，以 merge commit 进入 release |
+| W0-01 | 2 | #36：`[Wave 0] 干净交付测试自包含与 GitHub Actions 强制门禁` | `docs/plans/022-干净交付测试与CI.md` | `chore/wave0-clean-ci` → 含 #32 的 updated release | CI 与 Ruleset 生效，候选通过并以 merge commit 进入 release |
 | W0-03 | 3 | #37：`[Wave 0] 叠加 PR 候选审计与逐层合入` | `docs/plans/024-叠加PR审计与逐层合入.md` | 逐层 retarget，并把锁定的 `main` merge 到 topic 后进入 `main` | 10 个 PR 逐个验证并以 merge commit 进入 `main` |
 | W0-04 | 4 | #38：`[Wave 0] 工作区协作规则落地` | `docs/plans/025-工作区协作规则.md` | `../CLAUDE.md`，非 Git 目标 | 规则应用并通过 readback/hash 核实 |
 | W0-05 | 5 | #39：`[Wave 0] 仓库完成状态与方案模板规则落地` | `docs/plans/026-仓库治理规则.md` | `docs/wave0-repo-governance` → `main` | 仓库规则、模板、清单进入并验证于 `main` |
@@ -270,14 +297,16 @@ GitHub 为新 Issue 分配的数字不是占位符。创建后立即把真实编
 
 | Plan | 起草 worktree / 精确基点 | 审批前状态 | 审批后的执行载体 | 最终版本化载体 / 目标 |
 |---|---|---|---|---|
-| 022 / W0-01 | W0-00 `docs/wave0-coordination` worktree；计划内锁定刷新后的 PR #1/release SHA | 仅该 worktree 的未提交文件；W0-00 独占 active | `chore/wave0-clean-ci` → release | W0-00 文档 PR → `main` |
-| 023 / W0-02 | 同一 W0-00 worktree；计划内锁定含 W0-01 的 release SHA | 同上 | `fix/issue-32-mcp-read-only` → updated release | W0-00 文档 PR → `main` |
+| 023 / W0-02 | W0-00 `docs/wave0-coordination` worktree；计划内锁定刷新后彼此相等的 PR #1/release SHA | 仅该 worktree 的未提交文件；W0-00 独占 active | `fix/issue-32-mcp-read-only` → current release | W0-00 文档 PR → `main` |
+| 022 / W0-01 | 同一 W0-00 worktree；计划内锁定已包含 #32 的 PR #1/release 新 SHA | 同上 | `chore/wave0-clean-ci` → updated release | W0-00 文档 PR → `main` |
 | 024 / W0-03 | 同一 W0-00 worktree；计划内刷新十层 PR/live SHA | 同上 | 不新建代码分支；W0-03 active 时只执行获批的逐层 retarget/sync/merge | W0-00 文档 PR → `main` |
 | 025 / W0-04 | 同一 W0-00 worktree；计划内记录工作区 `CLAUDE.md` 旧 hash | 同上 | 无 Git 实现分支；获批补丁应用到工作区目标 | W0-00 文档 PR → `main` |
 | 026 / W0-05 | 同一 W0-00 worktree；计划内锁定当时 `main` | 同上 | `docs/wave0-repo-governance` → `main` | W0-00 文档 PR → `main` |
 | 027 / W0-06 | 同一 W0-00 worktree；计划内锁定当时 `main` | 同上 | `docs/wave0-feedback-ledger` → `main` | W0-00 文档 PR → `main` |
 
 每一行严格执行：W0-00 取得唯一 active 槽 → 只用 `apply_patch` 起草该一份 plan → 以文件 SHA 运行双人 Review Gate → 用户批准该精确 SHA → 只提交“该 plan + 必要台账” → 单独批准普通 push → 更新 W0-00 live-state 并 readback → W0-00 frozen。只有上述 readback 完成后，对应 W0-0x 才能取得 active 槽并创建表中执行载体。后续因实现发现而修改计划时必须先冻结实现 Key、换槽回 W0-00、重新 Review Gate 和批准，不得在实现分支私改计划。
+
+本次路线 A 是唯一 safety-amendment 例外：规格、协调计划和 Plan 023 三个固定 SHA 可以作为同一只读候选包接受双人 Review Gate；获批后仍只能在 W0-00 worktree 形成一个文档 commit，allowlist 恰为这三份文件，不含实现或客户端配置。该 commit 的普通 push 与 PR #35 live-state 更新仍分别审批。
 
 ## 4. 状态机与 WIP=1
 
@@ -323,28 +352,28 @@ W0-00 的台账更新也算写操作，不享有隐形并行豁免。每次需�
 
 ```mermaid
 flowchart TD
-    A["W0-00：协调文档独立 draft PR 后冻结"] --> A2["刷新远端事实与候选 SHA"]
-    A2 --> B["022：干净交付测试与 CI"]
-    B --> C["产生稳定 required check"]
-    C --> D["启用 release/main Ruleset"]
-    D --> E["W0-01 merge commit 进入 release"]
-    E --> F["023：移除 MCP 越界体检"]
-    F --> G["W0-02 通过双重门槛并进入 release"]
-    G --> H["024：叠加 PR 逐层合入"]
-    H --> I["PR #1 merge commit 进入 main"]
-    I --> J{"前序 head 是 main 祖先？"}
-    J -- "否" --> STOP["停线：另写 restack 方案"]
-    J -- "是" --> K["单独批准：retarget 下一层"]
-    K --> S["锁定 main，merge 到 topic"]
-    S --> T["单独批准：普通 push 新 topic head"]
-    T --> V["清空旧证据并重跑候选门槛"]
-    V --> L{"仍有下一层？"}
-    L -- "是" --> J
-    L -- "否" --> M["025 工作区规则"]
-    M --> N["026 仓库治理规则"]
-    N --> O["027 反馈台账与交接"]
-    O --> DOC["最终回填 W0-00，retarget + topic 同步后合入"]
-    DOC --> P["Wave 0 最终 Gate"]
+    A["只读确认：Claude 双配置 + 活跃六工具 server"] --> P["W0-00：三份固定 SHA 文档 commit/push/live-state readback"]
+    P --> B["单独批准：双配置临时隔离"]
+    B --> W["W0-00 live-state：唯一 active 写租约交给 W0-02"]
+    W --> Q["先退出 Claude；旧 app/后代全部退出"]
+    Q --> C["app 关闭态下 patch 两配置；逐份 SHA/JSON readback"]
+    C --> R{"两份都通过？"}
+    R -- "否" --> STOP["W0-02 active/partial；保持 app 关闭并只读对账"]
+    R -- "是" --> V["重开一次；两 registry 无 server + 三次进程树扫描"]
+    V --> S{"重开后 readback 全通过？"}
+    S -- "否" --> X["只退出新 app 一次；进程归零 readback；W0-02 继续占槽"]
+    S -- "是" --> D["023 / W0-02：#32 紧急注销"]
+    D --> E["pre-CI base/candidate 差分 Gate"]
+    E --> F["W0-02 merge commit 进入 release"]
+    F --> G["022 / W0-01：clean archive + CI"]
+    G --> H["required check + Ruleset"]
+    H --> I["W0-01 merge commit 进入 release"]
+    I --> J["024 / W0-03：PR #1 候选含 #32 + CI"]
+    J --> K["逐层 merge commit 进入 main"]
+    K --> L["clean clone + 真实客户端五工具 checkpoint"]
+    L --> M["发现闭环优先的产品 lane"]
+    L --> N["W0-04–W0-06 非阻塞治理 lane"]
+    N --> O["W0-00 最终文档收口"]
 ```
 
 ## 6. Tasks
@@ -516,31 +545,71 @@ git commit -m "docs: record Wave 0 issue map"
 
 Expected: `w0_docs_root` 必须从 W0-00 台账恢复，不得在当前 PR #21 工作树临时赋值；只提交协调计划的状态和 Issue 映射，不夹带代码或 `AGENT_HANDOFF.md`。push 更新 W0-00 draft PR 是独立远端写，执行前再次请求批准。
 
-### Task 2: 创建、审批并执行 W0-01 / Plan 022
+### Task 2: 创建、审批并执行 W0-02 / Plan 023（Issue #32 紧急注销）
+
+**Files:**
+- Create: `docs/plans/023-MCP越界体检移除.md`
+- Planned scope: `jobagent/mcp_server.py`、`tests/test_mcp_server.py`（两者都存在于 exact `50f5…` 基点；不得复制后续栈文件）
+- Branch: `fix/issue-32-mcp-read-only`
+- Target: `release/0.2.0-two-phase-apply`
+
+- [ ] **Step 1: 版本化获批的路线修订与 Plan 023**
+
+Expected: W0-00 独占 active；规格、协调计划和 Plan 023 三文件 SHA 经双人 Review Gate 与用户批准后，只形成一个 allowlisted 文档 commit。单独批准普通 push 与 PR #35 live-state readback 后，W0-00 frozen，W0-02 才可 active。
+
+- [ ] **Step 2: 持久换槽并完成 Claude 双配置临时隔离**
+
+Expected: Step 1 远端 readback 完成后，先展示并单独批准 PR #35 的精确 live-state 更新，把唯一 active 写租约从 W0-00 交给 W0-02；写后 readback 必须显示 W0-00 frozen、W0-02=`active/local-isolation`，随后才执行获批 §2.7 manifest。先确认旧 Claude 进程树完全退出，再在 app 关闭态完成两文件 SHA/JSON readback，只有两份都通过才重开。新 app PID/两客户端列表/三次结构化进程 readback 全部通过。任何失败使 W0-02 保持 `active/local-isolation-partial` 并持续占槽；重启后的 readback 失败还必须执行 manifest 内唯一一次 shutdown containment 与退出 readback。成功后 W0-02 继续 active 进入 Step 3，不把租约自动交回 W0-00。未成功前不创建分支，也不允许任何其他写任务。
+
+- [ ] **Step 3: 用独立状态评论对齐 Issue #32 与获批 Plan**
+
+Expected: 先展示评论的精确字节与 SHA，再单独批准这一次 GitHub 写；评论只说明“原文修法是历史建议，路线 A 按获批 Plan SHA 完整注销 MCP tool”，不编辑正文、不关闭 Issue。写后 readback 的 comment ID/body SHA 不符即停线；未对齐时不开分支。
+
+- [ ] **Step 4: 锁定精确 release 基点并创建隔离实现分支**
+
+```bash
+set -euo pipefail
+approved_base_sha="50f5e35d2f32b171a5684de83be17070eeb8b1d5"
+test "${#approved_base_sha}" -eq 40
+case "$approved_base_sha" in (*[!0-9a-f]*) exit 1 ;; esac
+git fetch origin release/0.2.0-two-phase-apply
+pr1_head_sha="$(gh pr view 1 --repo fishINlab666/job-agent --json headRefOid --jq .headRefOid)"
+release_head_sha="$(git rev-parse origin/release/0.2.0-two-phase-apply)"
+test "$pr1_head_sha" = "$approved_base_sha"
+test "$release_head_sha" = "$approved_base_sha"
+```
+
+Expected: 从同次 readback 中相等的 SHA 创建 `fix/issue-32-mcp-read-only` 独立 worktree；不使用当前脏工作树，不改 PR #1 branch。
+
+- [ ] **Step 5: 按 Plan 023 做 TDD 和最小 Implementation**
+
+Expected: 新守卫先证明六工具注册表会失败；修复只改 exact base 已存在的 `jobagent/mcp_server.py` 与 `tests/test_mcp_server.py`，删除 MCP tool、Submitter import/bridge 与旧工具测试。CLI `checkup`、Submitter、routing、SESSIONS 和数据库不变；不创建或复制后续栈文档。
+
+- [ ] **Step 6: 执行 §2.2A pre-CI 手工差分 Gate**
+
+Expected: 精确 deselect 已知 W0-01 基线红后的 MCP 边界 target suite 零失败；base/candidate 独立 archive 的 failed/error 集合逐字相等，已知 nodeid 必须在两边保持同形；diff allowlist、隐私扫描和 base/head/merge SHA 全部一致。当前无 required check，证据必须明确写 manual-gate。
+
+- [ ] **Step 7: 单独批准 push、draft PR 与 merge commit**
+
+Expected: 每次远端写分别展示精确对象。merge 前重新读取获批 base/head/merge SHA，使用 `--merge --match-head-commit` 且保留分支。release 目标复验后 W0-02=`verified-on-target`；#32 Issue 与本机隔离继续保持，等待 promotion 到 main。
+
+### Task 3: 创建、审批并执行 W0-01 / Plan 022（CI 与干净交付）
 
 **Files:**
 - Create: `docs/plans/022-干净交付测试与CI.md`
 - Planned scope: `.github/workflows/ci.yml` 与干净归档失败涉及的测试 fixture/配置
 - Branch: `chore/wave0-clean-ci`
-- Target: `release/0.2.0-two-phase-apply`
+- Target: 已包含 #32 的 `release/0.2.0-two-phase-apply`
 
-- [ ] **Step 1: 按 `docs/plans/_TEMPLATE.md` 写 Plan 022**
+- [ ] **Step 1: 从 W0-02 验证后的 release 新 head 起草 Plan 022**
 
-先让 W0-00 独占 active，在其 worktree 创建唯一未提交文件 Plan 022；此前不得创建 `chore/wave0-clean-ci`。Plan 022 必须写出：每个干净归档失败/错误及最小复现；真实数据库/画像/页面检查的 opt-in 语义；默认 fixture 的版本库归属；workflow 事件、权限、Action 完整 SHA、merge-candidate 证据；Ruleset 精确配置与回退；失败时不允许合入。
+Required: W0-00 独占 active，在其 worktree 创建唯一未提交文件 Plan 022；逐条写出干净归档失败、opt-in 真实数据语义、fixture 归属、workflow、Ruleset 和回退。不修改 #32 已验证行为。
 
-- [ ] **Step 2: 对 Plan 022 运行双人 Review Gate**
+- [ ] **Step 2: 双人 Review Gate、用户批准并版本化 Plan 022**
 
-Expected: 两名独立审查者和主审均无 P0/P1；技术版与 Freshmeat 版一致。
+Expected: 无 P0/P1；固定 SHA 获批后只提交 Plan 022 与必要台账，普通 push 与 live-state 分别批准/readback。随后 W0-01 才可 active。
 
-- [ ] **Step 3: 请求用户批准 Plan 022**
-
-Expected: 未批准前不创建实现分支、不改测试、不创建 workflow。批准精确文件 SHA 后，按 §3.1 只提交 Plan 022 与必要台账，单独批准 push 并完成 W0-00 live-state readback；然后冻结 W0-00。
-
-- [ ] **Step 4: 在独立 worktree 中按 Plan 022 执行 TDD**
-
-Required sub-skills: `using-git-worktrees`、`test-driven-development`、`subagent-driven-development` 或 `executing-plans`。
-
-创建分支前必须精确锁定基点：
+- [ ] **Step 3: 从已包含 #32 的精确 release head 创建实现分支**
 
 ```bash
 set -euo pipefail
@@ -551,117 +620,19 @@ test -n "$pr1_head_sha"
 test "$pr1_head_sha" = "$release_head_sha"
 ```
 
-Expected: 只允许从该次刷新得到且彼此相等的 `pr1_head_sha` / `release_head_sha` 创建 `chore/wave0-clean-ci`；先复现干净归档失败，再逐项修到目标与反向测试通过；不修改 #32 或业务 Issue。
+Expected: 只从相等的新 SHA 创建 `chore/wave0-clean-ci`；先复现 clean archive 基线，再逐项 TDD；不得恢复第六 MCP 工具。
 
-- [ ] **Step 5: 让 CI PR 自证并生成稳定 check 名**
+- [ ] **Step 4: 让 CI PR 自证并生成稳定 check 名**
 
-Expected: `pull_request` workflow 在该 PR 的 merge candidate 上运行；记录 base/head/merge SHA 与 check 名。未触发时不得用 push、`pull_request_target` 或口头确认绕过。
+Expected: `pull_request` workflow 在 merge candidate 上运行；记录 base/head/merge SHA 与 check 名。未触发时不得使用 push、`pull_request_target` 或口头确认绕过。
 
-- [ ] **Step 6: 展示并启用 Ruleset**
+- [ ] **Step 5: 单独批准 Ruleset 与 merge 设置**
 
-Expected: 用户确认精确配置后，release 与 `main` 都要求同一 check、strict/up-to-date、管理员无 bypass；回读设置确认生效。
+Expected: release/main 都要求同一 check、strict/up-to-date、管理员无 bypass；仓库只允许 Create a merge commit；写后逐项 readback。
 
-- [ ] **Step 7: 通过双重门槛后合入 W0-01**
+- [ ] **Step 6: 通过标准 §2.5 Gate 后 merge W0-01**
 
-```bash
-set -euo pipefail
-: "${approved_head_sha:?restore approved head SHA from the ledger}"
-: "${approved_base_sha:?restore approved base SHA from the ledger}"
-: "${approved_merge_sha:?restore approved merge SHA from the ledger}"
-: "${approved_required_check_name:?restore approved required check name from the ledger}"
-w0_ci_pr_count="$(gh pr list --repo fishINlab666/job-agent --head chore/wave0-clean-ci --state open --json number --jq 'length')"
-test "$w0_ci_pr_count" -eq 1
-w0_ci_pr_number="$(gh pr list --repo fishINlab666/job-agent --head chore/wave0-clean-ci --state open --json number --jq '.[0].number')"
-test -n "$w0_ci_pr_number"
-current_head_sha="$(gh pr view "$w0_ci_pr_number" --repo fishINlab666/job-agent --json headRefOid --jq .headRefOid)"
-current_base_sha="$(gh pr view "$w0_ci_pr_number" --repo fishINlab666/job-agent --json baseRefOid --jq .baseRefOid)"
-current_merge_sha="$(gh pr view "$w0_ci_pr_number" --repo fishINlab666/job-agent --json potentialMergeCommit --jq .potentialMergeCommit.oid)"
-test "$current_head_sha" = "$approved_head_sha"
-test "$current_base_sha" = "$approved_base_sha"
-test "$current_merge_sha" = "$approved_merge_sha"
-checks_json="$(gh api -H 'Accept: application/vnd.github+json' "repos/fishINlab666/job-agent/commits/$approved_merge_sha/check-runs?filter=latest&per_page=100")"
-matching_checks="$(jq --arg name "$approved_required_check_name" --arg sha "$approved_merge_sha" '[.check_runs[] | select(.name == $name and .head_sha == $sha)]' <<<"$checks_json")"
-test "$(jq 'length' <<<"$matching_checks")" -eq 1
-test "$(jq -r '.[0].status' <<<"$matching_checks")" = "completed"
-test "$(jq -r '.[0].conclusion' <<<"$matching_checks")" = "success"
-test "$(jq -r '.[0].app.slug' <<<"$matching_checks")" = "github-actions"
-approved_run_id="$(jq -r '.[0].details_url | capture("/actions/runs/(?<id>[0-9]+)").id' <<<"$matching_checks")"
-approved_check_suite_id="$(jq -r '.[0].check_suite.id' <<<"$matching_checks")"
-approved_run_json="$(gh api -H 'Accept: application/vnd.github+json' "repos/fishINlab666/job-agent/actions/runs/$approved_run_id")"
-test "$(jq -r .id <<<"$approved_run_json")" = "$approved_run_id"
-test "$(jq -r .check_suite_id <<<"$approved_run_json")" = "$approved_check_suite_id"
-test "$(jq -r .event <<<"$approved_run_json")" = "pull_request"
-test "$(jq -r .status <<<"$approved_run_json")" = "completed"
-test "$(jq -r .conclusion <<<"$approved_run_json")" = "success"
-gh pr merge "$w0_ci_pr_number" --repo fishINlab666/job-agent --merge --match-head-commit "$approved_head_sha" --delete-branch=false
-```
-
-Expected: `approved_head_sha`、`approved_base_sha`、`approved_merge_sha` 必须逐字取自用户刚批准且已写入台账的同一行，不得从当前查询结果反向覆盖；merge commit 进入 release，远端分支保留；Issue 经父分支复验后才到 `verified-on-target`。
-
-### Task 3: 创建、审批并执行 W0-02 / Plan 023（Issue #32）
-
-**Files:**
-- Create: `docs/plans/023-MCP越界体检移除.md`
-- Planned scope: `jobagent/mcp_server.py`、`tests/test_mcp_server.py`、`docs/MCP_SETUP.md`、`docs/SPEC.md`
-- Branch: `fix/issue-32-mcp-read-only`
-- Target: updated `release/0.2.0-two-phase-apply`
-
-- [ ] **Step 1: 从已验证的 release 新 head 起草并版本化 Plan 023，再建实现分支**
-
-Expected: W0-00 独占 active，在其 worktree 以已含 W0-01 CI 的 release SHA 为计划基准起草唯一未提交文件 Plan 023；不创建实现分支，不复用旧冻结分支。
-
-- [ ] **Step 2: 锁定最小安全范围**
-
-Required: 注册表不再暴露 `check_form_selectors`；用户工具清单不再宣称可调用；守卫禁止该工具回归。保留 CLI 体检 Implementation，不设计新的浏览器 Interface，不改投递状态。
-
-- [ ] **Step 3: 双人 Review Gate 并请求用户批准**
-
-Expected: 无 P0/P1 且用户批准精确文件 SHA 后，按 §3.1 只提交 Plan 023 与必要台账，单独批准 push 并完成 W0-00 live-state readback；随后才创建 `fix/issue-32-mcp-read-only` 并开始代码。
-
-- [ ] **Step 4: 按 Plan 023 执行 TDD 和隐私检查**
-
-Expected: 先用失败测试证明工具仍在注册表；修复后证明 MCP 不可调用它，且没有登录目录、cookie、画像或截图进入 Git。
-
-- [ ] **Step 5: 验证同一个 #32 merge candidate**
-
-Expected: 本地干净归档和 required check 对台账中的同一组三 SHA 通过。
-
-- [ ] **Step 6: 经用户确认后以 merge commit 合入 release**
-
-```bash
-set -euo pipefail
-: "${approved_head_sha:?restore approved head SHA from the ledger}"
-: "${approved_base_sha:?restore approved base SHA from the ledger}"
-: "${approved_merge_sha:?restore approved merge SHA from the ledger}"
-: "${approved_required_check_name:?restore approved required check name from the ledger}"
-w0_mcp_pr_count="$(gh pr list --repo fishINlab666/job-agent --head fix/issue-32-mcp-read-only --state open --json number --jq 'length')"
-test "$w0_mcp_pr_count" -eq 1
-w0_mcp_pr_number="$(gh pr list --repo fishINlab666/job-agent --head fix/issue-32-mcp-read-only --state open --json number --jq '.[0].number')"
-test -n "$w0_mcp_pr_number"
-current_head_sha="$(gh pr view "$w0_mcp_pr_number" --repo fishINlab666/job-agent --json headRefOid --jq .headRefOid)"
-current_base_sha="$(gh pr view "$w0_mcp_pr_number" --repo fishINlab666/job-agent --json baseRefOid --jq .baseRefOid)"
-current_merge_sha="$(gh pr view "$w0_mcp_pr_number" --repo fishINlab666/job-agent --json potentialMergeCommit --jq .potentialMergeCommit.oid)"
-test "$current_head_sha" = "$approved_head_sha"
-test "$current_base_sha" = "$approved_base_sha"
-test "$current_merge_sha" = "$approved_merge_sha"
-checks_json="$(gh api -H 'Accept: application/vnd.github+json' "repos/fishINlab666/job-agent/commits/$approved_merge_sha/check-runs?filter=latest&per_page=100")"
-matching_checks="$(jq --arg name "$approved_required_check_name" --arg sha "$approved_merge_sha" '[.check_runs[] | select(.name == $name and .head_sha == $sha)]' <<<"$checks_json")"
-test "$(jq 'length' <<<"$matching_checks")" -eq 1
-test "$(jq -r '.[0].status' <<<"$matching_checks")" = "completed"
-test "$(jq -r '.[0].conclusion' <<<"$matching_checks")" = "success"
-test "$(jq -r '.[0].app.slug' <<<"$matching_checks")" = "github-actions"
-approved_run_id="$(jq -r '.[0].details_url | capture("/actions/runs/(?<id>[0-9]+)").id' <<<"$matching_checks")"
-approved_check_suite_id="$(jq -r '.[0].check_suite.id' <<<"$matching_checks")"
-approved_run_json="$(gh api -H 'Accept: application/vnd.github+json' "repos/fishINlab666/job-agent/actions/runs/$approved_run_id")"
-test "$(jq -r .id <<<"$approved_run_json")" = "$approved_run_id"
-test "$(jq -r .check_suite_id <<<"$approved_run_json")" = "$approved_check_suite_id"
-test "$(jq -r .event <<<"$approved_run_json")" = "pull_request"
-test "$(jq -r .status <<<"$approved_run_json")" = "completed"
-test "$(jq -r .conclusion <<<"$approved_run_json")" = "success"
-gh pr merge "$w0_mcp_pr_number" --repo fishINlab666/job-agent --merge --match-head-commit "$approved_head_sha" --delete-branch=false
-```
-
-Expected: 三个 `approved_*_sha` 逐字来自用户刚批准的台账行；W0-02 在其目标 release 上成为 `verified-on-target`，但 #32 Issue 继续保持 open，作为进入 `main` 的 promotion Gate；临时运行禁令保留到 PR #1 进入并验证于 `main`。
+Expected: 本地 clean archive 与 GitHub required check 绑定同一 merge SHA；用户单独批准后以 merge commit 进入 release，分支保留。目标复验确认 PR #1 head 同时包含 #32 与 CI。
 
 ### Task 4: 创建、审批并执行 W0-03 / Plan 024（叠加 PR）
 
@@ -721,6 +692,10 @@ git merge-base --is-ancestor "$approved_head_sha" origin/main
 
 Expected: 三个 `approved_*_sha` 逐字来自用户刚批准的 PR #1 台账行；merge 成功且祖先检查退出码为 0；在 `main` 复验 MCP 注册表守卫后才可关闭 #32 并解除临时禁令。W0-02 已在 release 完成状态迁移，不重复改写其状态。
 
+- [ ] **Step 4A: PR #15 首次文档引入兼容 Gate**
+
+PR #15 是叠加栈中首次引入 `docs/MCP_SETUP.md` 的一层。取得 W0-03 active 后、对 #15 做 retarget/push/merge 前，先从获批 #15 head 展示一个仅把该文档当前 MCP 工具清单同步为五工具、删除 `check_form_selectors` 调用说明的精确兼容补丁；该补丁的 branch/head/diff/content SHA 必须单独 Review Gate 和批准。不得从更后层复制文件、不得混入其他文档整理，也不得在 merge 冲突时临场顺手修改。兼容 commit 的普通 push 是独立 L2 远端写，必须另行展示精确 old/new head 并批准/readback；完成后清空旧 candidate 证据，再按本 Task 的完整状态机重建 #15 候选。
+
 - [ ] **Step 5: 对剩余九层逐层执行相同状态机**
 
 For each PR in `#15 → #10 → #12 → #16 → #17 → #18 → #19 → #20 → #21`:
@@ -739,6 +714,12 @@ Expected: 任一步失败立即停线，不跳过失败层合并后层。
 - [ ] **Step 6: PR 栈目标分支全量复验与 Issue 对账**
 
 Expected: `main` 的干净归档与全量测试通过；最后合入 PR 的 pre-merge candidate required check 为 success，post-merge `origin/main` SHA 单独记录，两者不得冒充同一 SHA。#9/#11/#14 只有在目标行为复验后才关闭，其他 Issue 依据证据保留 open 或迁移状态。
+
+- [ ] **Step 7: clean clone + 真实 MCP 客户端五工具 checkpoint**
+
+Expected: 从已验证 `main` 创建 clean clone/clean environment，连接一个明确客户端；运行时 registry 恰为五个严格只读工具，不含 `check_form_selectors`、`user_data_dir` 或 Submitter bridge。不得调用真实浏览器、登录态或投递；结果只记技术反馈，不称三天真值或产品验收。通过后 #32 才可关闭；恢复一个客户端配置仍需单独批准。
+
+W0-03 Step 7 通过后，数据/身份/发现纵向切片可以取得后续 active 槽，不等待 W0-04–W0-06。治理 lane 仍按 WIP=1 顺序执行，不能与产品写并行。
 
 ### Task 5: 创建、审批并执行 W0-04 / Plan 025（工作区规则）
 
@@ -910,7 +891,7 @@ Expected: 无 P0/P1；P2 只有明确负责人和门槛的有界条件；技术�
 
 - [ ] **Step 6: 回填且不夸大状态**
 
-Expected: 只在七个 Key 的组合证据完整后声明 Wave 0 基线治理完成；Wave 1–5、真实页面、连续三天和外部试用仍标为未验证。若最终 Review Gate 要求任何文件修订，必须另建独立 remediation Issue/branch/PR 并重新审批，不得复活已合入的 W0-00 分支。
+Expected: 只在七个 Key 的组合证据完整后声明 Wave 0 **治理 lane** 完成；W0-03 后已开始的产品纵向切片单独按其 Plan 状态记录，不能被本行升级或降级。真实页面提交、连续三天和外部试用仍标为未验证。若最终 Review Gate 要求任何文件修订，必须另建 remediation Issue/branch/PR，不得复活已合入的 W0-00 分支。
 
 ## 7. 全局停止条件
 
@@ -923,6 +904,7 @@ Expected: 只在七个 Key 的组合证据完整后声明 Wave 0 基线治理完
 - 范围外文件进入 diff，尤其是 `profile.yaml`、`data/`、浏览器目录、截图或用户文件。
 - 任何步骤要求 squash/rebase、force-push、批量 merge 或删除远端分支。
 - 当前工作项触碰下一个工作项的文件或行为。
+- #32 进入并验证于 `main` 前，Claude 任一配置重新出现 `job-agent`、相关进程重新运行，或客户端重新显示第六工具。
 - secret/token 需要写入文件或日志；此时只能改用环境变量并重新授权。
 
 ## 8. Review Gate 验收表
@@ -930,12 +912,14 @@ Expected: 只在七个 Key 的组合证据完整后声明 Wave 0 基线治理完
 | Gate | 必须证据 | 失败动作 |
 |---|---|---|
 | 子计划批准 | 双人独立审查 + 主审，无 P0/P1 | 修订子计划，不写代码 |
-| fixed-on-branch | 目标/反向测试、全量测试、隐私扫描 | 保持 active 或回退改动 |
-| merge candidate | 本地 archive + required check + 三 SHA 一致 | 清空旧证据，重新生成候选 |
+| W0-02 fixed-on-branch | §2.2A 边界 target suite 在精确 deselect 已知 W0-01 基线红后零失败 + base/candidate 全量 JUnit failed/error 集合逐字相等 + 隐私扫描 | 保持 active 或回退改动 |
+| W0-02 merge candidate | pre-CI archive 差分 + 三 SHA 一致 + 用户对精确 candidate 单独批准；不伪称 required check | 清空旧证据，重新生成候选 |
+| 其他 fixed-on-branch | 目标/反向测试、全量测试、隐私扫描 | 保持 active 或回退改动 |
+| 其他 merge candidate | 本地 archive + required check + 三 SHA 一致 | 清空旧证据，重新生成候选 |
 | strict topic 同步 | 锁定 main、原/新 topic head、双祖先检查、本地测试、单次普通 push 批准与 readback | 保留隔离 worktree，不 push/merge；刷新后重做 |
 | merge | 用户对精确 PR 和 SHA 的单次批准 | 不调用 merge API |
 | verified-on-target | 目标分支测试、祖先检查、Issue 对账 | 不关闭 Issue，不启动下一项 |
-| Wave 0 完成 | `main` 中 W0-01–W0-06 台账、W0-00 Issue 收口评论/PR live-state、最终 main 与 Ruleset 一致 | Gate BLOCK，不进入 Wave 1 |
+| Wave 0 治理 lane 完成 | `main` 中 W0-01–W0-06 台账、W0-00 Issue 收口评论/PR live-state、最终 main 与 Ruleset 一致 | Gate BLOCK 治理收口；不撤销已通过 W0-03 五工具 checkpoint 后独立启动的产品 lane |
 
 ## 9. 当前未知与解决位置
 
@@ -947,6 +931,7 @@ Expected: 只在七个 Key 的组合证据完整后声明 Wave 0 基线治理完
 | retarget 后的 merge SHA | 复用当前快照 | W0-03 每层 retarget 后重新读取 |
 | topic 同步是否冲突、同步后的 head | 预判 Git 自动合并结果或沿用旧 head | W0-03 / W0-00 各层隔离 worktree 实际合并并记录 |
 | `AGENT_HANDOFF.md` 是否可提交 | 因文件存在就直接 add | Plan 027 隐私审计与用户确认 |
+| 未来恢复哪个 MCP 客户端 | 自动恢复本轮删除的两个条目 | #32 进入 main 且五工具 checkpoint 通过后，另立单客户端恢复审批 |
 
 ## 10. 交接要求
 
