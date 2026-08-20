@@ -4,9 +4,11 @@
 `docs/plans/013-apply_url健康巡检.md §9` 的命令人工验。分开的理由：判据要能进 CI
 且不会因为源站抖动假红；反过来，网络那层再稳也钉不住「判定顺序」这种逻辑。
 
-**形状检查读真库。** 这是有意的 —— 它要回答的问题就是「**库里现在**的链接是不是
-还长着对的样子」，喂假数据的话它永远绿。2026-08-10 那次事故（8594 条飞书链接
-少了 `/detail`）就是这条要抓的东西，而当时库里每个源的形状**数**依然是 1。
+**形状检查在 `--real-data` 下读真库。** 这是有意的 —— 它要回答的问题就是
+「**库里现在**的链接是不是还长着对的样子」，喂假数据的话它永远绿。
+默认测试和 CI 不读取本机数据；人工巡检时显式加开关。2026-08-10 那次事故
+（8594 条飞书链接少了 `/detail`）就是这条要抓的东西，而当时库里每个源的
+形状**数**依然是 1。
 """
 from __future__ import annotations
 
@@ -20,7 +22,9 @@ from jobagent import db, health
 # ---------------------------------------------------------------- 形状：真库
 
 @pytest.fixture(scope="module")
-def real_conn():
+def real_conn(request):
+    if not request.config.getoption("--real-data"):
+        pytest.skip("真实数据库检查默认关闭；人工巡检时加 --real-data")
     conn = db.connect_readonly()
     yield conn
     conn.close()
