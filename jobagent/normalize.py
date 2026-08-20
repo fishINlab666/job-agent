@@ -54,14 +54,7 @@ TITLE_RULES: list[tuple[tuple[str, ...], str]] = [
     (("设计", "美术", "视觉", "交互", "动效", "动画", "特效", "GUI", "多媒体"), "design"),
     (("产品", "策划", "项目管理", "产品经理"), "product"),
     (("市场", "营销", "公关", "品牌", "商务拓展", "商业分析", "战略", "用户研究"), "marketing"),
-    # `顾问` 是面客销售/咨询岗。加它救回 233 行 / 21 个岗位型（2026-08-13 快照）。
-    # 【原本这里写着「加进这一组和加在表末尾，改判数都是 0 —— 说明它和别的族没有
-    # 交叠」，后半句是错的，别照抄】「加在末尾改判 0」对任何词都成立，推不出「没有
-    # 交叠」。为什么见下面 `采购` 那段的同名警告。`顾问` 放在这一组本身没问题 ——
-    # 支持它的是**库级 0 改族**（scripts/measure_family_gaps.py db-effect），不是改判 0。
-    # 已知误判 1 个岗位型：`AI时尚顾问实习生-广告业务` 里 `顾问` 是头衔不是职能。
-    # 不为这 1 行加例外 —— 例外规则是下一个 issue #9 的原料。见方案 017 §3。
-    (("销售", "客户成功", "解决方案", "顾问"), "sales"),
+    (("销售", "客户成功", "解决方案"), "sales"),
     (("人力", "HR"), "hr"),
     (("法务", "法律", "公共策略"), "legal"),
     # 「研发」「后端」在这一层而**不在第 0 层**，是量过的：
@@ -126,6 +119,18 @@ TITLE_RULES: list[tuple[tuple[str, ...], str]] = [
     # 只有那一行提到它。`REJECTED_018` 存在的目的就是防止否决理由只活在注释里，
     # 而我在它旁边的注释里绕开了它。现在 tests/test_normalize.py 的
     # test_rejected_comment_matches_the_table 守着这段注释和那张表一致。
+    #
+    # 这批词由 `_family_from_title_rules` 统一消歧：财务/法务/传播等明确职能优先；
+    # 其余兼具业务域含义的词同时命中时取标题中最靠后的词，避免靠静态换序修一处、
+    # 又在另一组组合上复发。原有 product/hr/legal/tech 等主规则仍在这批之前。
+    (("结算",), "finance"),
+    (("税务",), "finance"),
+    (("资金",), "finance"),
+    (("内控",), "finance"),
+    (("成本",), "finance"),
+    (("定价",), "finance"),
+    (("法规",), "legal"),
+    (("传播",), "marketing"),
     (("软件",), "tech"),
     (("系统",), "tech"),
     (("SRE",), "tech"),
@@ -146,14 +151,6 @@ TITLE_RULES: list[tuple[tuple[str, ...], str]] = [
     (("商家",), "sales"),
     (("渠道",), "sales"),
     (("达人",), "sales"),
-    (("结算",), "finance"),
-    (("税务",), "finance"),
-    (("资金",), "finance"),
-    (("内控",), "finance"),
-    (("成本",), "finance"),
-    (("定价",), "finance"),
-    (("传播",), "marketing"),
-    (("法规",), "legal"),
     # 物流/备件 归 other 而不是新开 supply_chain，同 `采购` 的理由。
     #
     # 这里原本还有 `仓储`，量边际贡献时删掉了：库里只有 2 条含 `仓储` 的标题，
@@ -164,7 +161,24 @@ TITLE_RULES: list[tuple[tuple[str, ...], str]] = [
     # 以后新岗位撞上它只会加错，不会加对。其余 30 个词边际都 ≥1 行。
     (("物流",), "other"),
     (("备件",), "other"),
+    # `顾问` 是整个常规职能层的 sales 兜底，不是强销售词。放在最后，确保法律、
+    # 人力、硬件、产品以及本轮新增的软件/系统/法规等明确职能先赢；蔚来/乐道
+    # 门店顾问没有更具体职能时仍归 sales。
+    (("顾问",), "sales"),
 ]
+
+# 018 新词分两档。明确职能只要命中就优先；其余词经常是「业务域」，多个同时
+# 命中时按中文岗位名常见的「域在前、职能在后」取最靠后的那个。它们仍保留在
+# TITLE_RULES 中，方便测量脚本和结构测试看到同一份规则真源。
+_NEW_018_SPECIFIC_WORDS = frozenset({
+    "结算", "税务", "资金", "内控", "成本", "定价", "法规", "传播",
+})
+_NEW_018_POSITIONAL_WORDS = frozenset({
+    "软件", "系统", "SRE", "嵌入式", "结构", "材料", "热管理", "品质",
+    "电控", "仿真", "传感", "交付", "履约", "产销", "咨询", "售后",
+    "零售", "商家", "渠道", "达人", "物流", "备件",
+})
+_NEW_018_WORDS = _NEW_018_SPECIFIC_WORDS | _NEW_018_POSITIONAL_WORDS
 
 
 # 第 1.5 层用的两张表。**语义不同**，不要合并、也不要互相补词：
@@ -200,8 +214,30 @@ def _first_index(title: str, words: tuple[str, ...]) -> int | None:
     return min(hits) if hits else None
 
 
-def family_from_title(title: str) -> str | None:
-    """标题 → 归一岗位族。返回 None 表示判不出，由调用方用源站族兜底。"""
+def _last_family_for_words(
+    title: str,
+    rules: list[tuple[tuple[str, ...], str]],
+    allowed: frozenset[str],
+) -> str | None:
+    """返回 allowed 中在标题里最后出现的词对应的族。"""
+    best_at = -1
+    best_family: str | None = None
+    for keywords, family in rules:
+        for word in keywords:
+            if word not in allowed:
+                continue
+            at = title.rfind(word)
+            if at > best_at:
+                best_at = at
+                best_family = family
+    return best_family
+
+
+def _family_from_title_rules(
+    title: str,
+    rules: list[tuple[tuple[str, ...], str]],
+) -> str | None:
+    """用给定第 2 层规则分类；测量脚本也复用，避免复制判定逻辑。"""
     if any(m in title for m in TECH_MARKERS):
         return "tech"
     for keywords, fam in COMPOUND_RULES:
@@ -221,10 +257,28 @@ def family_from_title(title: str) -> str | None:
     function_at = _first_index(title, TECH_FUNCTION_WORDS)
     if domain_at is not None and function_at is not None and domain_at < function_at:
         return "tech"
-    for keywords, fam in TITLE_RULES:
-        if any(k in title for k in keywords):
+    # 原有规则（含采购）保持既有顺序。018 新词和泛化的顾问由下面单独消歧。
+    for keywords, fam in rules:
+        stable_keywords = tuple(
+            k for k in keywords if k not in _NEW_018_WORDS and k != "顾问"
+        )
+        if any(k in title for k in stable_keywords):
+            return fam
+    specific = _last_family_for_words(title, rules, _NEW_018_SPECIFIC_WORDS)
+    if specific is not None:
+        return specific
+    positional = _last_family_for_words(title, rules, _NEW_018_POSITIONAL_WORDS)
+    if positional is not None:
+        return positional
+    for keywords, fam in rules:
+        if "顾问" in keywords and "顾问" in title:
             return fam
     return None
+
+
+def family_from_title(title: str) -> str | None:
+    """标题 → 归一岗位族。返回 None 表示判不出，由调用方用源站族兜底。"""
+    return _family_from_title_rules(title, TITLE_RULES)
 
 
 def normalize_city(raw: str) -> str:

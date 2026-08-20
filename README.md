@@ -224,50 +224,17 @@ fingerprint = hashlib.sha256(
 
 ## 测试覆盖
 
-**865 个测试用例**（截至 2026-08-13），跑这条看最后一行：
+当前基线不在文档里写死，直接跑：
 
 ```bash
 uv run pytest -q
 ```
 
-这个数只写在这里一处。`docs/SPEC.md` 的验收标准那一节以前也钉过一个，两处对不上过
-（详见该文件文末 `2026-08-13` 那条变更记录），所以现在别处一律不写当前值。
-`tests/test_docs_match_code.py` 会核这里的数和 `--collect-only` 是否一致 —— 加了测试
-不改这里，测试会红。
-
-下面这张表故意不写每个文件多少条：23 个数字没人守，会跟上面那个 504 一样烂掉。
-要数就跑：
+要看各测试文件的分布，再跑：
 
 ```bash
 uv run pytest -q --collect-only | grep '::' | sed 's/::.*//' | sort | uniq -c | sort -rn
 ```
-
-| 文件 | 覆盖 |
-|---|---|
-| `test_normalize.py` | 岗位族分类、城市标准化、届别推导 |
-| `test_match.py` | 硬过滤、软打分、排除词 |
-| `test_adapter_feishu.py` | 四租户解析、分页、字段缺失 |
-| `test_ingest.py` | 变更检测、安全防护、事件产出 |
-| `test_submitter_feishu.py` | 两阶段闸门、歧义守卫、回读摘要、判据体检 |
-| `test_mcp_server.py` | 只读 MCP 工具层，含事件白名单对齐 `ingest.py` 发射点 |
-| `test_ats.py` | ATS 识别与路由判据 |
-| `test_routing.py` | 投递器选择 |
-| `test_cli.py` | 命令行出口，含 `apply` 的两阶段与 `checkup` |
-| `test_measure_family_gaps.py` | `scripts/measure_family_gaps.py` 的试算函数 |
-| `test_queries.py` | 只读查询层 |
-| `test_checkup_tencent.py` | 腾讯投递器的判据体检 |
-| `test_health.py` | 链接形状与正文判据（SPA 的 404 在渲染层） |
-| `test_submitter_tencent.py` | 腾讯表单填充与结果判据 |
-| `test_kb_index.py` | `docs/kb/README.md` 索引表与各文件 frontmatter 对齐 |
-| `test_db_migrate.py` | 迁移 |
-| `test_apply_quota.py` | 限投额度的计数与闸门 |
-| `test_digest.py` | digest 的 `job_updated` 渲染 |
-| `test_probe_buckets.py` | 探测脚本的分桶口径 |
-| `test_unsure_grouping.py` | unsure 分组与整列降级检测（issue #7） |
-| `test_adapter_tencent.py` | 腾讯适配器，全假 transport 不打网络 |
-| `test_docs_match_code.py` | 本文档与 `docs/SPEC.md` 是否还跟代码对得上 |
-| `test_packaging.py` | 包真装进了环境（不是 cwd 恰好在仓库根）、入口点与文档里的子命令都真存在 |
-| `test_e2e.py` | M1→M6 端到端串一遍 |
 
 **测试验不到的东西**（写在这里免得数字给人虚假安全感）：所有投递器测试都跑在
 假页面上，真页面的判据靠 `checkup` 命令在线核；`execute()` 的提交点击**没有任何
