@@ -17,11 +17,17 @@
 
 ### Claude Desktop
 
-配置文件在：
+常见配置位置是：
 
 ```
 ~/Library/Application Support/Claude/claude_desktop_config.json
 ```
+
+**不要只凭“文件里已经写入”就判定配置生效。** 不同发行版可能读取不同的
+Application Support 子目录；2026-08-13 的历史排查中，配置写进了 `Claude/`，
+实际运行的客户端却只读取 `Claude-3p/`，所以那次写入从未生效。真正恢复客户端前，
+必须用该客户端自己的运行时注册表或日志确认它读取的配置，并在重启后看到下面五个
+工具；当前文档不授权修改任何客户端配置。
 
 把 `job-agent` 这一段加进 `mcpServers`（文件不存在就整份写进去）：
 
