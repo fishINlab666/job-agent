@@ -106,7 +106,7 @@ run() {
     *)                echo "  ✗ **没红** —— 这条判据没有测试守着"; FAILED=1 ;;
   esac
   out=$("${PYTEST[@]}" -k "$other_k" 2>&1 | tail -1)
-  echo "  另一组（-k '$other_k'，期望 $other_expect）：$out"
+  echo "  另一组（-k '$other_k'，期望 ${other_expect}）：$out"
   case "$out" in
     *passed*|*failed*|*error*) : ;;
     *) echo "  ✗ **另一组的 -k 一条都没匹配上** —— 对照组是空的，等于没有对照组"
