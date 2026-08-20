@@ -723,3 +723,41 @@ class TestHealthSampleBounds:
 
         assert r.exit_code == 2
         assert "20" in r.output
+
+
+class TestJobIdentity:
+    def _seed_duplicate(self, conn) -> None:
+        db.register_source(
+            conn, "feishu:nio", "蔚来", "feishu",
+            "https://nio.jobs.feishu.cn", tenant="nio",
+        )
+        for source_key, company, system in (
+            ("tencent_join", "腾讯", "tencent_join"),
+            ("feishu:nio", "蔚来", "feishu"),
+        ):
+            conn.execute(
+                """INSERT INTO jobs(source_key, external_id, company, title,
+                       apply_url, apply_system, fingerprint,
+                       first_seen_at, last_seen_at)
+                   VALUES(?, 'DUP', ?, '产品运营', 'https://x', ?, 'fp', ?, ?)""",
+                (source_key, company, system, db.now(), db.now()),
+            )
+        conn.commit()
+
+    @pytest.mark.parametrize("command", ["apply", "checkup"])
+    def test_ambiguous_job_requires_source(
+        self, command, tmp_db, monkeypatch
+    ) -> None:
+        self._seed_duplicate(tmp_db)
+
+        def must_not_route(*args, **kwargs):
+            raise AssertionError("岗位还没消歧，不得进入投递路由")
+
+        monkeypatch.setattr(cli.routing, "get_submitter", must_not_route)
+        result = runner.invoke(cli.app, [command, "DUP"])
+        output = result.output.replace("\n", "")
+
+        assert result.exit_code == 1
+        assert "feishu:nio" in output and "tencent_join" in output
+        assert "--source" in output
+        assert not isinstance(result.exception, AssertionError)

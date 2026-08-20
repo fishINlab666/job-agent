@@ -24,6 +24,17 @@ from typing import Any, Iterable
 from . import db, match
 
 
+class AmbiguousJobError(ValueError):
+    """同一个 external_id 对应多个来源，调用方必须补全 source_key。"""
+
+    def __init__(self, external_id: str, source_keys: list[str]) -> None:
+        self.external_id = external_id
+        self.source_keys = source_keys
+        super().__init__(
+            f"岗位编号 {external_id!r} 出现在多个来源：{', '.join(source_keys)}"
+        )
+
+
 def _row_to_job(row: sqlite3.Row) -> dict:
     """把 jobs 行转成 dict，`cities` 解成 list。
 
@@ -91,8 +102,37 @@ def open_jobs(
     return rows, notes
 
 
+def find_job(
+    conn: sqlite3.Connection,
+    external_id: str,
+    *,
+    source_key: str | None = None,
+) -> dict | None:
+    """按完整岗位身份查找；编号重号时拒绝猜测。"""
+    if source_key is not None:
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE source_key=? AND external_id=?",
+            (source_key, external_id),
+        ).fetchone()
+        return _row_to_job(row) if row else None
+
+    rows = conn.execute(
+        "SELECT * FROM jobs WHERE external_id=? ORDER BY source_key",
+        (external_id,),
+    ).fetchall()
+    if len(rows) > 1:
+        raise AmbiguousJobError(
+            external_id, [str(row["source_key"]) for row in rows]
+        )
+    return _row_to_job(rows[0]) if rows else None
+
+
 def explain_match(
-    conn: sqlite3.Connection, external_id: str, intent: dict | None = None
+    conn: sqlite3.Connection,
+    external_id: str,
+    intent: dict | None = None,
+    *,
+    source_key: str | None = None,
 ) -> dict | None:
     """一条岗位为什么命中／不命中。岗位不存在返回 `None`。
 
@@ -100,16 +140,14 @@ def explain_match(
     「不命中」会丢掉最要紧的那一类：信息不全的岗位既没被排除也没被确认，
     该由人看一眼，而不是被系统当成不合格悄悄扣掉。
     """
-    row = conn.execute(
-        "SELECT * FROM jobs WHERE external_id=?", (external_id,)
-    ).fetchone()
-    if not row:
+    job = find_job(conn, external_id, source_key=source_key)
+    if job is None:
         return None
 
-    job = _row_to_job(row)
     intent = intent or {}
     verdict = match.classify(job, intent)
     return {
+        "source_key": job["source_key"],
         "external_id": job["external_id"],
         "company": job["company"],
         "title": job["title"],
