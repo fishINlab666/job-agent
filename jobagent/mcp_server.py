@@ -142,6 +142,7 @@ def list_jobs(
         "notes": notes,
         "jobs": [
             {
+                "source_key": r["source_key"],
                 "external_id": r["external_id"],
                 "company": r["company"],
                 "title": r["title"],
@@ -160,7 +161,7 @@ def list_jobs(
 
 
 @mcp.tool()
-def explain_match(external_id: str) -> dict:
+def explain_match(external_id: str, source_key: str | None = None) -> dict:
     """一条岗位为什么命中／不命中我的画像。
 
     `state` 是三态，别当布尔看：
@@ -169,7 +170,18 @@ def explain_match(external_id: str) -> dict:
       unknown —— **信息不全，既没被排除也没被确认**，`missing` 列出缺哪几维。
                  这类要由人看一眼，不要当成不合格。
     """
-    out = queries.explain_match(_conn(), external_id, _intent())
+    try:
+        out = queries.explain_match(
+            _conn(), external_id, _intent(), source_key=source_key
+        )
+    except queries.AmbiguousJobError as exc:
+        return {
+            "found": False,
+            "ambiguous": True,
+            "external_id": external_id,
+            "source_keys": exc.source_keys,
+            "hint": "编号来自多个来源，请把 list_jobs 返回的 source_key 一并传入。",
+        }
     if out is None:
         return {"found": False, "external_id": external_id,
                 "hint": "库里没这条。external_id 要用 list_jobs 返回的那个值。"}

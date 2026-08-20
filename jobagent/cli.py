@@ -47,6 +47,26 @@ APP_FUNNEL = (
 APP_STATUSES = tuple(s for _, ss, _ in APP_FUNNEL for s in ss)
 
 
+def _find_job_or_exit(
+    conn, external_id: str, source_key: str | None = None
+) -> dict:
+    """给写操作选定唯一岗位；重号时要求用户明确来源。"""
+    try:
+        job = queries.find_job(conn, external_id, source_key=source_key)
+    except queries.AmbiguousJobError as exc:
+        choices = "、".join(exc.source_keys)
+        console.print(
+            f"[red]岗位编号不唯一[/red] {external_id} 来自：{choices}"
+        )
+        console.print("[yellow]请加 --source 指定其中一个来源[/yellow]")
+        raise typer.Exit(1)
+    if job is None:
+        where = f"（来源 {source_key}）" if source_key else ""
+        console.print(f"[red]岗位不存在[/red] {external_id}{where}（先跑 sync）")
+        raise typer.Exit(1)
+    return job
+
+
 def _fmt_cities(cities: list[str]) -> str:
     """diff 里的城市列表转成给人看的一行。
 
@@ -750,7 +770,7 @@ def status(
 @app.command()
 def apply(
     job_id: str = typer.Argument(..., help="岗位的 external_id"),
-    source: str = typer.Option(None, help="指定源（默认从 jobs 表推断）"),
+    source: str = typer.Option(None, help="岗位编号重号时指定来源"),
     profile_path: str = typer.Option("profile.yaml", help="用户画像文件"),
     headless: bool = typer.Option(False, help="无头模式。确认环节要看页面，默认关"),
     user_data_dir: str = typer.Option(None, help="浏览器用户数据目录（持久化登录态）"),
@@ -763,12 +783,8 @@ def apply(
     """
     conn = db.connect()
 
-    row = conn.execute("SELECT * FROM jobs WHERE external_id=?", (job_id,)).fetchone()
-    if not row:
-        console.print(f"[red]岗位不存在[/red] {job_id}（先跑 sync）")
-        raise typer.Exit(1)
-    job = dict(row)
-    src = source or job["source_key"]
+    job = _find_job_or_exit(conn, job_id, source)
+    src = job["source_key"]
 
     try:
         form = profile.load_profile(profile_path)
@@ -779,11 +795,6 @@ def apply(
 
     src_row = conn.execute("SELECT * FROM sources WHERE source_key=?", (src,)).fetchone()
     lookup = dict(job)
-    if source:
-        # 显式指定了 --source 就以它为准：库里的 apply_system 会赢过 sources.system，
-        # 不清掉的话「我指定了源，它却走了另一个投递器」——排查起来看不出为什么。
-        lookup.pop("apply_system", None)
-        lookup["source_key"] = src
 
     route = routing.resolve(lookup, dict(src_row) if src_row else None)
     try:
@@ -1163,7 +1174,7 @@ def _render_plan(plan: SubmissionPlan, job: dict, form: "profile.FormProfile") -
 @app.command()
 def checkup(
     job_id: str = typer.Argument(..., help="拿哪个岗位的表单来体检（external_id）"),
-    source: str = typer.Option(None, help="指定源（默认从 jobs 表推断）"),
+    source: str = typer.Option(None, help="岗位编号重号时指定来源"),
     user_data_dir: str = typer.Option(None, help="浏览器用户数据目录（要有登录态）"),
 ) -> None:
     """核一遍投递表单的判据还认不认页面。**只读，不填不投。**
@@ -1176,18 +1187,11 @@ def checkup(
     改完选择器、或者隔一段时间没投过，跑一次。
     """
     conn = db.connect()
-    row = conn.execute("SELECT * FROM jobs WHERE external_id=?", (job_id,)).fetchone()
-    if not row:
-        console.print(f"[red]岗位不存在[/red] {job_id}（先跑 sync）")
-        raise typer.Exit(1)
-    job = dict(row)
-    src = source or job["source_key"]
+    job = _find_job_or_exit(conn, job_id, source)
+    src = job["source_key"]
 
     src_row = conn.execute("SELECT * FROM sources WHERE source_key=?", (src,)).fetchone()
     lookup = dict(job)
-    if source:
-        lookup.pop("apply_system", None)
-        lookup["source_key"] = src
     try:
         submitter = routing.get_submitter(
             lookup, dict(src_row) if src_row else None,

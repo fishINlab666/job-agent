@@ -737,6 +737,38 @@ class TestToolContract:
         assert out["found"] is False
         assert "hint" in out
 
+    def test_duplicate_job_id_exposes_sources_instead_of_guessing(
+        self, db_with_data
+    ) -> None:
+        c = db.connect(db_with_data)
+        db.register_source(
+            c, "feishu:nio", "蔚来", "feishu",
+            "https://nio.jobs.feishu.cn", tenant="nio",
+        )
+        c.execute(
+            """INSERT INTO jobs(source_key, external_id, company, title,
+                   job_family, cities, recruit_type, grad_year, apply_url,
+                   apply_system, fingerprint, first_seen_at, last_seen_at)
+               VALUES('feishu:nio','J1','蔚来','产品运营','operations','["深圳"]',
+                   'campus','26','https://x','feishu','fp',?,?)""",
+            (db.now(), db.now()),
+        )
+        c.commit()
+        c.close()
+
+        listed = call("list_jobs")["jobs"]
+        assert all("source_key" in job for job in listed)
+
+        ambiguous = call("explain_match", {"external_id": "J1"})
+        assert ambiguous["ambiguous"] is True
+        assert ambiguous["source_keys"] == ["feishu:nio", "tencent_join"]
+
+        exact = call(
+            "explain_match", {"external_id": "J1", "source_key": "feishu:nio"}
+        )
+        assert exact["found"] is True
+        assert exact["source_key"] == "feishu:nio"
+
     def test_bad_dimension_is_an_error_not_a_silent_ignore(self, db_with_data) -> None:
         from mcp import Client
 

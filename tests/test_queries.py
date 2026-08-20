@@ -228,6 +228,26 @@ class TestExplainMatch:
         out = queries.explain_match(conn, "shut", INTENT)
         assert out is not None and out["closed_at"]
 
+    def test_duplicate_external_id_requires_source(self, conn) -> None:
+        seed_job(conn, "same")
+        seed_job(conn, "same", source_key="feishu:nio", company="蔚来")
+
+        with pytest.raises(queries.AmbiguousJobError) as exc:
+            queries.explain_match(conn, "same", INTENT)
+
+        assert exc.value.source_keys == ["feishu:nio", "tencent_join"]
+
+    def test_source_key_selects_the_exact_job(self, conn) -> None:
+        seed_job(conn, "same")
+        seed_job(conn, "same", source_key="feishu:nio", company="蔚来")
+
+        out = queries.explain_match(
+            conn, "same", INTENT, source_key="feishu:nio"
+        )
+
+        assert out["source_key"] == "feishu:nio"
+        assert out["company"] == "蔚来"
+
 
 class TestSourceHealth:
 
