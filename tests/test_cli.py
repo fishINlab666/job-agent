@@ -661,6 +661,47 @@ class TestDigestEmptyState:
         assert "sync" not in r.output
 
 
+class TestSyncSurfacesDesyncCount:
+    """`fingerprint_desync` 必须出现在 sync 的输出里。见方案 016 §5 约束 3。
+
+    为什么单独测 CLI 而不只测 stats：方案 016 的第 2 和第 3 个方向的差别**全在
+    这一条上** —— 判空但不报出来（方向 2），「diff 为空所以吞掉」和「压根没变化」
+    在输出里就长得一样了，而这个 bug 第三次复发正是因为那个状态一直没人看见。
+    只加 stats 键不打印，等于选了方向 2 还以为选了方向 3。
+
+    这里 monkeypatch `ingest.sync` 而不是走真适配器：要验的是「CLI 拿到这个数会不会
+    打」，不是「sync 算得对不对」（那 6 条在 test_ingest.py 里）。走真路径得连网。
+    """
+
+    def _fake_stats(self, desync: int) -> dict:
+        return {
+            "source": "tencent_join", "bootstrap": False, "fetched": 10,
+            "opened": 0, "updated": desync, "closed": 0, "guard_tripped": False,
+            "families_first_seen": [], "family_unknown": 0,
+            "fingerprint_desync": desync,
+        }
+
+    def test_nonzero_desync_is_printed(self, tmp_db, monkeypatch) -> None:
+        monkeypatch.setattr(
+            cli.ingest, "sync", lambda *a, **k: self._fake_stats(8594)
+        )
+        r = runner.invoke(cli.app, ["sync", "--source", "tencent_join"])
+
+        assert r.exit_code == 0, r.output
+        assert "8594" in r.output
+        assert "指纹与列不同步" in r.output
+
+    def test_zero_desync_is_not_printed(self, tmp_db, monkeypatch) -> None:
+        """正常情况下恒为 0，打出来就是每轮一行噪声。"""
+        monkeypatch.setattr(
+            cli.ingest, "sync", lambda *a, **k: self._fake_stats(0)
+        )
+        r = runner.invoke(cli.app, ["sync", "--source", "tencent_join"])
+
+        assert r.exit_code == 0, r.output
+        assert "指纹与列不同步" not in r.output
+
+
 class TestHealthSampleBounds:
     @pytest.mark.parametrize("sample", ["-1", "0", "21"])
     def test_invalid_sample_is_rejected_before_health_runs(self, sample) -> None:

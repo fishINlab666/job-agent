@@ -301,6 +301,11 @@ def sync(conn, adapter: Adapter, *, dry_run: bool = False) -> dict:
         # 飞书上这个比例是 48.5%(nio) / 33.1%(xiaopeng)，按租户差 15 个百分点，
         # 而且岗位池自己在动，所以写死一个阈值必然错。见 002 §7。
         "family_unknown": 0,
+        # 指纹变了但六个字段全等的行数 = 有人绕过 sync 只改了列。
+        # 正常恒为 0，非 0 说明刚跑过修复命令或者有 bug。见方案 016。
+        # 这个数**必须打到 CLI 输出里**：只判空不报出来，等于把不一致状态藏起来，
+        # 换个字段又会以别的形式复发（那正是这个 bug 第三次出现的原因）。
+        "fingerprint_desync": 0,
     }
 
     try:
@@ -410,6 +415,22 @@ def sync(conn, adapter: Adapter, *, dry_run: bool = False) -> dict:
                     prev_cities, now_cities = _cities(prev["cities"]), _cities(j.cities)
                     if prev_cities != now_cities:
                         diff["cities"] = {"from": prev_cities, "to": now_cities}
+                    # 指纹变了但六个字段逐个比全等 = 库里存着一个不一致状态：
+                    # 有人只改了列没重算指纹（repair_apply_url 按自己的硬约束 1
+                    # 就是这么干的，8594 行，实测 2026-08-13）。这时候 diff 是空的，
+                    # 发出去就是一条「岗位 XXX 有更新」点开什么都没有。
+                    #
+                    # 判据刻意用 `diff == {}` 而不是「apply_url 变了但值相同」这种
+                    # 具体成因：上面那段注释记的 cities 是同一个症状的第一次，
+                    # 这是第三次。按成因修了两回还是复发，所以这次守的是形状 ——
+                    # diff 是发事件那一刻手上唯一的事实，空的就没有可通知的东西。
+                    #
+                    # reopened 不受这条守卫管（见下面发事件那行的条件）：下线又
+                    # 原样上线时 diff 确实是空的，但 closed_at 从有值变 NULL 压根
+                    # 不在这六个字段里，判空会吃掉一个真实信号。
+                    fp_desync = not diff and not reopened
+                    if fp_desync:
+                        stats["fingerprint_desync"] += 1
                     conn.execute(
                         """UPDATE jobs SET title=?, job_family=?, raw_category=?, cities=?,
                                raw_location=?, department=?, recruit_type=?, grad_year=?,
@@ -424,7 +445,10 @@ def sync(conn, adapter: Adapter, *, dry_run: bool = False) -> dict:
                         ),
                     )
                     stats["updated"] += 1
-                    if not bootstrap:
+                    # UPDATE 照旧执行（在上面），只是不发事件 —— 指纹必须重算，
+                    # 否则每轮 sync 都会重新进这个分支，fingerprint_desync 永久非 0，
+                    # 「不同步」这个信号就失真了。
+                    if not bootstrap and not fp_desync:
                         db.add_event(
                             conn, "job_reopened" if reopened else "job_updated",
                             source_key=adapter.source_key, company=adapter.company,

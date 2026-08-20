@@ -1173,3 +1173,104 @@ class TestRefreshFeishuGradYear:
 
         assert st["changed"] == 1
         assert _gy(conn, "1") is None, "预演却写了库"
+
+
+class TestEmptyDiffEmitsNothing:
+    """指纹变了但六个字段逐个比全等时，不许发 job_updated。见方案 016。
+
+    这是同一个症状的第三次出现，前两次都在上面 TestCitiesDiff 的 docstring 里：
+    那次是 cities 少算（成因），修法是把字段补进 diff。这次字段没少，是
+    repair_apply_url 按自己的硬约束「只写一列不碰指纹」留下了不一致状态。
+    **两次成因不同，症状一模一样** —— 所以这批用例钉的是形状（diff 为空就不发），
+    不是成因。
+    """
+
+    def _desync(self, conn, ext_id: str = "1") -> None:
+        """造出「列已是新值、指纹还是老值」—— repair_apply_url 干的事。
+
+        绕过 sync 直接 UPDATE 一列，这是刻意的：这个 bug 的成因就是有命令绕过
+        sync 改库。用 sync 造不出这个状态（它总会一起重算指纹）。
+        """
+        conn.execute(
+            "UPDATE jobs SET apply_url=apply_url || '/detail' WHERE external_id=?",
+            (ext_id,),
+        )
+        conn.commit()
+
+    def _job_with_new_url(self, ext_id: str = "1") -> RawJob:
+        """适配器这轮抓到的就是修好之后的 URL —— 和库里的列已经一致。"""
+        j = make_job(ext_id)
+        j.apply_url = f"{j.apply_url}/detail"
+        return j
+
+    def test_empty_diff_emits_no_job_updated(self, conn) -> None:
+        ingest.sync(conn, FakeAdapter([make_job("1")]))
+        self._desync(conn)
+        st = ingest.sync(conn, FakeAdapter([self._job_with_new_url()]))
+
+        # 进了 UPDATE 分支（指纹确实不同），但一条事件都不该有
+        assert st["updated"] == 1
+        assert events_of(conn, "job_updated") == []
+
+    def test_empty_diff_still_updates_fingerprint(self, conn) -> None:
+        """不发事件 ≠ 不写库。指纹必须重算，否则每轮都重新进这个分支。"""
+        ingest.sync(conn, FakeAdapter([make_job("1")]))
+        self._desync(conn)
+        job = self._job_with_new_url()
+        ingest.sync(conn, FakeAdapter([job]))
+
+        assert conn.execute(
+            "SELECT fingerprint FROM jobs WHERE external_id='1'"
+        ).fetchone()["fingerprint"] == ingest._fp(job)
+
+        # 再跑一轮：这次指纹已经对上了，计数器必须回到 0
+        st = ingest.sync(conn, FakeAdapter([job]))
+        assert st["fingerprint_desync"] == 0, "指纹没重算成功，不同步状态会永久非 0"
+        assert st["updated"] == 0
+
+    def test_empty_diff_is_counted_in_stats(self, conn) -> None:
+        """只判空、不计数 = 把不一致状态藏起来（方案 016 §5 约束 3）。"""
+        ingest.sync(conn, FakeAdapter([make_job("1"), make_job("2")]))
+        self._desync(conn, "1")
+        self._desync(conn, "2")
+        st = ingest.sync(conn, FakeAdapter([
+            self._job_with_new_url("1"), self._job_with_new_url("2"),
+        ]))
+
+        assert st["fingerprint_desync"] == 2
+
+    def test_clean_sync_reports_zero_desync(self, conn) -> None:
+        """反向对照：没人绕过 sync 时这个数必须是 0，否则它没有报警价值。"""
+        ingest.sync(conn, FakeAdapter([make_job("1")]))
+        st = ingest.sync(conn, FakeAdapter([make_job("1", title="后台开发")]))
+
+        assert st["updated"] == 1
+        assert st["fingerprint_desync"] == 0
+
+    def test_nonempty_diff_still_emits(self, conn) -> None:
+        """守卫不许写成恒真 —— 真实变化照发。"""
+        ingest.sync(conn, FakeAdapter([make_job("1")]))
+        st = ingest.sync(conn, FakeAdapter([make_job("1", title="后台开发")]))
+
+        assert st["updated"] == 1
+        rows = events_of(conn, "job_updated")
+        assert len(rows) == 1
+        assert json.loads(rows[0]["payload"])["diff"]["title"] == {
+            "from": "产品运营", "to": "后台开发",
+        }
+
+    def test_reopened_with_empty_diff_still_emits(self, conn) -> None:
+        """守卫写成 `if diff:` 会吃掉这条：下线又原样上线时 diff 本来就是空的。
+
+        closed_at 从有值变 NULL 压根不在 _fp() 的六个字段里，所以「重新开放」
+        这个信号只能靠 reopened 标志表达，判空会把它一起吞掉。
+        """
+        full = [make_job(str(i)) for i in range(6)]
+        ingest.sync(conn, FakeAdapter(full))
+        ingest.sync(conn, FakeAdapter(full[:5]))   # 5 号关闭
+        st = ingest.sync(conn, FakeAdapter(full))  # 原样回来，六个字段都没变
+
+        assert len(events_of(conn, "job_reopened")) == 1
+        assert st["fingerprint_desync"] == 0, "reopened 不算指纹不同步"
+        payload = json.loads(events_of(conn, "job_reopened")[0]["payload"])
+        assert payload["diff"] == {}, "前提变了：这条用例要的就是空 diff 的重新开放"

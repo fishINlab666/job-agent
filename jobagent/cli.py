@@ -300,6 +300,16 @@ def sync(
                 f"  [yellow]判不出岗位族 {unknown} 条（{pct:.0%}）[/yellow]"
                 "—— 按族筛会漏掉这些"
             )
+        # 指纹和列不同步的行数。这行是给维护者看的，不是日常信息：正常恒为 0，
+        # 非 0 说明有人绕过 sync 直接改了列（repair_apply_url / refresh_grad_year
+        # 那类命令按设计就会这样）。这些行本轮重算了指纹但**不发事件** ——
+        # 不打出来的话，「diff 为空所以吞掉」和「压根没变化」在输出里长得一样，
+        # 而这个 bug 第三次复发正是因为那个状态一直没人看见。见方案 016。
+        desync = st.get("fingerprint_desync", 0)
+        if desync:
+            console.print(
+                f"  [dim]指纹与列不同步 {desync} 条（已重算指纹，未发事件）[/dim]"
+            )
         if st["guard_tripped"]:
             console.print(
                 "  [yellow]关闭守卫触发[/yellow]：消失比例异常，本轮未关闭任何岗位，"
