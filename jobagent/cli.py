@@ -490,13 +490,26 @@ def jobs(
 def digest(mark: bool = typer.Option(False, "--mark", help="标记为已推送")) -> None:
     """每日增量：只看还没推给我、且命中画像的事件。"""
     conn = db.connect()
-    intent = match.load_profile().get("intent") or {}
     rows = conn.execute(
         """SELECT e.id, e.kind, e.company, e.payload, e.occurred_at, j.*
            FROM events e LEFT JOIN jobs j ON j.id = e.job_id
            WHERE e.notified_at IS NULL
            ORDER BY e.occurred_at DESC"""
     ).fetchall()
+
+    # 没有事件时，答案只取决于是否采集过；不该为了打印空状态强制读取画像。
+    if not rows:
+        ever_synced = conn.execute("SELECT 1 FROM runs LIMIT 1").fetchone()
+        if ever_synced:
+            console.print("[dim]没有新增。[/dim]")
+        else:
+            console.print(
+                "[dim]库里还没有任何一次采集记录。先跑 [/dim]"
+                "[cyan]sync[/cyan][dim]，再回来看 digest。[/dim]"
+            )
+        return
+
+    intent = match.load_profile().get("intent") or {}
 
     shown: list[int] = []
     highlights: list[str] = []
@@ -1214,7 +1227,12 @@ def checkup(
 @app.command()
 def health(
     source: str = typer.Option(None, help="只查一个源（默认全查）"),
-    sample: int = typer.Option(5, help="每源抽几条。选 5 是为区分度，不是覆盖率"),
+    sample: int = typer.Option(
+        5,
+        min=1,
+        max=20,
+        help="每源抽几条（1–20）。选 5 是为区分度，不是覆盖率",
+    ),
 ) -> None:
     """抽查 `apply_url` 还能打开。**只报告，不改库。**
 
