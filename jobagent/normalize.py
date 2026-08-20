@@ -119,6 +119,18 @@ TITLE_RULES: list[tuple[tuple[str, ...], str]] = [
     # 只有那一行提到它。`REJECTED_018` 存在的目的就是防止否决理由只活在注释里，
     # 而我在它旁边的注释里绕开了它。现在 tests/test_normalize.py 的
     # test_rejected_comment_matches_the_table 守着这段注释和那张表一致。
+    #
+    # 这批词内部也有优先级：财务/法务/传播是明确职能，必须先于材料/结构、
+    # 交付、商家/渠道/达人等常作业务域的词。否则「商家结算」「材料成本」会被
+    # 前面的域词抢走。原有 product/hr/legal/tech 等主规则仍在这批之前。
+    (("结算",), "finance"),
+    (("税务",), "finance"),
+    (("资金",), "finance"),
+    (("内控",), "finance"),
+    (("成本",), "finance"),
+    (("定价",), "finance"),
+    (("法规",), "legal"),
+    (("传播",), "marketing"),
     (("软件",), "tech"),
     (("系统",), "tech"),
     (("SRE",), "tech"),
@@ -139,14 +151,6 @@ TITLE_RULES: list[tuple[tuple[str, ...], str]] = [
     (("商家",), "sales"),
     (("渠道",), "sales"),
     (("达人",), "sales"),
-    (("结算",), "finance"),
-    (("税务",), "finance"),
-    (("资金",), "finance"),
-    (("内控",), "finance"),
-    (("成本",), "finance"),
-    (("定价",), "finance"),
-    (("传播",), "marketing"),
-    (("法规",), "legal"),
     # 物流/备件 归 other 而不是新开 supply_chain，同 `采购` 的理由。
     #
     # 这里原本还有 `仓储`，量边际贡献时删掉了：库里只有 2 条含 `仓储` 的标题，

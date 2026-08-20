@@ -503,17 +503,42 @@ class TestVocabGapWords018:
         ("交付实习生（上海大区）", "operations"),
         ("【27届校招】履约培训生", "operations"),
         ("【27届校招】产销培训生", "operations"),
+        ("管理咨询实习生-飞书", "sales"),
         ("【27届校招】海外售后赋能培训生-东南亚", "sales"),
         ("新零售实习生（上海大区）", "sales"),
+        ("商家分析实习生 - 抖音电商", "sales"),
         ("【27届校招】渠道拓展培训生", "sales"),
+        ("增长达人实习生-AI创新业务", "sales"),
+        ("IDC商务结算 - AI算力基础设施", "finance"),
         ("税务实习生", "finance"),
         ("【27届校招】资金培训生", "finance"),
         ("【27届校招】内控培训生", "finance"),
         ("【27届校招】成本培训生", "finance"),
+        ("UK/EU定价和补贴策略实习生-TikTok Shop", "finance"),
+        ("企业文化传播实习生-企业文化", "marketing"),
+        ("【27届校招】标准法规培训生", "legal"),
+        ("供应链与物流实习生-TikTok Shop", "other"),
         ("【27届校招】备件培训生", "other"),
     ])
     def test_word_rescues_its_target(self, title: str, expected: str) -> None:
         """删掉对应的词，这条就从 expected 掉回 None。"""
+        assert family_from_title(title) == expected
+
+    @pytest.mark.parametrize("title,expected", [
+        ("商家结算专员", "finance"),
+        ("渠道结算专员", "finance"),
+        ("达人结算专员", "finance"),
+        ("材料成本专员", "finance"),
+        ("结构成本专员", "finance"),
+        ("交付结算", "finance"),
+        ("法规咨询顾问", "legal"),
+        ("渠道传播", "marketing"),
+        ("达人传播", "marketing"),
+    ])
+    def test_specific_function_beats_new_domain_words(
+        self, title: str, expected: str
+    ) -> None:
+        """新增域词不得抢走同层中更明确的财务、法务或市场职能。"""
         assert family_from_title(title) == expected
 
     def test_all_words_are_in_layer_two(self) -> None:
