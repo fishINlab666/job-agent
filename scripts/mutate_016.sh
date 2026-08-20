@@ -3,7 +3,7 @@
 #
 # 用法：bash scripts/mutate_016.sh
 # 跑完自动还原并校验 sha256 —— 改坏脚本自己留下脏文件是最坏的结果。
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 
 ING=jobagent/ingest.py
@@ -19,26 +19,43 @@ export PYTHONDONTWRITEBYTECODE=1
 PYTEST=(.venv/bin/pytest -q -p no:cacheprovider)
 
 restore() { cp "$TMP/ingest.py.orig" "$ING"; cp "$TMP/cli.py.orig" "$CLI"; }
+cleanup() { restore; rm -rf "$TMP"; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-# run <标签> <该红的-k> <另一组-k> [另一组的预期，默认「全绿」]
+# run <标签> <该红的-k> <另一组-k> [另一组说明] [另一组预期摘要]
 run() {
-  local label=$1 red_k=$2 other_k=$3 other_expect=${4:-全绿}
+  local label=$1 red_k=$2 other_k=$3 other_expect=${4:-全绿} other_summary=${5:-}
   echo "───────────────────────────────────────────────"
   echo "改坏：$label"
-  local out
-  out=$("${PYTEST[@]}" -k "$red_k" 2>&1 | tail -1)
-  echo "  该红的一组（-k '$red_k'）：$out"
-  case "$out" in
-    *failed*) echo "  ✓ 红了" ;;
-    *)        echo "  ✗ **没红** —— 这条判据没有测试守着" ;;
-  esac
-  out=$("${PYTEST[@]}" -k "$other_k" 2>&1 | tail -1)
-  echo "  另一组（-k '$other_k'，期望 $other_expect）：$out"
+  local red_output other_output red_tail other_tail red_rc=0 other_rc=0
+  red_output=$("${PYTEST[@]}" -k "$red_k" 2>&1) || red_rc=$?
+  other_output=$("${PYTEST[@]}" -k "$other_k" 2>&1) || other_rc=$?
+  red_tail=${red_output##*$'\n'}
+  other_tail=${other_output##*$'\n'}
+  echo "  该红的一组（-k '$red_k'）：$red_tail"
+  echo "  另一组（-k '$other_k'，期望 ${other_expect}）：$other_tail"
+  if [[ $red_rc -ne 1 || $red_tail != *failed* || $red_tail == *"no tests ran"* ]]; then
+    echo "  ✗ 目标组没有按预期失败"
+    return 1
+  fi
+  if [[ -n $other_summary ]]; then
+    if [[ $other_rc -ne 1 || $other_tail != *"$other_summary"* ]]; then
+      echo "  ✗ 另一组的失败分布不符合预期"
+      return 1
+    fi
+  elif [[ $other_rc -ne 0 ]]; then
+    echo "  ✗ 另一组没有保持全绿"
+    return 1
+  fi
+  echo "  ✓ 变异结果符合预期"
   restore
 }
 
 echo "=== 基线 ==="
-"${PYTEST[@]}" 2>&1 | tail -1
+baseline_output=$("${PYTEST[@]}" 2>&1)
+echo "${baseline_output##*$'\n'}"
 
 # 1. 整条守卫不加 —— 回到 bug 本身
 perl -0pi -e 's/if not bootstrap and not fp_desync:/if not bootstrap:/' "$ING"
@@ -57,7 +74,7 @@ perl -0pi -e 's/(\s+)if fp_desync:\n(\s+)stats\["fingerprint_desync"\] \+= 1/$1i
 #    `stats["updated"] += 1`（它在 UPDATE 下面），而那条用例断言了 updated == 1。
 #    这里声明真实分布而不是写「全绿」—— 方案 015 改坏 3 踩过同一个坑：
 #    测量是对的，预期列写错了，看起来像判据失效。
-run "空 diff 时跳过 UPDATE（指纹不重算）" "test_empty_diff_still_updates_fingerprint" "test_empty_diff_emits_no_job_updated" "1 红（updated 计数也被跳过）"
+run "空 diff 时跳过 UPDATE（指纹不重算）" "test_empty_diff_still_updates_fingerprint" "test_empty_diff_emits_no_job_updated" "1 红（updated 计数也被跳过）" "1 failed"
 
 # 4. 只判空、不计数 —— 退化成方案 016 的方向 2
 perl -0pi -e 's/(\s+)if fp_desync:\n\s+stats\["fingerprint_desync"\] \+= 1/$1if False:\n$1    stats["fingerprint_desync"] += 1/' "$ING"
@@ -84,5 +101,5 @@ AFTER_CLI=$(shasum -a 256 "$CLI" | cut -d' ' -f1)
 # 还原后必须回到全绿，且不许有过期 .pyc 撑着
 find . -name '*.pyc' -newer "$TMP/ingest.py.orig" -not -path './.venv/*' -delete 2>/dev/null
 echo "=== 还原后 ==="
-"${PYTEST[@]}" 2>&1 | tail -1
-rm -rf "$TMP"
+final_output=$("${PYTEST[@]}" 2>&1)
+echo "${final_output##*$'\n'}"
