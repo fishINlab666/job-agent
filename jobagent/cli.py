@@ -1224,6 +1224,170 @@ def checkup(
                       "重复投递），拿一个正常岗位页核不出文案有没有换。[/dim]")
 
 
+@app.command()
+def health(
+    source: str = typer.Option(None, help="只查一个源（默认全查）"),
+    sample: int = typer.Option(
+        5,
+        min=1,
+        max=20,
+        help="每源抽几条（1–20）。选 5 是为区分度，不是覆盖率",
+    ),
+) -> None:
+    """抽查 `apply_url` 还能打开。**只报告，不改库。**
+
+    为什么需要它：2026-08-10 发现库里 8594 条飞书 `apply_url` 全是死链，
+    少了 `/detail`，从采集第一天就坏，三个月没人发现 —— HTTP 回 200，
+    只有渲染出来才是「您正在寻找的页面不存在」。
+
+    两层检查，先便宜的：URL 形状（不联网，秒级），再真开浏览器抽样。
+    形状层就报错的话不必往下打 —— 形状全错时抽样只是把同一个结论测 40 遍。
+    """
+    from . import health as hm
+
+    conn = db.connect_readonly()
+    problems = hm.check_shapes(conn)
+    if problems:
+        console.print("[red]URL 形状对不上登记值[/red]")
+        for p in problems:
+            console.print(f"  ⚠ {p}")
+        console.print("\n[dim]先修适配器的链接拼装，别逐条改库。"
+                      "形状层没过就不抽样了 —— 那只是把同一个结论测几十遍。[/dim]")
+        conn.close()
+        raise typer.Exit(1)
+    console.print(f"[green]URL 形状全部对上登记值[/green]（{len(hm.EXPECTED_SHAPE)} 个源）")
+
+    sources = [source] if source else sorted(hm.EXPECTED_SHAPE)
+    skipped = [s for s in sources if s in hm.UNJUDGEABLE]
+    todo = [s for s in sources if s not in hm.UNJUDGEABLE]
+
+    plan: list[tuple[str, str, str, bool]] = []
+    for src in todo:
+        picked = hm.sample_urls(conn, src, sample)
+        if not picked:
+            console.print(f"[yellow]{src}：没有开放岗位可抽[/yellow]")
+            continue
+        plan.extend((s, eid, url, False) for s, eid, url in picked)
+        # 对照组：形状对、id 不存在，必须判出 gone。判不出说明判据失效了。
+        s0, eid0, url0 = picked[0]
+        plan.append((s0, hm.SENTINEL_ID, hm.sentinel_url(url0, eid0), True))
+    conn.close()
+
+    if not plan:
+        console.print("[red]一条都没抽到[/red]（源名写对了吗？）")
+        raise typer.Exit(1)
+
+    real = sum(1 for *_, is_sent in plan if not is_sent)
+    # 拿轮询预算估，不是拿「平均单页耗时」估。健康页要等满预算才返回
+    # （health.probe_one 说明了为什么），而抽样打的绝大多数就是健康页。
+    # 早先按 6.9s/页 估，实测 24 页跑了 7 分钟、估的是 2.8 分钟 —— 差一倍多。
+    est = len(plan) * hm.POLL_BUDGET_SEC / 60
+    console.print(f"[dim]真开浏览器打 {len(plan)} 个页面"
+                  f"（{real} 条抽样 + {len(plan) - real} 条对照），最多约 "
+                  f"{est:.0f} 分钟（坏页秒返回，健康页等满 "
+                  f"{hm.POLL_BUDGET_SEC:.0f}s）…[/dim]")
+
+    results, sentinels = _run_probes(plan)
+    _render_health(results, sentinels, skipped, sample)
+
+
+def _run_probes(
+    plan: list[tuple[str, str, str, bool]],
+) -> tuple[list[tuple[str, str, str]], dict[str, str]]:
+    """真打一轮。返回 `([(源, id, 判定)], {源: 对照组判定})`。
+
+    复用一个 browser + 一个 page：实测 6.9s/页，其中启浏览器只占 0.3s，
+    每条新开会把这个数字翻几倍。
+    """
+    from playwright.sync_api import sync_playwright
+    from . import health as hm
+
+    results: list[tuple[str, str, str]] = []
+    sentinels: dict[str, str] = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        try:
+            for src, eid, url, is_sentinel in plan:
+                verdict, _ = hm.probe_one(page, url)
+                if is_sentinel:
+                    sentinels[src] = verdict
+                else:
+                    results.append((src, eid, verdict))
+        finally:
+            browser.close()
+    return results, sentinels
+
+
+def _render_health(
+    results: list[tuple[str, str, str]],
+    sentinels: dict[str, str],
+    skipped: list[str],
+    sample: int,
+) -> None:
+    """按源出表。`unknown` 单独一栏 —— 不算活也不算死。"""
+    from collections import Counter
+    from . import health as hm
+
+    by_source: dict[str, Counter] = {}
+    for src, _eid, verdict in results:
+        by_source.setdefault(src, Counter())[verdict] += 1
+
+    table = Table(title="apply_url 巡检")
+    table.add_column("源")
+    table.add_column("抽", justify="right")
+    table.add_column("活", justify="right")
+    table.add_column("链接坏了", justify="right")
+    table.add_column("岗位没了", justify="right")
+    table.add_column("判不出", justify="right")
+    for src in sorted(by_source):
+        c = by_source[src]
+        n = sum(c.values())
+        broken = c["broken_route"]
+        table.add_row(
+            src, str(n),
+            f"[green]{c['healthy']}[/green]" if c["healthy"] else "0",
+            f"[red]{broken}[/red]" if broken else "0",
+            str(c["gone"]),
+            f"[yellow]{c['unknown'] + c['error']}[/yellow]"
+            if c["unknown"] + c["error"] else "0",
+        )
+    console.print(table)
+
+    # 对照组：判据自己的体检。它不占抽样配额，但它红了上面整张表都不可信。
+    dead_judgement = [s for s, v in sentinels.items() if v != "gone"]
+    if dead_judgement:
+        console.print(f"\n[red]判据可能已失效[/red]：{'、'.join(dead_judgement)} 的对照组"
+                      f"（形状对、id 不存在）没判出「岗位没了」")
+        console.print("[dim]源站前端换了框架，空值不再渲染成 undefined？"
+                      "这种失效是静默的 —— 上面那张表会把不存在的岗位报成「活」。"
+                      f"改 health.py 的 GONE_MARK。[/dim]")
+
+    for src, c in sorted(by_source.items()):
+        n = sum(c.values())
+        if c["broken_route"] == n and n > 0:
+            console.print(f"\n[red]⚠ {src} 整源异常[/red]：抽中的 {n} 条全是链接坏了，"
+                          f"不像零散下架")
+            console.print("[dim]核对适配器的链接拼装，别逐条改库。[/dim]")
+
+    if skipped:
+        console.print(f"\n[yellow]没查：{'、'.join(skipped)}[/yellow]")
+        console.print("[dim]腾讯 post.html?pid= 是列表页，真 pid / 假 pid / 负 pid "
+                      "渲染出的正文逐字节相同，详情不登录不渲染 —— 没有判据可用。"
+                      "这些源只被 URL 形状不变量守着。[/dim]")
+
+    hit = {5: "21.6%", 10: "38.6%", 20: "62.6%"}.get(sample)
+    console.print(f"\n[dim]口径：分母是**抽中的 {sample} 条**，不是源里全部的。"
+                  f"「抽 {sample} 条全活」证不了这个源都活着 —— 抽样只能证伪。[/dim]")
+    console.print("[dim]整源坏掉抽 1 条就能发现；零散下架（库里积 30 条未标）"
+                  + (f"抽 {sample} 条只有 {hit} 命中率，" if hit else "的命中率远不到一半，")
+                  + "所以这里**不宣称**「没发现下架岗位」。[/dim]")
+    if any(c["gone"] for c in by_source.values()):
+        console.print("[dim]「岗位没了」是源站的业务事件，不是我们的 bug。"
+                      "巡检不自动标 closed_at —— 判据换季失效时，"
+                      "错的方向会是「把活岗位标成关闭」，而这个动作没有回滚。[/dim]")
+
+
 def _record_blocked(conn, job: dict, src: str, plan: SubmissionPlan) -> None:
     """prepare 没走通，也要留痕：不然用户只看到一句报错，查不到发生过什么。"""
     db.record_blocked(

@@ -659,3 +659,12 @@ class TestDigestEmptyState:
         assert r.exit_code == 0, r.output
         assert "没有新增" in r.output
         assert "sync" not in r.output
+
+
+class TestHealthSampleBounds:
+    @pytest.mark.parametrize("sample", ["-1", "0", "21"])
+    def test_invalid_sample_is_rejected_before_health_runs(self, sample) -> None:
+        r = runner.invoke(cli.app, ["health", "--sample", sample])
+
+        assert r.exit_code == 2
+        assert "20" in r.output
