@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from jobagent.adapters.feishu import FeishuAdapter
+from jobagent.normalize import family_from_title
 
 
 # 必须在打补丁之前把真类抓住。工厂里直接写 httpx.Client 会调到被 patch 的
@@ -89,22 +90,46 @@ class TestFamilyNotBackfilled:
     """
 
     # 这四条是 nio 全量里真实判不出的标题，不是编的。
-    # 原来第一条是 `ONVO-乐道行销顾问-重庆`，方案 017 把 `顾问` 加进 sales 之后
-    # 它判得出来了 —— 于是这条用例不再能区分「适配器兜底了」和「标题规则命中了」。
-    # 换成库里现在仍判不出的 `实习-NSC售后服务代表`（`服务` 是域词，方案 017 §6
-    # 明确不加）。挑替补的判据是「当前代码判不出」，跑
-    # `measure_family_gaps.py by-source` 能重新找一批。
+    #
+    # 【挑选判据换过一次，别再按「当前判不出」挑】
+    # 这批例子过期过两轮：017 加 `顾问` 撞掉 `ONVO-乐道行销顾问-重庆`，
+    # 018 加 `售后` 撞掉 `实习-NSC售后服务代表` 和 `售后服务-增值服务（西安）`。
+    # 两次红的都是这个文件，而坏的是词表扩容 —— 排查方向被带偏了两次。
+    # 所以判据从「跑一遍现在判不出」换成「差一点命中的那个词在**明确不加**的
+    # 否决表里」（`scripts/measure_family_gaps.py` 的 REJECTED_018）：
+    #   计划  → 否决理由「`培养计划` 里是「项目」的意思：救 9 个错 6 个」
+    #   分析  → 否决理由「跨族：数据分析/商业分析/财务分析」
+    #   整车 / 大使 / 机电 → 域词和身份词，不是职能，方案 017 §6 的口径
+    # 词表下次扩容时这四条仍然不该动；真被撞了，是那次扩容越过了否决表，
+    # 该看的是 normalize.py 而不是这里。下面 test_fixtures_are_still_undecidable
+    # 会先替你把这件事说清楚。
     UNDECIDABLE = [
-        "实习-NSC售后服务代表",
-        "门店店总-蔚来天津区域公司",
-        "区域用户增长（活动方向）",
-        "售后服务-增值服务（西安）",
+        "蔚来AGI超星计划-敢想敢研，自成课题",
+        "实习-AI代码分析",
+        "提前批-整车音响调音师",
+        "实习-蔚来2027届校园大使",
     ]
 
     @pytest.mark.parametrize("title", UNDECIDABLE)
     def test_undecidable_title_stays_none(self, monkeypatch, title):
         _, jobs = _fetch(monkeypatch, _serve([_body([_post(title=title)])]))
         assert jobs[0].job_family is None, "判不出就该是 None，兜底成 other 会让用户按族筛不到"
+
+    @pytest.mark.parametrize("title", UNDECIDABLE)
+    def test_fixtures_are_still_undecidable(self, title):
+        """前提独立成一条：这些标题在**规则层**必须仍然判不出。
+
+        上面那条用例只有在 `family_from_title(title) is None` 时才在测适配器；
+        前提一旦不成立，它就变成一条恒绿的空用例 —— 或者像 017/018 那样红在
+        适配器上，让人去查一个没坏的东西。把前提单独钉出来，红的时候消息直接
+        指向词表。
+        """
+        assert family_from_title(title) is None, (
+            f"`{title}` 现在判得出来了 —— 坏的不是适配器，是这条 fixture 过期了。"
+            "词表扩容撞到了 REJECTED_018 里的词，先确认那次扩容对不对；"
+            "确实该加就换 fixture，从 `measure_family_gaps.py by-source` 里"
+            "挑一条近似命中词仍在否决表上的。"
+        )
 
     def test_source_category_does_not_decide_family(self, monkeypatch):
         """源站分类**存在也不参与判定** —— 这条是这次最要紧的反向用例。

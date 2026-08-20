@@ -27,10 +27,21 @@ export PYTHONDONTWRITEBYTECODE=1
 PYTEST=(.venv/bin/pytest -q -p no:cacheprovider)
 
 restore() { cp "$TMP/normalize.py.orig" "$NORM"; cp "$TMP/measure.py.orig" "$MEAS"; }
-cleanup() { restore; rm -rf "$TMP"; }
+
+# 中途死掉也要还原。两个限制（只跑一次、信号路径还原完就退出）缺一个都会自己造出
+# 新缺陷，原因见 mutate_018.sh 里同一段注释：`| head -45` 关掉管道之后 SIGPIPE 让
+# trap 反复触发约 50 次，第一次就删了备份，比不装 trap 更坏。别加 `$BASHPID` 判断，
+# macOS 的 bash 3.2 没这个变量，而且子 shell 本来就不继承 EXIT trap。
+CLEANED=0
+cleanup() {
+  [ "$CLEANED" = 1 ] && return 0
+  CLEANED=1
+  [ -f "$TMP/normalize.py.orig" ] && restore
+  rm -rf "$TMP"
+}
+on_signal() { cleanup; trap - EXIT; exit 130; }
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap on_signal HUP INT TERM PIPE
 
 # 改坏有没有真落到文件上。没落上就不必看颜色了 —— 那是脚本的错，不是判据的。
 landed() {
@@ -76,17 +87,17 @@ echo "${baseline_output##*$'\n'}"
 
 # 1. `顾问` 不加 —— 回到 issue #8 的现状
 perl -0pi -e 's/\n    \(\("顾问",\), "sales"\),//' "$NORM"
-run "顾问 不加进 sales 组" "TestAdvisorIsSales" "TestProcurementIsOther or TestServiceIsDeliberately"
+run "顾问 不加进 sales 组" "TestAdvisorIsSales" "TestServiceIsDeliberately"
 
 # 2. `顾问` 写成 sales 之外的族 —— 判得出但判错
 perl -0pi -e 's/\(\("顾问",\), "sales"\)/(("顾问",), "hr")/' "$NORM"
-run "顾问 判成 hr" "TestAdvisorIsSales" "TestProcurementIsOther"
+run "顾问 判成 hr" "TestAdvisorIsSales" "TestServiceIsDeliberately"
 
 # 3. `采购` 挪进 COMPOUND_RULES —— 实测会改判 5 条
 perl -0pi -e 's/\(\("物业", "办公规划", "行政"\), "other"\)/(("物业", "办公规划", "行政", "采购"), "other")/' "$NORM"
 perl -0pi -e 's/\n    \(\("采购",\), "other"\),//' "$NORM"
 run "采购 挪进 COMPOUND_RULES（第 2 层之前）" \
-    "test_procurement_direction_does_not_steal or test_other_group_is_last" \
+    "test_procurement_direction_does_not_steal or test_procurement_precedes_the_018_words or test_procurement_beats_domain" \
     "test_procurement_is_other" "全绿（采购本身还是判 other，只是抢了别人）"
 
 # 4. `采购` 组挪到 tech 之前 —— 只有 `硬件采购实习生` 会翻
@@ -94,7 +105,7 @@ run "采购 挪进 COMPOUND_RULES（第 2 层之前）" \
 perl -0pi -e 's/\n    \(\("采购",\), "other"\),//' "$NORM"
 perl -0pi -e 's/(    \(\("数据", "安全", "硬件")/    (("采购",), "other"),\n$1/' "$NORM"
 run "采购 组挪到 tech 组之前" \
-    "test_procurement_direction_does_not_steal or test_other_group_is_last" \
+    "test_procurement_direction_does_not_steal or test_procurement_precedes_the_018_words or test_procurement_beats_domain" \
     "TestAdvisorIsSales"
 
 # 5. `服务` 加进 sales 组 —— 数据上看着划算的那个错
