@@ -12,6 +12,9 @@
 
 ## 一、配
 
+> 本节只说明未来如何接入，不授权现在修改任何客户端配置。只有代码进入 `main`、
+> 干净安装通过，并在只读 MCP 检查点获得明确批准后，才恢复一个客户端。
+
 ### Claude Desktop
 
 配置文件在：
@@ -26,9 +29,9 @@
 {
   "mcpServers": {
     "job-agent": {
-      "command": "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent/.venv/bin/python",
+      "command": "/absolute/path/to/job-agent/.venv/bin/python",
       "args": ["-m", "jobagent.mcp_server"],
-      "cwd": "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent"
+      "cwd": "/absolute/path/to/job-agent"
     }
   }
 }
@@ -46,7 +49,7 @@
 一条命令写进去（**会覆盖 `mcpServers` 里的同名项，其余保留**）：
 
 ```bash
-cd "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent" && .venv/bin/python -c "
+cd "$(git rev-parse --show-toplevel)" && .venv/bin/python -c "
 import json, pathlib
 p = pathlib.Path.home()/'Library/Application Support/Claude/claude_desktop_config.json'
 d = json.loads(p.read_text()) if p.exists() else {}
@@ -68,7 +71,7 @@ print('现有 server:', list(d['mcpServers'].keys()))
 ### Claude Code（CLI）
 
 ```bash
-cd "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent" && claude mcp add job-agent -- "$PWD/.venv/bin/python" -m jobagent.mcp_server
+cd "$(git rev-parse --show-toplevel)" && claude mcp add job-agent -- "$PWD/.venv/bin/python" -m jobagent.mcp_server
 ```
 
 ---
@@ -78,20 +81,20 @@ cd "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent" && claude mcp add job-ag
 先确认 server 自己能起来（会挂住等 stdio 输入，`Ctrl-C` 退出 —— 挂住就是对的）：
 
 ```bash
-cd "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent" && .venv/bin/python -m jobagent.mcp_server
+cd "$(git rev-parse --show-toplevel)" && .venv/bin/python -m jobagent.mcp_server
 ```
 
-再确认注册表里是那 6 个工具。**这条比读代码可靠**，它问的是运行时：
+再确认注册表里是那 5 个工具。**这条比读代码可靠**，它问的是运行时：
 
 ```bash
-cd "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent" && .venv/bin/python -c "
+cd "$(git rev-parse --show-toplevel)" && .venv/bin/python -c "
 from jobagent import mcp_server as m
 import asyncio
 for t in asyncio.run(m.mcp.list_tools()): print(t.name)
 "
 ```
 
-应该正好这六行：
+应该正好这五行：
 
 ```
 list_jobs
@@ -99,7 +102,6 @@ explain_match
 list_sources
 list_sync_runs
 job_changes
-check_form_selectors
 ```
 
 最后 —— **在对话里实调一次**。前面两条只证明进程能起、注册表对，
@@ -109,7 +111,7 @@ check_form_selectors
 
 ---
 
-## 三、六个工具各干什么
+## 三、五个工具各干什么
 
 | 工具 | 问什么 | 注意 |
 |---|---|---|
@@ -118,23 +120,14 @@ check_form_selectors
 | `list_sources` | 每个源的岗位数、最近采集、投递配额 | `last_run` 为 null = **一次都没跑过**，和「跑过但失败了」不是一回事 |
 | `list_sync_runs` | 采集批次历史 | `finished_at` 为 null = 这轮没收尾（进程被杀或正在跑），不是数据缺失 |
 | `job_changes` | 岗位变动：新开、关闭、改动、源首次接入 | **只有岗位侧事件。** 投递记录不在这一层 |
-| `check_form_selectors` | 投递表单的判据还认不认对方页面 | ⚠️ **会启真浏览器，一次几十秒。** 需要 `user_data_dir` |
 
 ### 几个容易读错的地方
 
 **判不出族的岗位按任何族筛都查不到，包括 `other`。** 那一列是空的，
 不是「归到 other 里了」。想看这批得不带 `family` 参数。
 
-**`check_form_selectors` 的 `all_valid=true` 不等于「站点没改过文案」。**
-有些判据只在异常页面上才触发（岗位已关闭、提交成功、重复投递），
-拿一个正常岗位页核不动它们 —— 那几条在 `unprovable` 里列着。
-只说「全部有效」等于把「这次没验成」洗成了「验过是好的」。
-
-**`check_form_selectors` 别连着反复调。** 它是这六个里唯一对外发请求的，
-其余五个都只读本地库。改完选择器、或者隔一段时间没投过，才跑一次。
-
-**没有登录态时它返回一条 blocker，不是一片假红。** `reached_form=false`
-就是走到登录墙了，那时候的红不代表判据坏了。
+表单判据检查不属于 MCP。它会启动浏览器并接触登录态，只能在明确授权的
+本地人工流程中运行，不能从对话工具注册表恢复。
 
 ---
 
