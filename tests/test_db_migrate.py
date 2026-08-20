@@ -280,6 +280,40 @@ def test_existing_migrated_row_is_linked_instead_of_copied(tmp_path):
     assert [row["legacy_submission_id"] for row in rows] == [7]
 
 
+def test_existing_migrated_row_with_missing_created_at_is_not_copied(tmp_path):
+    """旧表没创建时间时，升级也要认出此前已经搬过的那一行。"""
+    conn = db.connect(tmp_path / "legacy.db")
+    db.init(conn)
+    job_id = _seed_job(conn)
+    conn.execute(
+        """INSERT INTO applications(
+               job_id, source_key, external_id, company, status,
+               submitted_at, error, note, created_at)
+           VALUES(?, 'tencent_join', 'J1', '腾讯', 'failed',
+                  NULL, '提交结果未知', '从 submissions 表迁移', ?)""",
+        (job_id, "2026-08-20T10:00:00+08:00"),
+    )
+    conn.executescript(LEGACY_SUBMISSIONS_DDL)
+    conn.execute(
+        """INSERT INTO submissions(
+               id, job_id, external_id, source_key, company,
+               submitted_at, status, error, created_at)
+           VALUES(9, ?, 'J1', 'tencent_join', '腾讯', NULL,
+                  'failed', '提交结果未知', NULL)""",
+        (job_id,),
+    )
+    conn.commit()
+
+    db.migrate(conn)
+    db.migrate(conn)
+
+    rows = conn.execute(
+        """SELECT legacy_submission_id FROM applications
+           WHERE note='从 submissions 表迁移'"""
+    ).fetchall()
+    assert [row["legacy_submission_id"] for row in rows] == [9]
+
+
 class TestConfirmTokenIsNullNotEmpty:
     """`confirm_token` 取不到时必须写 NULL，不能写空串。
 

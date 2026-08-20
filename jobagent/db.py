@@ -162,21 +162,24 @@ def _absorb_submissions(conn: sqlite3.Connection) -> list[str]:
             continue
 
         status = status_map.get(d.get("status"), d.get("status") or "failed")
-        created_at = d.get("created_at") or now()
-        existing = conn.execute(
-            """SELECT id FROM applications
-               WHERE legacy_submission_id IS NULL
-                 AND note='从 submissions 表迁移'
-                 AND job_id IS ? AND source_key IS ? AND external_id IS ?
-                 AND company IS ? AND status IS ? AND submitted_at IS ?
-                 AND error IS ? AND screenshot_path IS ? AND created_at IS ?
-               ORDER BY id LIMIT 1""",
-            (
-                d.get("job_id"), d.get("source_key"), d.get("external_id"),
-                d.get("company"), status, d.get("submitted_at"), d.get("error"),
-                d.get("screenshot_path"), created_at,
-            ),
-        ).fetchone()
+        legacy_created_at = d.get("created_at")
+        created_at = legacy_created_at or now()
+        match_sql = """SELECT id FROM applications
+                       WHERE legacy_submission_id IS NULL
+                         AND note='从 submissions 表迁移'
+                         AND job_id IS ? AND source_key IS ? AND external_id IS ?
+                         AND company IS ? AND status IS ? AND submitted_at IS ?
+                         AND error IS ? AND screenshot_path IS ?"""
+        match_values = (
+            d.get("job_id"), d.get("source_key"), d.get("external_id"),
+            d.get("company"), status, d.get("submitted_at"), d.get("error"),
+            d.get("screenshot_path"),
+        )
+        # 旧值缺失时，旧版迁移写入的是当时的 now()，升级时无法重算同一时间。
+        if legacy_created_at:
+            match_sql += " AND created_at IS ?"
+            match_values += (legacy_created_at,)
+        existing = conn.execute(match_sql + " ORDER BY id LIMIT 1", match_values).fetchone()
         if existing:
             conn.execute(
                 "UPDATE applications SET legacy_submission_id=? WHERE id=?",
