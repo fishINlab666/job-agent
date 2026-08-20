@@ -7,8 +7,8 @@
 set -u
 cd "${0:A:h}/.."
 NZ=jobagent/normalize.py
-BAK=$(mktemp); cp $NZ $BAK
-SHA0=$(shasum -a 256 < $NZ)
+BAK=$(mktemp); cp "$NZ" "$BAK"
+SHA0=$(shasum -a 256 < "$NZ")
 export PYTHONDONTWRITEBYTECODE=1
 
 run() {  # run <标签> <该红的-k> <另一组-k> [另一组的预期，默认「全绿」]
@@ -31,7 +31,9 @@ assert s.count(old) == 1, f"要替换的串命中 {s.count(old)} 次，不是 1"
 p.write_text(s.replace(old, new))
 PY
 }
-restore() { cp $BAK $NZ }
+restore() { cp "$BAK" "$NZ" }
+cleanup() { restore; rm -f "$BAK" }
+trap cleanup EXIT INT TERM
 
 print "=== 1. 整层不加（回到 issue #9 的状态）==="
 mutate 'if domain_at is not None and function_at is not None and domain_at < function_at:
@@ -80,8 +82,7 @@ run 7 "test_word_lists_contain_no_family_names" "does_not_steal"
 restore
 
 print "\n=== 还原校验 ==="
-SHA1=$(shasum -a 256 < $NZ)
+SHA1=$(shasum -a 256 < "$NZ")
 [[ "$SHA0" == "$SHA1" ]] && print "  ✓ sha256 与开跑前一致" || print "  ✗ 文件没还原干净"
 .venv/bin/pytest tests/test_normalize.py -p no:cacheprovider -q 2>&1 | tail -1
-find . -name '*.pyc' -newer $BAK 2>/dev/null | head -3
-rm -f $BAK
+find . -name '*.pyc' -newer "$BAK" 2>/dev/null | head -3
