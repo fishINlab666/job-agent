@@ -203,29 +203,53 @@ def list_sync_runs(source_key: str | None = None, limit: int = 20) -> dict:
     return {"runs": queries.sync_runs(_conn(), source_key=source_key, limit=limit)}
 
 
-#: `events` 表里**岗位侧**的事件种类。这一层只交出这些。
+#: `events` 表里**采集侧**的事件种类。这一层只交出这些。
 #:
 #: 为什么是白名单不是黑名单：同一张表里还躺着代投侧的事件（`apply_blocked` 等），
 #: 而它们的 payload 里有 `screenshots/` 路径 —— 那些截图是填好的表单，画面上有
 #: 姓名手机身份证。更要紧的是代投侧的 kind 是 `f"apply_{result.status}"` 拼出来的，
-#: **grep 数不出全集**，将来多一个状态就多一个漏出去的 kind。黑名单在这种形状下
-#: 一定会漏，白名单漏的方向是「少给一类事件」，看得见。
+#: **grep 数不出全集**（`cli.py:877`），将来多一个状态就多一个漏出去的 kind。
+#: 黑名单在这种形状下一定会漏。
+#:
+#: 【这张表原本只有 4 个，漏了后面 3 个，见 019】漏掉的是 `job_reopened` /
+#: `family_first_seen` / `batch_started`，库里当时正丢着 8 条事件。原来的注释在这里
+#: 写着「白名单漏的方向是『少给一类事件』，看得见」—— 那句话的前提是文档没有反向
+#: 承诺，而底下 `job_changes` 的 docstring 恰好写着「省略则全要」，漏掉就从「看得见」
+#: 变成了「读成没发生过」。所以这次除了补全，还把「排除了什么」做进返回值
+#: （`EXCLUDED_KINDS`），不再只靠注释。
+#:
+#: 判据是**发射点级**，不是名字级：`ingest.py` 发的都给，`cli.py` 发的都不给。
+#: 名字级判据（「叫 `job_*` 的就给」）解释不了 `source_bootstrapped`，
+#: 「有没有 `job_id`」也解释不了它 —— 正是这两个判据说不清的地方漏了 3 个。
+#: `tests/test_mcp_server.py` 的 `test_every_ingest_kind_is_whitelisted` 拿
+#: `ingest.py` 的 AST 当锚点守着这张表，能查出「少了一个」。
 JOB_EVENT_KINDS = frozenset({
     "job_opened", "job_closed", "job_updated", "source_bootstrapped",
+    "job_reopened", "family_first_seen", "batch_started",
 })
+
+#: 这一层**永远**排除的事件种类，随 `job_changes` 的返回值一起交出去。
+#:
+#: 为什么是个非空常量而不是「算出来的差集」：差集会在白名单补全之后变成空列表，
+#: 而空列表会被读成「什么都没排除」—— 那正是这次要修掉的误读。代投侧一条不给
+#: 是这一层的固定边界，不是某次快照的结果，所以它写成常量。
+EXCLUDED_KINDS = ("apply_*",)
 
 
 @mcp.tool()
 def job_changes(
     kind: str | None = None, since: str | None = None, limit: int = 50
 ) -> dict:
-    """岗位变动事件：新开、关闭、改动、某个源首次接入。
+    """岗位变动事件：新开、关闭、改动、复活、某族首现、批次启动、某个源首次接入。
 
-    kind: job_opened / job_closed / job_updated / source_bootstrapped，省略则全要。
+    kind: job_opened / job_closed / job_updated / job_reopened / family_first_seen
+    / batch_started / source_bootstrapped。**省略则给全部采集侧事件 —— 不是这张表
+    的全部。** 返回值里的 `excluded_kinds` 写明了差在哪。
     since: ISO 时间字符串，只看这之后的。
 
-    **只有岗位侧的事件。** 投递记录不在这一层 —— 代投全程在命令行里做，
-    问投了什么请去看 `jobagent applications`。
+    **只有采集侧的事件。** 投递记录不在这一层 —— 代投全程在命令行里做，
+    问投了什么请去看 `jobagent applications`。所以 `events` 为空只说明
+    「这段时间没有岗位变动」，推不出「没有投递」。
 
     某条事件带 `payload_raw` 说明它的 payload 存坏了解不开 —— 那是数据问题，
     不是「这次没有变动」。
@@ -243,7 +267,10 @@ def job_changes(
     # 各 kind 分别取了 limit 条，合起来要重新排序再截断，否则「最近 N 条」
     # 会变成「每种最近 N 条拼在一起」——条数对，但不是最近的那些。
     events.sort(key=lambda e: (e["occurred_at"] or "", e["id"]), reverse=True)
-    return {"events": events[:limit]}
+    # `excluded_kinds` 每次都带上，哪怕调用方指定了单个 kind：它说的是
+    # 「这一层永远不给什么」，不是「这一次筛掉了什么」。省略它等于让调用方
+    # 把一份被裁过的结果当成全集 —— 019 修的就是这个。
+    return {"events": events[:limit], "excluded_kinds": list(EXCLUDED_KINDS)}
 
 
 def main() -> None:
