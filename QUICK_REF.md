@@ -1,5 +1,8 @@
 # 校招 Agent - 快速参考
 
+> **历史文档（写于 M1–M6 阶段）。当前命令全集以
+> `uv run python -m jobagent.cli --help` 为准**；这份没有 M7/M8 和 MCP 只读层。
+
 ## 完整工作流（M1-M6）
 
 ### 1. 初始化

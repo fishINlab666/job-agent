@@ -4,8 +4,11 @@
 > 不记决策过程、不记调研弯路、不记「打算做」—— 那些在 Wiki（`docs/WIKI.md`）。
 > 不作为 Agent 检索源 —— 那是知识库（`docs/kb/`）。
 >
-> 校对于 `2026-08-10` · 测试基线 `uv run pytest -q` → **464 passed**
+> 校对于 `2026-08-13`（方案 013–019 落地后）· 测试基线：跑 `uv run pytest -q` 看最后一行。
 > 状态口径同 `CLAUDE.md`：这里每一条都能被下面 §9 的命令验证；验不出来的属于 Wiki。
+>
+> **这里刻意不写用例数** —— 动态数字只从 `uv run pytest -q` 的输出读取，避免
+> 每新增一条测试就要同步多份文档。
 
 ---
 
@@ -23,24 +26,41 @@
 **明确不解决**：不做投递代理商（不代替用户判断投不投）、不做简历优化、
 不做面试辅导。
 
-## 2. 功能范围（M1–M6，已实现）
+## 2. 功能范围（M1–M8，已实现）
 
-| 模块 | 做什么 | 入口 |
-|---|---|---|
-| M1 采集 | 按源抓岗位列表，落 `snapshots` 原文 | `cli sync` |
-| M2 归一与增量 | 字段归一 + diff 出开/关/变更，落 `jobs` | 同上 |
-| M3 匹配 | 按 `profile.yaml` 判命中/信息不全/不命中，可按维度放宽 | `cli jobs --matched [--allow-missing <维度>]` |
-| M4 事件 | 开放/关闭/重开/族首现/批次启动 | `cli digest` |
-| M5 摘要 | 按分数排序输出日报 | `cli digest --mark` |
-| M6 代投 | 浏览器填表 → 人工确认 → 提交 | `cli apply <id>` |
-| M7 投递出口 | 读 `applications`：投了什么、卡在哪、截图在哪 | `cli applications [--funnel]` |
+| 模块 | 做什么 | 入口 | 实现 |
+|---|---|---|---|
+| M1 采集 | 按源抓岗位列表，落 `snapshots` 原文 | `cli sync` | `ingest.py` + `adapters/` |
+| M2 归一与增量 | 字段归一 + diff 出开/关/变更，落 `jobs` | 同上 | `normalize.py` |
+| M3 匹配 | 按 `profile.yaml` 判命中/信息不全/不命中，可按维度放宽 | `cli jobs --matched [--allow-missing <维度>]` | `match.py` + `profile.py` |
+| M4 事件 | 开放/关闭/重开/族首现/批次启动/源首接入 | `cli digest` | `ingest.py` |
+| M5 摘要 | 按分数排序输出日报 | `cli digest --mark` | `cli.py` |
+| M6 代投 | 浏览器填表 → 人工确认 → 提交 | `cli apply <id>` | `submitters/` + `routing.py` |
+| M7 投递出口 | 读 `applications`：投了什么、卡在哪、截图在哪 | `cli applications [--funnel]` | `queries.py` |
+| M8 只读巡检 | 判据体检 + `apply_url` 死链抽查，**都不改库** | `cli checkup` / `cli health` | `health.py` + `submitters/*.checkup()` |
+| MCP 只读层 | 对话里直接问库，代投一步都不许过来 | 见下 | `mcp_server.py` + `queries.py` |
 
-CLI 全部命令：`init` / `sync` / `jobs` / `digest` / `status` / `apply` /
-`applications` / `refresh-grad-year` / `repair-apply-url`。
+CLI 命令的唯一全集由 `uv run python -m jobagent.cli --help` 生成；本文不再复制一份
+会随代码漂移的手工清单。
 
-> 这张清单漏过两次（`refresh-grad-year` 从 007 起、`repair-apply-url` 从 010 起），
-> 都是新命令落地时没回来改。核对办法是**拿代码当准**：
-> `uv run python -m jobagent.cli --help` 的输出才是全集。
+**M8 和 MCP 层都只读。** 分开列是因为它们失效的方式不同：M8 是**主动**去核
+（判据还认不认页面、链接还打不打得开），它存在的理由是这两类东西坏掉时**全程静默**；
+MCP 层是**被动**响应模型提问，它的风险在边界而不在正确性。
+
+### MCP 只读层（方案 014、019）
+
+5 个工具，全部严格只读：`list_jobs` / `explain_match` / `list_sources` /
+`list_sync_runs` / `job_changes`。
+
+- **代投一步都不许过来。** 这一层没有任何能改状态的工具，
+  `apply` 的 prepare/execute 两阶段闸门只在 CLI 上（§7 那条硬约束）。
+- **`job_changes` 只交出采集侧事件。** 判据是**发射点级**：`ingest.py` 发的都给
+  （7 种），`cli.py` 发的（代投侧）都不给 —— 后者 payload 里有 `screenshots/` 路径，
+  截图上有姓名手机身份证。返回值带 `excluded_kinds` 字段，让「没给你什么」看得见，
+  而不是靠一句注释。
+- `check_form_selectors` 已永久注销：它会启动浏览器并接触登录态，不属于 MCP 只读边界。
+- 五个工具只读本地库，不启动浏览器、不访问外部站点。
+- 配置见 `docs/MCP_SETUP.md`。装：`uv pip install -e ".[mcp]"`。
 
 **M7 是只读的，且故意不提供任何改状态的开关。** 状态变更必须走 `apply` 的
 prepare/execute 两阶段闸门（§7 那条硬约束），从一个查看命令里改终态等于开后门。
@@ -251,8 +271,7 @@ awk '/match/ && (/import/ || /from/) {print FILENAME":"FNR": "$0}' jobagent/subm
 uv run pytest -q
 ```
 
-464 passed（2026-08-10，012 落地后；011 落地时是 450）。新功能的验收 =
-这个数变大且全绿。
+验收看退出状态、失败明细和关键行为覆盖，不把“测试条数必须变大”当成功能正确性的替代品。
 
 ```bash
 uv run python -m jobagent.cli jobs --matched --limit 1                              # 612

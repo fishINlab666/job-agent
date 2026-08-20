@@ -204,7 +204,7 @@ fingerprint = hashlib.sha256(
 2. **复合职能特例**：员工福利+薪酬 → `hr`，投资+风险 → `finance`
 3. **常规职能词**：运营 → `operations`，产品 → `product`
 
-**已知修正**（31 个测试用例锁定）：
+**已知修正**（由 `tests/test_normalize.py` 锁定，条数见下面「测试覆盖」那节的命令）：
 - ✅ "混元基座模型-视觉理解大模型研究" 曾误判为 `design`，现在正确识别为 `tech`
 - ✅ "腾讯营销—广告推荐基础大模型" 曾误判为 `marketing`，已修正
 - ✅ "运营开发" 曾误判为 `operations`，现在识别为 `tech`
@@ -224,24 +224,17 @@ fingerprint = hashlib.sha256(
 
 ## 测试覆盖
 
+当前基线不在文档里写死，直接跑：
+
 ```bash
-uv run pytest -xvs
+uv run pytest -q
 ```
 
-**504 个测试用例**（截至 2026-08-10）：
+要看各测试文件的分布，再跑：
 
-| 文件 | 数量 | 覆盖 |
-|---|---|---|
-| `test_match.py` | 98 | 硬过滤、软打分、排除词 |
-| `test_adapter_feishu.py` | 69 | 四租户解析、分页、字段缺失 |
-| `test_submitter_feishu.py` | 64 | 两阶段闸门、歧义守卫、回读摘要、判据体检 |
-| `test_ingest.py` | 63 | 变更检测、安全防护、事件产出 |
-| `test_ats.py` | 54 | ATS 识别与路由判据 |
-| `test_routing.py` | 39 | 投递器选择 |
-| `test_normalize.py` | 31 | 岗位族分类、城市标准化 |
-| `test_cli.py` | 24 | 命令行出口，含 `apply` 的两阶段与 `checkup` |
-| `test_submitter_tencent.py` | 23 | 腾讯表单填充与结果判据 |
-| 其余 6 个文件 | 39 | 迁移、摘要、探针分桶、端到端 |
+```bash
+uv run pytest -q --collect-only | grep '::' | sed 's/::.*//' | sort | uniq -c | sort -rn
+```
 
 **测试验不到的东西**（写在这里免得数字给人虚假安全感）：所有投递器测试都跑在
 假页面上，真页面的判据靠 `checkup` 命令在线核；`execute()` 的提交点击**没有任何
