@@ -72,6 +72,39 @@ TITLE_RULES: list[tuple[tuple[str, ...], str]] = [
 ]
 
 
+# 第 1.5 层用的两张表。**语义不同**，不要合并、也不要互相补词：
+#   域词 = 岗位作用在什么东西上（视觉、多媒体）
+#   职能词 = 岗位干什么活（后端、研发）
+# 第 2 层 design 组把这两类混在一条规则里（`设计`/`美术` 是职能，`视觉`/`多媒体`
+# 是域），这正是 issue #9 的病根 —— `多媒体客户端研发实习生` 因为含 `多媒体` 就
+# 判 design，而它其实是个技术岗。这一层只认「域在前、职能在后」这一个方向。
+#
+# 为什么不是从第 2 层 design 组里摘词：摘 `多媒体` 只修好 3/6，还会造出
+# design→product；再摘 `视觉` 会让 `计算机视觉实习生-电商业务` 判成 None ——
+# 没有族比判错族更难发现，飞书那边没有兜底。见 docs/plans/015。
+DESIGN_DOMAIN_WORDS: tuple[str, ...] = (
+    "视觉", "交互", "动效", "动画", "特效", "GUI", "多媒体",
+)
+
+# 这里**故意不含** `数据`/`安全`/`硬件`/`模型`：它们在第 2 层 tech 组里，但补到这
+# 张表会把 `视觉生成策略运营（图片美感方向）实习生-AI数据与安全` 这类 3 条运营岗
+# 判成技术，破模块头号不变量。也**故意不含** `设计`/`美术`：那是职能词表里的域词
+# 反串，会让 `设计师（前端方向）` 判 tech。
+TECH_FUNCTION_WORDS: tuple[str, ...] = (
+    "后台", "后端", "前端", "客户端", "研发",
+)
+
+
+def _first_index(title: str, words: tuple[str, ...]) -> int | None:
+    """命中最靠前那个词的下标；没命中返回 None。
+
+    **返回 0 是合法命中**，调用方必须与 None 区分。目标 6 条标题里有 5 条域词在
+    下标 0（`多媒体客户端研发实习生…`），写 `if d and f` 会漏掉整类。
+    """
+    hits = [title.index(w) for w in words if w in title]
+    return min(hits) if hits else None
+
+
 def family_from_title(title: str) -> str | None:
     """标题 → 归一岗位族。返回 None 表示判不出，由调用方用源站族兜底。"""
     if any(m in title for m in TECH_MARKERS):
@@ -79,6 +112,20 @@ def family_from_title(title: str) -> str | None:
     for keywords, fam in COMPOUND_RULES:
         if any(k in title for k in keywords):
             return fam
+    # 第 1.5 层：设计域词 + 技术职能词，且**域词在前** → 技术岗。
+    # 位置必须在 COMPOUND_RULES **之后**：放前面会把 `交互设计前端实习生`、
+    # `视觉设计客户端实习生` 判成 tech（那两条有显式复合短语 `交互设计`/`视觉设计`，
+    # 显式短语优先于位置启发式）。真数据上两个位置无差别（0 条冲突），只能靠
+    # tests/test_normalize.py 里的构造用例钉住。
+    #
+    # 顺序判据不能弱化成「两类词都在」：`后台动画设计师`、`客户端UI动效设计`、
+    # `后端图形界面GUI设计` 三条都同时含两类词，但技术词在前时它是修饰语，职能仍是
+    # 设计。用 `<` 而不是 `<=`：同下标意味着同一个词同时在两张表里，那是词表配错了，
+    # 不该在这里被当成命中（两表交集由测试断言为空）。
+    domain_at = _first_index(title, DESIGN_DOMAIN_WORDS)
+    function_at = _first_index(title, TECH_FUNCTION_WORDS)
+    if domain_at is not None and function_at is not None and domain_at < function_at:
+        return "tech"
     for keywords, fam in TITLE_RULES:
         if any(k in title for k in keywords):
             return fam
