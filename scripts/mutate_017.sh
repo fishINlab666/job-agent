@@ -75,11 +75,11 @@ baseline_output=$("${PYTEST[@]}" 2>&1)
 echo "${baseline_output##*$'\n'}"
 
 # 1. `顾问` 不加 —— 回到 issue #8 的现状
-perl -0pi -e 's/"解决方案", "顾问"/"解决方案"/' "$NORM"
+perl -0pi -e 's/\n    \(\("顾问",\), "sales"\),//' "$NORM"
 run "顾问 不加进 sales 组" "TestAdvisorIsSales" "TestProcurementIsOther or TestServiceIsDeliberately"
 
 # 2. `顾问` 写成 sales 之外的族 —— 判得出但判错
-perl -0pi -e 's/"解决方案", "顾问"\), "sales"/"解决方案"), "sales"),\n    (("顾问",), "hr"/' "$NORM"
+perl -0pi -e 's/\(\("顾问",\), "sales"\)/(("顾问",), "hr")/' "$NORM"
 run "顾问 判成 hr" "TestAdvisorIsSales" "TestProcurementIsOther"
 
 # 3. `采购` 挪进 COMPOUND_RULES —— 实测会改判 5 条
@@ -98,7 +98,7 @@ run "采购 组挪到 tech 组之前" \
     "TestAdvisorIsSales"
 
 # 5. `服务` 加进 sales 组 —— 数据上看着划算的那个错
-perl -0pi -e 's/"解决方案", "顾问"/"解决方案", "顾问", "服务"/' "$NORM"
+perl -0pi -e 's/"解决方案"\), "sales"/"解决方案", "服务"), "sales"/' "$NORM"
 run "服务 加进 sales 组" "TestServiceIsDeliberatelyNotSales" "TestAdvisorIsSales" \
     "全绿（顾问不受影响）"
 

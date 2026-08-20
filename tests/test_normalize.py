@@ -294,6 +294,18 @@ class TestAdvisorIsSales:
         t = '校招实习-蔚来顾问-"未来星"营销管训班-合肥'
         assert family_from_title(t) == "marketing"
 
+    @pytest.mark.parametrize("title,expected", [
+        ("人力资源顾问", "hr"),
+        ("法律顾问", "legal"),
+        ("硬件顾问", "tech"),
+        ("产品顾问", "product"),
+    ])
+    def test_advisor_is_only_a_fallback(
+        self, title: str, expected: str
+    ) -> None:
+        """明确职能必须先赢；裸 `顾问` 只能兜底成 sales。"""
+        assert family_from_title(title) == expected
+
 
 class TestProcurementIsOther:
     """方案 017：`采购` 判 other，且必须在第 2 层末尾。"""
