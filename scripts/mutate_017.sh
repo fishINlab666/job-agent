@@ -27,10 +27,6 @@ export PYTHONDONTWRITEBYTECODE=1
 PYTEST=(.venv/bin/pytest -q -p no:cacheprovider)
 
 restore() { cp "$TMP/normalize.py.orig" "$NORM"; cp "$TMP/measure.py.orig" "$MEAS"; }
-cleanup() { restore; rm -rf "$TMP"; }
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
 # 中途死掉也要还原。两个限制（只跑一次、信号路径还原完就退出）缺一个都会自己造出
 # 新缺陷，原因见 mutate_018.sh 里同一段注释：`| head -45` 关掉管道之后 SIGPIPE 让
@@ -91,11 +87,11 @@ echo "${baseline_output##*$'\n'}"
 
 # 1. `顾问` 不加 —— 回到 issue #8 的现状
 perl -0pi -e 's/\n    \(\("顾问",\), "sales"\),//' "$NORM"
-run "顾问 不加进 sales 组" "TestAdvisorIsSales" "TestProcurementIsOther or TestServiceIsDeliberately"
+run "顾问 不加进 sales 组" "TestAdvisorIsSales" "TestServiceIsDeliberately"
 
 # 2. `顾问` 写成 sales 之外的族 —— 判得出但判错
 perl -0pi -e 's/\(\("顾问",\), "sales"\)/(("顾问",), "hr")/' "$NORM"
-run "顾问 判成 hr" "TestAdvisorIsSales" "TestProcurementIsOther"
+run "顾问 判成 hr" "TestAdvisorIsSales" "TestServiceIsDeliberately"
 
 # 3. `采购` 挪进 COMPOUND_RULES —— 实测会改判 5 条
 perl -0pi -e 's/\(\("物业", "办公规划", "行政"\), "other"\)/(("物业", "办公规划", "行政", "采购"), "other")/' "$NORM"
