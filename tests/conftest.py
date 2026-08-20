@@ -39,6 +39,15 @@ from jobagent import db
 REAL_DB = Path(db.DB_PATH).resolve()
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--real-data",
+        action="store_true",
+        default=False,
+        help="运行只读真实数据库检查（默认关闭，CI 不读取本机数据）",
+    )
+
+
 @pytest.fixture(autouse=True)
 def _no_writes_to_the_real_db(monkeypatch):
     """任何测试拿可写连接打开真库时当场抛。

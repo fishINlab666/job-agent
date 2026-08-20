@@ -12,7 +12,7 @@ import json
 import pytest
 from typer.testing import CliRunner
 
-from jobagent import cli, db
+from jobagent import cli, db, match
 
 runner = CliRunner()
 
@@ -635,6 +635,7 @@ class TestDigestEmptyState:
         """runs 表空 —— 说清楚是没采集过，并给出下一步。"""
         path = tmp_path / "fresh.db"
         monkeypatch.setattr(db, "DB_PATH", path)
+        monkeypatch.setattr(match, "PROFILE_PATH", tmp_path / "missing-profile.yaml")
         conn = db.connect(path)
         db.init(conn)          # 建表，但不 start_run
         conn.commit()
@@ -645,11 +646,14 @@ class TestDigestEmptyState:
         assert "sync" in r.output
         conn.close()
 
-    def test_synced_but_empty_does_not_say_sync(self, tmp_db) -> None:
+    def test_synced_but_empty_does_not_say_sync(
+        self, tmp_db, tmp_path, monkeypatch
+    ) -> None:
         """有 run、没岗位 —— 这是「真的没新增」，不能让人再跑一次 sync。
 
         tmp_db 建了 run 但没插 jobs，正好是源站关站那种形状。
         """
+        monkeypatch.setattr(match, "PROFILE_PATH", tmp_path / "missing-profile.yaml")
         r = runner.invoke(cli.app, ["digest"])
 
         assert r.exit_code == 0, r.output
@@ -696,3 +700,12 @@ class TestSyncSurfacesDesyncCount:
 
         assert r.exit_code == 0, r.output
         assert "指纹与列不同步" not in r.output
+
+
+class TestHealthSampleBounds:
+    @pytest.mark.parametrize("sample", ["-1", "0", "21"])
+    def test_invalid_sample_is_rejected_before_health_runs(self, sample) -> None:
+        r = runner.invoke(cli.app, ["health", "--sample", sample])
+
+        assert r.exit_code == 2
+        assert "20" in r.output
