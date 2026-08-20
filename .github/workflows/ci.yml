@@ -1,0 +1,49 @@
+name: CI
+
+"on":
+  pull_request:
+    branches:
+      - main
+      - release/0.2.0-two-phase-apply
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out merge candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: 0.11.29
+          python-version: "3.13"
+          enable-cache: false
+
+      - name: Verify pull request merge candidate
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$MERGE_SHA"
+          printf 'base_sha=%s\nhead_sha=%s\nmerge_sha=%s\n' \
+            "$BASE_SHA" "$HEAD_SHA" "$MERGE_SHA"
+
+      - name: Verify dependency lock
+        run: uv lock --check
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Run test suite
+        run: uv run --frozen pytest -q -p no:cacheprovider

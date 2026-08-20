@@ -281,32 +281,32 @@ xiaopeng 正常页 294 字，离 127 只差一倍多。这种判据坏起来是�
 形状不变量（不联网，秒级，进 CI）：
 
 ```bash
-cd "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent" && PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest tests/test_health.py -q -p no:cacheprovider
+cd "$(git rev-parse --show-toplevel)" && PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest tests/test_health.py -q -p no:cacheprovider
 ```
 
 真打一轮（联网，开浏览器，**实测 7 分钟** —— 健康页要等满 20s 预算，§7）：
 
 ```bash
-cd "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent" && .venv/bin/python -m jobagent.cli health
+cd "$(git rev-parse --show-toplevel)" && .venv/bin/python -m jobagent.cli health
 ```
 
 Bash 工具的单次调用上限是 2 分钟，所以从工具里跑要挂后台再读日志：
 
 ```bash
-cd "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent" && nohup .venv/bin/python -m jobagent.cli health > /tmp/health_run.log 2>&1 &
+cd "$(git rev-parse --show-toplevel)" && nohup .venv/bin/python -m jobagent.cli health > /tmp/health_run.log 2>&1 &
 ```
 
 单源 + 小样本（调判据时用，约 2 分钟）：
 
 ```bash
-cd "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent" && .venv/bin/python -m jobagent.cli health --source feishu:nio:campus --sample 5
+cd "$(git rev-parse --show-toplevel)" && .venv/bin/python -m jobagent.cli health --source feishu:nio:campus --sample 5
 ```
 
 **证明形状不变量真的能红** —— 这条最关键，把 `EXPECTED_SHAPE` 里
 bytedance 那行的 `/detail` 删掉再跑，必须失败（复现 2026-08-10 那次事故）：
 
 ```bash
-cd "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent" && cp jobagent/health.py /tmp/health.bak && .venv/bin/python -c "import pathlib; p=pathlib.Path('jobagent/health.py'); s=p.read_text(); old='bytedance.jobs.feishu.cn/campus/position/<ID>/detail'; assert old in s, '改坏目标串不存在，这次改坏是空操作'; p.write_text(s.replace(old, old[:-7]))" && PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest tests/test_health.py -q -p no:cacheprovider; cp /tmp/health.bak jobagent/health.py && PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest tests/test_health.py -q -p no:cacheprovider | tail -1
+cd "$(git rev-parse --show-toplevel)" && cp jobagent/health.py /tmp/health.bak && .venv/bin/python -c "import pathlib; p=pathlib.Path('jobagent/health.py'); s=p.read_text(); old='bytedance.jobs.feishu.cn/campus/position/<ID>/detail'; assert old in s, '改坏目标串不存在，这次改坏是空操作'; p.write_text(s.replace(old, old[:-7]))" && PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest tests/test_health.py -q -p no:cacheprovider; cp /tmp/health.bak jobagent/health.py && PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest tests/test_health.py -q -p no:cacheprovider | tail -1
 ```
 
 **改坏验证有两个自己的坑，都是这次踩到的。**
@@ -328,7 +328,7 @@ cd "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent" && cp jobagent/health.py
 全量套件（当前基线在 §0，加完这组应更多且全绿）：
 
 ```bash
-cd "/Users/wujingyu/Desktop/AI/projects-jobs/job-agent" && PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest -q -p no:cacheprovider
+cd "$(git rev-parse --show-toplevel)" && PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest -q -p no:cacheprovider
 ```
 
 ### 10. 测试钉的是哪几条
