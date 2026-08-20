@@ -144,8 +144,9 @@ def _absorb_submissions(conn: sqlite3.Connection) -> list[str]:
     moved = 0
     for r in rows:
         d = dict(r)
+        # SQLite 里 NULL = NULL 不成立；IS 对普通值仍按相等比较，同时能匹配 NULL。
         already = conn.execute(
-            "SELECT 1 FROM applications WHERE job_id=? AND submitted_at=?",
+            "SELECT 1 FROM applications WHERE job_id=? AND submitted_at IS ?",
             (d.get("job_id"), d.get("submitted_at")),
         ).fetchone()
         if already:

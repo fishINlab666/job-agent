@@ -141,6 +141,49 @@ def _seed_job(conn: sqlite3.Connection) -> int:
     return int(cur.lastrowid)
 
 
+LEGACY_SUBMISSIONS_DDL = """
+CREATE TABLE submissions (
+    id              INTEGER PRIMARY KEY,
+    job_id          INTEGER NOT NULL,
+    external_id     TEXT,
+    source_key      TEXT,
+    company         TEXT,
+    submitted_at    TEXT,
+    status          TEXT,
+    error           TEXT,
+    screenshot_path TEXT,
+    created_at      TEXT
+);
+"""
+
+
+def test_legacy_submission_without_time_is_migrated_once(tmp_path):
+    """反复初始化不能复制同一条没有提交时间的历史失败记录。"""
+    conn = db.connect(tmp_path / "legacy.db")
+    db.init(conn)
+    job_id = _seed_job(conn)
+    conn.executescript(LEGACY_SUBMISSIONS_DDL)
+    conn.execute(
+        """INSERT INTO submissions(
+               id, job_id, external_id, source_key, company,
+               submitted_at, status, error, created_at)
+           VALUES(1, ?, 'J1', 'tencent_join', '腾讯', NULL,
+                  'failed', '提交结果未知', ?)""",
+        (job_id, db.now()),
+    )
+    conn.commit()
+
+    for _ in range(5):
+        db.migrate(conn)
+
+    migrated = conn.execute(
+        "SELECT COUNT(*) FROM applications WHERE note='从 submissions 表迁移'"
+    ).fetchone()[0]
+    used, _ = db.quota_state(conn, "腾讯")
+    assert migrated == 1
+    assert used == 1
+
+
 class TestConfirmTokenIsNullNotEmpty:
     """`confirm_token` 取不到时必须写 NULL，不能写空串。
 
