@@ -1227,7 +1227,12 @@ def checkup(
 @app.command()
 def health(
     source: str = typer.Option(None, help="只查一个源（默认全查）"),
-    sample: int = typer.Option(5, help="每源抽几条。选 5 是为区分度，不是覆盖率"),
+    sample: int = typer.Option(
+        5,
+        min=1,
+        max=20,
+        help="每源抽几条（1–20）。选 5 是为区分度，不是覆盖率",
+    ),
 ) -> None:
     """抽查 `apply_url` 还能打开。**只报告，不改库。**
 
