@@ -13,6 +13,7 @@ SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 # 老库要补的列。ALTER TABLE ADD COLUMN 的默认值必须是常量，
 # 所以 created_at 这里不带 datetime('now')，由写入方自己填。
 APPLICATION_COLUMNS: list[tuple[str, str]] = [
+    ("legacy_submission_id", "INTEGER"),
     ("source_key", "TEXT"),
     ("external_id", "TEXT"),
     ("company", "TEXT"),
@@ -118,6 +119,11 @@ def migrate(conn: sqlite3.Connection) -> list[str]:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_apps_token "
         "ON applications(confirm_token) WHERE confirm_token IS NOT NULL"
     )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_apps_legacy_submission "
+        "ON applications(legacy_submission_id) "
+        "WHERE legacy_submission_id IS NOT NULL"
+    )
 
     done += _absorb_submissions(conn)
     conn.commit()
@@ -144,23 +150,54 @@ def _absorb_submissions(conn: sqlite3.Connection) -> list[str]:
     moved = 0
     for r in rows:
         d = dict(r)
+        legacy_id = d.get("id")
+        if legacy_id is None:
+            raise ValueError("遗留 submissions 行缺少 id，无法安全去重")
+
         already = conn.execute(
-            "SELECT 1 FROM applications WHERE job_id=? AND submitted_at=?",
-            (d.get("job_id"), d.get("submitted_at")),
+            "SELECT 1 FROM applications WHERE legacy_submission_id=?",
+            (legacy_id,),
         ).fetchone()
         if already:
             continue
+
+        status = status_map.get(d.get("status"), d.get("status") or "failed")
+        legacy_created_at = d.get("created_at")
+        created_at = legacy_created_at or now()
+        match_sql = """SELECT id FROM applications
+                       WHERE legacy_submission_id IS NULL
+                         AND note='从 submissions 表迁移'
+                         AND job_id IS ? AND source_key IS ? AND external_id IS ?
+                         AND company IS ? AND status IS ? AND submitted_at IS ?
+                         AND error IS ? AND screenshot_path IS ?"""
+        match_values = (
+            d.get("job_id"), d.get("source_key"), d.get("external_id"),
+            d.get("company"), status, d.get("submitted_at"), d.get("error"),
+            d.get("screenshot_path"),
+        )
+        # 旧值缺失时，旧版迁移写入的是当时的 now()，升级时无法重算同一时间。
+        if legacy_created_at:
+            match_sql += " AND created_at IS ?"
+            match_values += (legacy_created_at,)
+        existing = conn.execute(match_sql + " ORDER BY id LIMIT 1", match_values).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE applications SET legacy_submission_id=? WHERE id=?",
+                (legacy_id, existing["id"]),
+            )
+            continue
+
         conn.execute(
             """INSERT INTO applications(
-                   job_id, source_key, external_id, company, status,
-                   submitted_at, error, screenshot_path, note, created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                   legacy_submission_id, job_id, source_key, external_id,
+                   company, status, submitted_at, error, screenshot_path,
+                   note, created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                d.get("job_id"), d.get("source_key"), d.get("external_id"),
-                d.get("company"),
-                status_map.get(d.get("status"), d.get("status") or "failed"),
+                legacy_id, d.get("job_id"), d.get("source_key"),
+                d.get("external_id"), d.get("company"), status,
                 d.get("submitted_at"), d.get("error"), d.get("screenshot_path"),
-                "从 submissions 表迁移", d.get("created_at") or now(),
+                "从 submissions 表迁移", created_at,
             ),
         )
         moved += 1

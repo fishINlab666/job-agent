@@ -106,6 +106,7 @@ CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind, occurred_at DESC);
 -- 保证同一个确认令牌不会落出两条记录来。
 CREATE TABLE IF NOT EXISTS applications (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    legacy_submission_id INTEGER,      -- 遗留 submissions.id；迁移去重的稳定身份
     job_id         INTEGER NOT NULL REFERENCES jobs(id),
     source_key     TEXT,
     external_id    TEXT,            -- 源站岗位 id，jobs 行被重建也能追溯

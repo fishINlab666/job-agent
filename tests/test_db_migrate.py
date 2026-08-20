@@ -141,6 +141,179 @@ def _seed_job(conn: sqlite3.Connection) -> int:
     return int(cur.lastrowid)
 
 
+LEGACY_SUBMISSIONS_DDL = """
+CREATE TABLE submissions (
+    id              INTEGER PRIMARY KEY,
+    job_id          INTEGER NOT NULL,
+    external_id     TEXT,
+    source_key      TEXT,
+    company         TEXT,
+    submitted_at    TEXT,
+    status          TEXT,
+    error           TEXT,
+    screenshot_path TEXT,
+    created_at      TEXT
+);
+"""
+
+
+def test_legacy_submission_without_time_is_migrated_once(tmp_path):
+    """反复初始化不能复制同一条没有提交时间的历史失败记录。"""
+    conn = db.connect(tmp_path / "legacy.db")
+    db.init(conn)
+    job_id = _seed_job(conn)
+    conn.executescript(LEGACY_SUBMISSIONS_DDL)
+    conn.execute(
+        """INSERT INTO submissions(
+               id, job_id, external_id, source_key, company,
+               submitted_at, status, error, created_at)
+           VALUES(1, ?, 'J1', 'tencent_join', '腾讯', NULL,
+                  'failed', '提交结果未知', ?)""",
+        (job_id, db.now()),
+    )
+    conn.commit()
+
+    for _ in range(5):
+        db.migrate(conn)
+
+    migrated = conn.execute(
+        "SELECT COUNT(*) FROM applications WHERE note='从 submissions 表迁移'"
+    ).fetchone()[0]
+    used, _ = db.quota_state(conn, "腾讯")
+    assert migrated == 1
+    assert used == 1
+
+
+def test_distinct_legacy_attempts_without_time_are_both_kept(tmp_path):
+    """同一岗位的两次真实尝试不能因为提交时间都为空而合并。"""
+    conn = db.connect(tmp_path / "legacy.db")
+    db.init(conn)
+    job_id = _seed_job(conn)
+    conn.executescript(LEGACY_SUBMISSIONS_DDL)
+    conn.executemany(
+        """INSERT INTO submissions(
+               id, job_id, external_id, source_key, company,
+               submitted_at, status, error, created_at)
+           VALUES(?, ?, 'J1', 'tencent_join', '腾讯', NULL,
+                  'failed', ?, ?)""",
+        (
+            (1, job_id, "第一次结果未知", "2026-08-20T10:00:00+08:00"),
+            (2, job_id, "第二次结果未知", "2026-08-20T11:00:00+08:00"),
+        ),
+    )
+    conn.commit()
+
+    db.migrate(conn)
+
+    migrated = conn.execute(
+        "SELECT COUNT(*) FROM applications WHERE note='从 submissions 表迁移'"
+    ).fetchone()[0]
+    assert migrated == 2
+
+
+def test_unrelated_null_application_does_not_hide_legacy_attempt(tmp_path):
+    """现有 blocked 记录不能挡住同岗位的历史 failed 记录。"""
+    conn = db.connect(tmp_path / "legacy.db")
+    db.init(conn)
+    job_id = _seed_job(conn)
+    db.record_blocked(
+        conn,
+        job_id=job_id,
+        source_key="tencent_join",
+        external_id="J1",
+        company="腾讯",
+        error="需要登录",
+    )
+    conn.executescript(LEGACY_SUBMISSIONS_DDL)
+    conn.execute(
+        """INSERT INTO submissions(
+               id, job_id, external_id, source_key, company,
+               submitted_at, status, error, created_at)
+           VALUES(1, ?, 'J1', 'tencent_join', '腾讯', NULL,
+                  'failed', '提交结果未知', ?)""",
+        (job_id, db.now()),
+    )
+    conn.commit()
+
+    db.migrate(conn)
+
+    migrated = conn.execute(
+        "SELECT COUNT(*) FROM applications WHERE note='从 submissions 表迁移'"
+    ).fetchone()[0]
+    used, _ = db.quota_state(conn, "腾讯")
+    assert migrated == 1
+    assert used == 1
+
+
+def test_existing_migrated_row_is_linked_instead_of_copied(tmp_path):
+    """升级前已经搬过的行只补旧记录序号，不再复制一份。"""
+    conn = db.connect(tmp_path / "legacy.db")
+    db.init(conn)
+    job_id = _seed_job(conn)
+    created_at = "2026-08-20T10:00:00+08:00"
+    conn.execute(
+        """INSERT INTO applications(
+               job_id, source_key, external_id, company, status,
+               submitted_at, error, note, created_at)
+           VALUES(?, 'tencent_join', 'J1', '腾讯', 'failed',
+                  NULL, '提交结果未知', '从 submissions 表迁移', ?)""",
+        (job_id, created_at),
+    )
+    conn.executescript(LEGACY_SUBMISSIONS_DDL)
+    conn.execute(
+        """INSERT INTO submissions(
+               id, job_id, external_id, source_key, company,
+               submitted_at, status, error, created_at)
+           VALUES(7, ?, 'J1', 'tencent_join', '腾讯', NULL,
+                  'failed', '提交结果未知', ?)""",
+        (job_id, created_at),
+    )
+    conn.commit()
+
+    assert "legacy_submission_id" in _cols(conn, "applications")
+    db.migrate(conn)
+
+    rows = conn.execute(
+        """SELECT legacy_submission_id FROM applications
+           WHERE note='从 submissions 表迁移'"""
+    ).fetchall()
+    assert [row["legacy_submission_id"] for row in rows] == [7]
+
+
+def test_existing_migrated_row_with_missing_created_at_is_not_copied(tmp_path):
+    """旧表没创建时间时，升级也要认出此前已经搬过的那一行。"""
+    conn = db.connect(tmp_path / "legacy.db")
+    db.init(conn)
+    job_id = _seed_job(conn)
+    conn.execute(
+        """INSERT INTO applications(
+               job_id, source_key, external_id, company, status,
+               submitted_at, error, note, created_at)
+           VALUES(?, 'tencent_join', 'J1', '腾讯', 'failed',
+                  NULL, '提交结果未知', '从 submissions 表迁移', ?)""",
+        (job_id, "2026-08-20T10:00:00+08:00"),
+    )
+    conn.executescript(LEGACY_SUBMISSIONS_DDL)
+    conn.execute(
+        """INSERT INTO submissions(
+               id, job_id, external_id, source_key, company,
+               submitted_at, status, error, created_at)
+           VALUES(9, ?, 'J1', 'tencent_join', '腾讯', NULL,
+                  'failed', '提交结果未知', NULL)""",
+        (job_id,),
+    )
+    conn.commit()
+
+    db.migrate(conn)
+    db.migrate(conn)
+
+    rows = conn.execute(
+        """SELECT legacy_submission_id FROM applications
+           WHERE note='从 submissions 表迁移'"""
+    ).fetchall()
+    assert [row["legacy_submission_id"] for row in rows] == [9]
+
+
 class TestConfirmTokenIsNullNotEmpty:
     """`confirm_token` 取不到时必须写 NULL，不能写空串。
 
