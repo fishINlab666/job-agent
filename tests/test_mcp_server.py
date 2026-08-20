@@ -565,8 +565,24 @@ class TestToolContract:
         out = call("list_jobs", {"allow_missing": ["grad_year"]})
         assert any("只在 --matched 下生效" in n for n in out["notes"])
 
-    def test_unsure_jobs_carry_their_reason(self, db_with_data) -> None:
+    def test_unsure_jobs_carry_their_reason(
+        self, db_with_data, tmp_path, monkeypatch
+    ) -> None:
         """信息不全的岗位要带 why_unsure，别看起来和确定命中的一样。"""
+        import yaml
+        from jobagent import match
+
+        profile = tmp_path / "profile.yaml"
+        profile.write_text(yaml.safe_dump({
+            "intent": {
+                "families": ["operations"],
+                "recruit_types": ["campus"],
+                "grad_years": ["26"],
+                "cities": ["深圳"],
+            },
+        }, allow_unicode=True), encoding="utf-8")
+        monkeypatch.setattr(match, "PROFILE_PATH", profile)
+
         c = db.connect(db_with_data)
         c.execute(
             """INSERT INTO jobs(source_key, external_id, company, title, job_family,
