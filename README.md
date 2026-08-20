@@ -4,18 +4,24 @@
 
 ## 核心功能
 
-**M1-M5 已完成（发现侧 MVP）**：
+**M1-M7 已完成**：
 - **M1 数据采集**：适配器模式对接各公司招聘 API
 - **M2 变更检测**：基于指纹的增量 diff，产出类型化事件流
 - **M3 用户画像**：YAML 配置文件定义筛选条件
 - **M4 智能匹配**：规则引擎过滤 + 关键词打分
 - **M5 CLI 界面**：Rich 格式化表格，支持增量推送
 
-- **M6 自动投递**：Playwright 浏览器自动化，表单填充 + 简历上传
+- **M6 代投（两阶段）**：Playwright 填表 + 简历上传，**填完停下等你确认才提交**
+- **M7 投递记录**：只读的投递漏斗与拦截原因
 
 **待实现**：
-- M7：邮件解析跟踪投递状态
-- 更多公司适配器（字节、阿里、华为等 19 家）
+- 邮件解析跟踪投递状态
+- 更多公司适配器（阿里、华为、美团等）
+- 折叠段字段（工作经历 / 项目经历 / 证书）—— 机制已通，等画像层支持多条目
+
+**M6 的实测边界**（说清楚比说漂亮重要）：填表、上传、下拉选择、隐私政策勾选、
+判据体检都在真页面上验过；**`execute()` 最后那一下「提交」从未真跑过**，
+所以 `_is_success` / `_is_duplicate` 的成功文案仍是推测的 —— 只验过「未提交时不误报」。
 
 ## 快速开始
 
@@ -71,19 +77,60 @@ uv run python -m jobagent.cli digest
 # 标记已读
 uv run python -m jobagent.cli digest --mark
 
-# M6: 自动投递岗位
-uv run python -m jobagent.cli apply <job_id> \
+# M6: 自动投递岗位（第一个参数是源站的 external_id，不是 jobs.id）
+uv run python -m jobagent.cli apply <external_id> \
   --profile-path profile.yaml \
   --user-data-dir ~/.cache/playwright-tencent
+
+# M7: 看投递记录（只读）—— 投了什么、卡在哪、截图在哪
+uv run python -m jobagent.cli applications
+uv run python -m jobagent.cli applications --funnel          # 分档汇总 + 拦截原因
+uv run python -m jobagent.cli applications --status blocked  # 只看被拦的
+uv run python -m jobagent.cli applications --company 蔚来     # 一家公司的全部源
 ```
 
-**M6 投递流程**：
-1. 首次运行需手动登录（浏览器自动打开）
+**M7 是只读的**，没有任何改状态的开关：状态变更必须走 `apply` 的
+prepare/execute 两阶段闸门，从查看命令里改终态等于给那条闸门开后门。
+
+**M6 投递流程（两阶段闸门）**：
+1. 首次运行需手动登录（浏览器自动打开，手机号 + 验证码只能你自己做）
 2. 登录态持久化到 `--user-data-dir`（后续无需重复登录）
-3. 自动填充表单（姓名、手机、邮箱、学校、专业、学历、毕业时间）
-4. 自动上传简历（如果 `profile.yaml` 中配置了 `resume_path`）
-5. 提交并返回结果（成功/失败/重复投递/岗位已关闭）
+3. **prepare**：填表 → 截图 → 渲染逐字段清单（值来自画像哪一行、哪些没填上、
+   页面判哪个值不合法）→ 发一个一次性 `confirm_token`。**停在提交按钮前。**
+4. 你看完清单点头
+5. **execute**：校验 token → **回读页面上现在的值重算摘要**，和你确认过的对不上
+   就拒绝提交 → 勾隐私政策 → 点「提交简历」
 6. 截图保存在 `screenshots/` 目录
+
+没有 `--yes` 这种开关，这是故意的：提交不可逆，对方系统里多一条记录撤不回来。
+
+**限投额度**：很多公司对校招投递有次数上限（腾讯这类通常 1~3 个岗位）。两阶段闸门
+保的是「这一次提交是你确认过的」，它保不了「这是这家公司的第几次」—— 挨个确认 5 个
+岗位，每一步看起来都正常。所以 `apply` 在开浏览器之前先查一次额度：
+
+```bash
+# 登记时给上限。拿不到真实上限就别填，留空 = 不限（不猜一个数）
+uv run python -m jobagent.cli source-add feishu:nio:campus \
+  --company 蔚来 --entry-url https://nio.jobs.feishu.cn/campus --apply-limit 2
+```
+
+用量按**公司**算，不按源算：一家公司在库里可以有多行（蔚来就有 `feishu:nio` 和
+`feishu:nio:campus` 两行），按源数会把用量拆成两份、每份都不到上限，于是投穿。
+算占用的是 `submitted` / `duplicate` / `failed` —— `failed` 也算，因为它全都写在
+点击提交之后，点击超时不代表没点上。
+
+```bash
+# 只填表看清单，不提交（安全，可反复跑）
+uv run python -m jobagent.cli apply <external_id> --dry-run --user-data-dir .browser
+
+# 判据体检：核一遍选择器还认不认页面。只读，不填不投
+uv run python -m jobagent.cli checkup <external_id> --user-data-dir .browser
+```
+
+`checkup` 存在的理由：投递器里靠字符串认页面的常量有一打（中文字段名、
+CSS-modules 类名前缀、勾选框旁的文案、下拉选项全称）。它们坏掉的方式全是
+**静默**的 —— 命中 0 个，然后代投交出一张几乎空的表单加一句「填了 2 个字段」。
+判据写对了不算完，得有一条命令能回答「怎么知道它失效了」。
 
 详见 [M6 手工测试指南](docs/M6_MANUAL_TEST.md)。
 
@@ -181,9 +228,24 @@ fingerprint = hashlib.sha256(
 uv run pytest -xvs
 ```
 
-**41 个测试用例**：
-- `test_ingest.py`：变更检测、安全防护、事件产出
-- `test_normalize.py`：岗位族分类、城市标准化
+**504 个测试用例**（截至 2026-08-10）：
+
+| 文件 | 数量 | 覆盖 |
+|---|---|---|
+| `test_match.py` | 98 | 硬过滤、软打分、排除词 |
+| `test_adapter_feishu.py` | 69 | 四租户解析、分页、字段缺失 |
+| `test_submitter_feishu.py` | 64 | 两阶段闸门、歧义守卫、回读摘要、判据体检 |
+| `test_ingest.py` | 63 | 变更检测、安全防护、事件产出 |
+| `test_ats.py` | 54 | ATS 识别与路由判据 |
+| `test_routing.py` | 39 | 投递器选择 |
+| `test_normalize.py` | 31 | 岗位族分类、城市标准化 |
+| `test_cli.py` | 24 | 命令行出口，含 `apply` 的两阶段与 `checkup` |
+| `test_submitter_tencent.py` | 23 | 腾讯表单填充与结果判据 |
+| 其余 6 个文件 | 39 | 迁移、摘要、探针分桶、端到端 |
+
+**测试验不到的东西**（写在这里免得数字给人虚假安全感）：所有投递器测试都跑在
+假页面上，真页面的判据靠 `checkup` 命令在线核；`execute()` 的提交点击**没有任何
+真实执行记录**，测试只能证明「token 不对/摘要漂移时它拒绝提交」。
 
 ## 生产数据验证
 
@@ -197,13 +259,15 @@ uv run pytest -xvs
 
 ## 下一步
 
-**选项 A：横向扩展（发现侧）**  
-添加 19 家公司适配器：字节、阿里、华为、美团...
+当初的判断是「先做投递侧（M6），因为它是最大未知风险」。现在这个风险大部分已经落地
+（表单机制、登录门归因、判据体检都通了），剩下的按不确定性排：
 
-**选项 B：纵向深入（投递侧）**  
-先实现 M6（浏览器自动化），验证代投可行性后再扩展公司池
-
-**建议**：先做 B。M6 是最大未知风险（反爬、验证码、多步骤流程），在一家公司上验证可行性，比盲目采集 20 家数据更稳妥。
+1. **真投一次**，核实 `_is_success` / `_is_duplicate` / `_is_job_closed` 的文案。
+   这是唯一还在猜的地方，也是唯一需要你亲自点头的一步。
+2. **画像层支持多条目**（`internships` / `projects`），折叠段的填写机制已经通了，
+   缺的是数据 —— 现在 `profile.yaml` 里那两个还是空列表。
+3. **横向扩展**：飞书系已覆盖 4 家（蔚来 / 小鹏 / 字节 / 商汤），同一套前端再加
+   租户成本很低；Moka / 北森系需要另做，它们的厂商 API 对外是关的，只能走公开前端。
 
 ## 技术栈
 

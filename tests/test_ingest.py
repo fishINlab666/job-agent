@@ -6,6 +6,9 @@
 """
 from __future__ import annotations
 
+import json
+import sqlite3
+
 import pytest
 
 from jobagent import db, ingest
@@ -13,29 +16,56 @@ from jobagent.adapters.base import RawJob
 
 
 class FakeAdapter:
-    """可控的假适配器，用来构造 diff 场景。"""
+    """可控的假适配器，用来构造 diff 场景。
+
+    `source_key` / `company` 既是类属性也能按实例覆盖：绝大多数测试只用一个源，
+    读类属性（`FakeAdapter.source_key`）就够；跨源污染那条要两个不同的源，
+    走参数覆盖。
+    """
 
     source_key = "fake_src"
     company = "测试公司"
     system = "self_built"
     entry_url = "https://example.test"
 
-    def __init__(self, jobs: list[RawJob]) -> None:
+    def __init__(
+        self,
+        jobs: list[RawJob],
+        key: str | None = None,
+        company: str | None = None,
+    ) -> None:
         self._jobs = jobs
+        if key is not None:
+            self.source_key = key
+        if company is not None:
+            self.company = company
 
     def fetch(self) -> list[RawJob]:
         return self._jobs
 
 
-def make_job(ext_id: str, title: str = "产品运营", family: str = "operations") -> RawJob:
+def make_job(
+    ext_id: str,
+    title: str = "产品运营",
+    family: str = "operations",
+    cities: list[str] | None = None,
+    grad_year: str | None = "27",
+) -> RawJob:
+    # cities 用 None 当哨兵而不是直接默认 ["北京"]：要能区分「没传」和
+    # 「传了空列表」—— 城市变空是一个正经用例（TestCitiesDiff 里那条）。
+    #
+    # grad_year 原来写死成 "27"，20 多条 ingest 测试共用，于是**没有一条测试
+    # 让这个字段变过** —— 这正是「把 grad_year 加进 _fp()」和「加一条强制比对
+    # 旁路」这两个改动都能 379 全绿存活的原因。它是 TestGradYearRefresh
+    # 那两条用例的前提，不是顺手加的参数。
     return RawJob(
         external_id=ext_id,
         title=title,
         raw_json={"id": ext_id, "title": title},
         job_family=family,
-        cities=["北京"],
+        cities=["北京"] if cities is None else cities,
         recruit_type="campus",
-        grad_year="27",
+        grad_year=grad_year,
         apply_url=f"https://example.test/{ext_id}",
     )
 
@@ -50,6 +80,15 @@ def conn(tmp_path):
 
 def events_of(conn, kind: str) -> list:
     return conn.execute("SELECT * FROM events WHERE kind=?", (kind,)).fetchall()
+
+
+def _is_closed(c: sqlite3.Connection) -> bool:
+    """sqlite3 没有 `.closed` 属性，只能拿一句无害的查询试出来。"""
+    try:
+        c.execute("SELECT 1")
+    except sqlite3.ProgrammingError as exc:
+        return "closed" in str(exc).lower()
+    return False
 
 
 class TestBootstrap:
@@ -241,6 +280,102 @@ class TestReopen:
         ).fetchone()["closed_at"] is None
 
 
+class TestCitiesDiff:
+    """城市变更要进 diff，且口径必须和指纹一致。
+
+    原来 cities 在指纹里（`ingest._fp`）却不在 diff 的字段清单里，于是
+    「只有城市变了」会触发 job_updated 但 diff 是空的 —— 用户收到
+    「岗位 XXX 有更新」，后面什么都没有。真库里这样的事件有 16 条，
+    回查源站快照，变的字段全是 workCities。见方案 006 问题 1。
+    """
+
+    def _diff_of(self, conn, before: list[str], after: list[str]) -> dict | None:
+        """跑两轮 sync，返回第二轮 job_updated 的 diff（没有事件则 None）。"""
+        ingest.sync(conn, FakeAdapter([make_job("1", cities=before)]))
+        ingest.sync(conn, FakeAdapter([make_job("1", cities=after)]))
+        row = conn.execute(
+            "SELECT payload FROM events WHERE kind='job_updated'"
+        ).fetchone()
+        return json.loads(row["payload"])["diff"] if row else None
+
+    def test_cities_change_enters_diff(self, conn) -> None:
+        """城市从三地缩到一地，diff 里要能看出来。
+
+        修之前这条红：diff 是 {}，事件照发，用户看不到变了什么。
+        """
+        diff = self._diff_of(conn, ["北京", "上海", "深圳"], ["深圳"])
+
+        assert diff is not None, "城市变了却没发 job_updated"
+        assert "cities" in diff, f"城市变了但 diff 里没有 cities：{diff}"
+        assert diff["cities"] == {"from": ["上海", "北京", "深圳"], "to": ["深圳"]}
+
+    def test_diff_carries_lists_not_json_strings(self, conn) -> None:
+        """diff 里的 cities 是 list，不是 JSON 字符串。
+
+        钉的是渲染端的形状依赖：`cli._fmt_cities` 按 list 处理。
+        谁图省事把 `prev["cities"]` 原样塞进 diff（那是字符串），这条红。
+        """
+        diff = self._diff_of(conn, ["北京"], ["深圳"])
+
+        assert isinstance(diff["cities"]["from"], list)
+        assert isinstance(diff["cities"]["to"], list)
+
+    def test_unchanged_cities_stay_out_of_diff(self, conn) -> None:
+        """城市没变就不该出现在 diff 里（反向用例）。
+
+        忘了反序列化时这条红：库里是 `'["北京"]'`、内存里是 `["北京"]`，
+        直接比永远不等，于是**每个**岗位都被判成城市变了。
+        """
+        diff = self._diff_of(conn, ["北京"], ["北京"])
+
+        # 城市和其它字段都没变 → 指纹不变 → 压根不该有事件
+        assert diff is None, f"什么都没变却发了 job_updated：{diff}"
+
+    def test_city_reorder_alone_emits_no_event(self, conn) -> None:
+        """只换城市顺序，不算变更 —— 指纹算的是排序后的值。
+
+        这条钉的是不变量，但它**抓不住** diff 里漏掉 sorted 的错：
+        顺序变了指纹不变，事件根本不发，diff 那几行走不到。
+        真正抓 sorted 的是下一条。
+        """
+        assert self._diff_of(conn, ["北京", "深圳"], ["深圳", "北京"]) is None
+
+    def test_city_reorder_is_not_a_change_next_to_a_real_change(self, conn) -> None:
+        """标题变了、城市只换了顺序：diff 里要有 title，不许有 cities。
+
+        **这条是 sorted 的唯一守卫。** 必须搭一个别的字段变更把指纹顶开，
+        才能让代码走到建 diff 那几行；否则顺序变化根本进不了那段逻辑。
+        去掉 `_cities` 里的 sorted 之后，这条红（会多出一个假的 cities 变更），
+        而上面那条仍然绿。
+        """
+        ingest.sync(conn, FakeAdapter([make_job("1", cities=["北京", "深圳"])]))
+        ingest.sync(
+            conn,
+            FakeAdapter([make_job("1", title="高级产品运营", cities=["深圳", "北京"])]),
+        )
+        diff = json.loads(
+            conn.execute(
+                "SELECT payload FROM events WHERE kind='job_updated'"
+            ).fetchone()["payload"]
+        )["diff"]
+
+        assert "title" in diff, "标题变了却没进 diff，用例本身坏了"
+        assert "cities" not in diff, (
+            f"只换了城市顺序却报成变更 —— 指纹说没变、diff 说变了，自相矛盾：{diff}"
+        )
+
+    def test_cities_going_empty_is_a_change(self, conn) -> None:
+        """城市变空是变更，不是「没变」。
+
+        `[]` 的含义是「源站这次什么都没给」，和 `["不限"]`（源站明说哪都行）
+        是两件事。空列表不许被当成「跳过比较」。
+        """
+        diff = self._diff_of(conn, ["北京"], [])
+
+        assert diff is not None and "cities" in diff
+        assert diff["cities"] == {"from": ["北京"], "to": []}
+
+
 class TestDryRunWritesNothing:
     """`--dry-run` 必须是只读的。
 
@@ -339,3 +474,702 @@ class TestSnapshots:
         ingest.sync(conn, FakeAdapter([make_job("1"), make_job("2")]))
 
         assert conn.execute("SELECT COUNT(*) n FROM snapshots").fetchone()["n"] == 4
+
+
+class TestTransactionBoundary:
+    """一次 sync = 一个事务，崩了整轮退干净，但 `runs` 那行痕迹留下。
+
+    报告里那例 bug 的形状：同一批喂进来两条相同 external_id，撞
+    `UNIQUE(source_key, external_id)`，异常往上抛 —— 而抛之前已经写进去的
+    snapshots / jobs / events 没人回滚，留在库里。下一个源的 `commit()`
+    顺手把它们带进库，于是**失败的那一轮污染了成功的那一轮**。
+
+    收拢的做法是业务数据全部走主连接、只在函数结尾提交一次；`runs` 那行走
+    独立的侧连接自己提交，所以主事务回滚它不跟着退。两半缺一不可，缺哪一半
+    会红哪条测试写在各自的 docstring 里。
+
+    触发器为什么用重复 external_id：它是真实故障（报告里就是这么炸的），
+    而且不用 monkeypatch —— 改 `conn.execute` 会撞
+    `attribute 'execute' is read-only`，而且假造的失败点证明不了真实路径。
+    """
+
+    DUP = "UNIQUE constraint failed"
+
+    def _counts(self, conn) -> dict:
+        return {
+            t: conn.execute(f"SELECT COUNT(*) n FROM {t}").fetchone()["n"]
+            for t in ("jobs", "snapshots", "events")
+        }
+
+    def test_write_loop_error_rolls_back_business_data(self, conn) -> None:
+        """写库循环中途抛异常，这一轮的业务数据一行都不许留。
+
+        只收拢事务这一半就能过。单独钉住是因为它是本方案的主命题：
+        没有它，下面几条都可以靠「异常发生前什么都还没写」假绿。
+        """
+        with pytest.raises(Exception, match=self.DUP):
+            ingest.sync(conn, FakeAdapter([make_job("1"), make_job("2"), make_job("2")]))
+
+        assert self._counts(conn) == {"jobs": 0, "snapshots": 0, "events": 0}
+
+    def test_duplicate_external_id_leaves_no_partial_rows(self, conn) -> None:
+        """复现报告问题 2：库里已经有数据时，崩掉的那轮不许改动它。
+
+        和上一条的区别是这里有基线 —— 「回滚」不能是「清空」。上一条在空库上
+        跑，`DELETE FROM jobs` 也能让它绿。
+        """
+        ingest.sync(conn, FakeAdapter([make_job("1")]))
+        before = self._counts(conn)
+
+        with pytest.raises(Exception, match=self.DUP):
+            ingest.sync(conn, FakeAdapter([make_job("2"), make_job("3"), make_job("3")]))
+
+        assert self._counts(conn) == before
+        # 具体钉住：新岗位一条都没进来，老岗位还在
+        assert [r["external_id"] for r in conn.execute(
+            "SELECT external_id FROM jobs ORDER BY external_id"
+        )] == ["1"]
+
+    def test_failed_source_does_not_leak_into_next(self, conn) -> None:
+        """报告那例 bug 的守门测试：A 源崩了，B 源的 commit 不许把 A 的数据带进库。
+
+        这是「不回滚」最恶劣的表现形式 —— 单独跑 A 会看到异常，单独跑 B 会看到
+        正确结果，只有连着跑才能看到 A 的半截数据混在 B 的事务里落盘。
+        """
+        with pytest.raises(Exception, match=self.DUP):
+            ingest.sync(conn, FakeAdapter([make_job("1"), make_job("2"), make_job("2")],
+                                          key="src_a", company="A公司"))
+
+        st = ingest.sync(conn, FakeAdapter([make_job("10"), make_job("11")],
+                                           key="src_b", company="B公司"))
+
+        # B 自己完整
+        assert (st["fetched"], st["opened"]) == (2, 2)
+        # 三张表里都不许出现 src_a 的行
+        for table in ("jobs", "snapshots"):
+            assert conn.execute(
+                f"SELECT COUNT(*) n FROM {table} WHERE source_key=?", ("src_a",)
+            ).fetchone()["n"] == 0, f"{table} 里混进了失败源的数据"
+        assert conn.execute(
+            "SELECT COUNT(*) n FROM events WHERE source_key=?", ("src_a",)
+        ).fetchone()["n"] == 0
+        # B 是首轮，所以 events 只有一条 source_bootstrapped —— 数量对得上说明
+        # 没有 A 的事件被算进去
+        assert [r["source_key"] for r in conn.execute("SELECT source_key FROM events")] == ["src_b"]
+
+    def test_run_row_survives_write_failure(self, conn) -> None:
+        """业务数据退干净，但 `runs` 那一行**留着** —— 崩过的痕迹是排查的唯一入口。
+
+        **只收拢事务、没上侧连接时这条红**：`runs` 那行也在主连接的事务里，
+        跟着 `rollback()` 一起退掉，库里查不到这轮崩过。业务数据是干净的、
+        报告那例 bug 也确实修好了，代价是排查能力静默退化 ——
+        本仓库 001 §12 那个坑是同一个形状：常见路径全绿。
+        """
+        with pytest.raises(Exception, match=self.DUP):
+            ingest.sync(conn, FakeAdapter([make_job("1"), make_job("2"), make_job("2")]))
+
+        # sources 那行也要留着：runs.source_key 有外键指过去
+        assert conn.execute(
+            "SELECT COUNT(*) n FROM sources WHERE source_key=?", (FakeAdapter.source_key,)
+        ).fetchone()["n"] == 1
+        assert conn.execute("SELECT COUNT(*) n FROM runs").fetchone()["n"] == 1
+
+    def test_write_loop_failure_marks_run_failed_not_running(self, conn) -> None:
+        """崩掉的那轮必须是 `failed` + 有 error，不能停在 `running` + error 为空。
+
+        **照方案 §5 骨架字面实现时这条红**（骨架里 `...` 占位掩盖了一次真实重构：
+        当前代码的 `try` 只包 `fetch()`，写库循环整段在 try 外面）。那个形状下
+        业务数据回滚正确、四条原有路径全对、全量测试也绿，唯独写库循环这条路径上
+        run 停在 `running`。
+
+        上面那条 `test_run_row_survives_write_failure` 抓不到它 —— 那条只断言
+        「行还在」，而这里行确实还在，只是状态不对。
+
+        为什么这一行的状态要紧：`cli status` 每个源只读最近一条 run
+        （`ORDER BY id DESC LIMIT 1`），崩过的一轮会显示成「还在跑」。
+        留痕是为了查得到崩在哪，痕迹里没 error、状态还是 running，
+        等于只说了半句话。
+        """
+        with pytest.raises(Exception, match=self.DUP):
+            ingest.sync(conn, FakeAdapter([make_job("1"), make_job("2"), make_job("2")]))
+
+        run = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+        assert run["status"] == "failed"
+        assert run["error"] and self.DUP in run["error"], "error 得写进去，不然查不到崩在哪"
+        assert run["finished_at"] is not None
+
+    def test_fetch_failure_also_marks_run_failed(self, conn) -> None:
+        """反向对照：源返回空这条路径原来就对，收拢之后不许退化。
+
+        少了它，上一条可以靠「把所有失败都写成 failed」蒙对 —— 而空返回那条
+        路径在重构里被改过（原来是 `finish_run` + `raise`，现在是裸 `raise`，
+        统一由 except 收尾），改坏了得有人喊。
+        """
+        with pytest.raises(RuntimeError, match="拒绝按「全部关闭」处理"):
+            ingest.sync(conn, FakeAdapter([]))
+
+        run = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+        assert run["status"] == "failed"
+        assert "返回 0 条" in run["error"]
+        assert self._counts(conn) == {"jobs": 0, "snapshots": 0, "events": 0}
+
+    def test_repeated_syncs_do_not_leak_connections(self, conn, monkeypatch) -> None:
+        """每一个侧连接都得关掉，**失败路径也算**。常驻进程里不关就是每轮泄一个。
+
+        判据是「开出来的每个侧连接都已关闭」，不是「存活的 Connection 对象数没涨」。
+        后者测不出东西：CPython 靠引用计数，函数栈退掉时那个没人引用的连接会被
+        立刻回收，于是 `side.close()` 只写在 `else` 里（失败路径不关）也能全绿 ——
+        实测过，378 passed。改成盯 `db.connect` 开出来的对象才抓得住。
+
+        `finally` 这个位置是必须的：放在 `else` 里失败路径漏关，放在 `finish_run`
+        之前成功路径会拿到已关闭的连接（`ProgrammingError`）。所以这里成功和
+        失败混着跑。
+        """
+        opened: list[sqlite3.Connection] = []
+        real_connect = db.connect
+
+        def tracking(path, *a, **kw):
+            c = real_connect(path, *a, **kw)
+            opened.append(c)
+            return c
+
+        monkeypatch.setattr(db, "connect", tracking)
+
+        for i in range(9):
+            if i % 3 == 2:
+                # 重复的那一对每轮换新 id：库里已经有的 external_id 走 UPDATE 分支，
+                # 撞不到 UNIQUE —— 复用 "2" 的话这一轮根本不会抛。
+                dup = make_job(f"d{i}")
+                with pytest.raises(Exception, match=self.DUP):
+                    ingest.sync(conn, FakeAdapter([make_job("1"), make_job("2"), dup, dup]))
+            else:
+                ingest.sync(conn, FakeAdapter([make_job("1"), make_job("2")]))
+
+        assert len(opened) == 9, "每轮真跑都该开一个侧连接，开的数量不对说明侧连接没接上"
+        still_open = [i for i, c in enumerate(opened) if not _is_closed(c)]
+        assert still_open == [], f"第 {still_open} 轮的侧连接没关"
+
+    def test_dry_run_opens_no_side_connection(self, conn, monkeypatch) -> None:
+        """dry-run 不许开侧连接 —— 开了就会真提交，`rollback()` 无事可回。
+
+        `_NoCommit` 换成真侧连接时这条红。上面 `TestDryRunWritesNothing` 那几条
+        也会红，但它们说的是「库里多了行」，这条说的是「为什么多」。
+        """
+        calls: list = []
+        real_connect = db.connect
+        monkeypatch.setattr(
+            db, "connect", lambda *a, **kw: (calls.append(a), real_connect(*a, **kw))[1]
+        )
+
+        ingest.sync(conn, FakeAdapter([make_job("1")]), dry_run=True)
+
+        assert calls == [], f"dry-run 开了侧连接：{calls}"
+
+
+def grad_job(ext_id: str, label: str, grad_year: str | None = "27") -> RawJob:
+    """带招聘标签的岗位。标签落进 `raw_json`，因为刷新的输入是快照原文。
+
+    和 `make_job` 分开而不是加参数：这一族用例关心的是「标签 → 届别」这条推导
+    在存量上重放，`make_job` 那 20 多个调用方一个都不关心标签。
+    """
+    return RawJob(
+        external_id=ext_id,
+        title="产品运营",
+        raw_json={"id": ext_id, "label": label},
+        job_family="operations",
+        cities=["北京"],
+        recruit_type="campus",
+        grad_year=grad_year,
+        apply_url=f"https://example.test/{ext_id}",
+    )
+
+
+class GradYearAdapter(FakeAdapter):
+    """带届别重算规则的假适配器。
+
+    规则的**形状**和腾讯一致（读原文里的标签字面量、换季只改一个常量），
+    但词表是测试自己的 —— 这里测的是 `refresh_grad_year` 这个机制，
+    腾讯那套标签映射在 `test_adapter_tencent.py` 里，两处不该互相绑死。
+    """
+
+    source_key = "fake_grad_src"
+    campus_year = "26"          # 换季就是改这个
+
+    @classmethod
+    def grad_year_from_raw(cls, raw: dict) -> str | None:
+        label = raw.get("label") or ""
+        if "应届" in label:
+            return cls.campus_year
+        if "实习" in label:
+            return "不限"
+        return None             # 认不出的标签不兜底
+
+
+def _gy(conn, ext_id: str = "1") -> str | None:
+    row = conn.execute(
+        "SELECT grad_year FROM jobs WHERE external_id=?", (ext_id,)
+    ).fetchone()
+    return row["grad_year"]
+
+
+class TestGradYearRefresh:
+    """届别换季刷新。见 docs/plans/008-届别换季刷新与过期告警.md"""
+
+    def test_sync_alone_does_not_refresh_grad_year(self, conn) -> None:
+        """只改届别时 `sync` 不更新存量。**这是问题 5 的正面钉子。**
+
+        `grad_year` 不在 `_fp()` 里，所以指纹没变，落到「只动 last_seen_at」
+        那条分支。表现是「改了代码、sync 说 updated=0、库里没动」。
+
+        有人把 `grad_year` 加进 `_fp()`、或者加一条「指纹之外的强制比对」旁路时
+        这条红 —— 它同时是「本方案不走那两条路」的归属锁：那两条路各自的代价
+        写在 008 §8（前者造 9401 条空 diff 假事件，后者会静默把好值抹成 NULL）。
+        """
+        ingest.sync(conn, FakeAdapter([make_job("1", grad_year="26")]))
+        assert _gy(conn) == "26"
+
+        st = ingest.sync(conn, FakeAdapter([make_job("1", grad_year="27")]))
+        assert st["updated"] == 0, "只改届别不该算一次变更"
+        assert _gy(conn) == "26", "届别被 sync 刷新了 —— 那 refresh 命令就没有存在理由"
+
+        # 反面：别的字段也变时指纹就变了，届别搭上便车。
+        # 这一半保证上面那条断言不是因为「sync 根本不更新任何东西」而绿的。
+        st = ingest.sync(
+            conn, FakeAdapter([make_job("1", title="产品运营（新）", grad_year="27")])
+        )
+        assert st["updated"] == 1
+        assert _gy(conn) == "27"
+
+    def test_apply_updates_stored_value(self, conn) -> None:
+        """刷新把存量改对。
+
+        断言的是**库里的值**，不是 rowcount —— rowcount 只说明走了 UPDATE 分支，
+        说明不了届别对不对。同 004 §10「断言成员不断言条数」。
+        """
+        ingest.sync(conn, GradYearAdapter([
+            grad_job("1", "应届毕业生", grad_year="25"),
+            grad_job("2", "日常实习", grad_year="25"),
+        ]))
+        assert (_gy(conn, "1"), _gy(conn, "2")) == ("25", "25")
+
+        st = ingest.refresh_grad_year(conn, GradYearAdapter([]), apply=True)
+
+        assert (_gy(conn, "1"), _gy(conn, "2")) == ("26", "不限")
+        assert st["changed"] == 2
+        assert st["transitions"] == {("25", "26"): 1, ("25", "不限"): 1}
+
+    def test_refresh_is_idempotent(self, conn) -> None:
+        """连跑两次，第二次改 0 行。WHERE 里漏掉「值不同」这个条件时红。"""
+        ingest.sync(conn, GradYearAdapter([grad_job("1", "应届毕业生", grad_year="25")]))
+
+        first = ingest.refresh_grad_year(conn, GradYearAdapter([]), apply=True)
+        second = ingest.refresh_grad_year(conn, GradYearAdapter([]), apply=True)
+
+        assert first["changed"] == 1
+        assert second["changed"] == 0, "第二次还在改，说明没跳过已经对的行"
+        assert second["unchanged"] == 1
+        assert _gy(conn) == "26"
+
+    def test_refresh_does_not_touch_fingerprint(self, conn) -> None:
+        """刷新不碰 `fingerprint`。**归属用例。**
+
+        有人「顺手」在刷新里也重算指纹时红。那会让全部存量行的哈希都变
+        （实测：`_fp` 的字典里多一个键，9401 行全不等），下一轮 sync 造出
+        同样多的 diff 为空的假 `job_updated` —— plan 006 问题 1 的同型放大。
+        没有这条，008 §8 那条禁令在代码里没有执行力。
+        """
+        ingest.sync(conn, GradYearAdapter([
+            grad_job("1", "应届毕业生", grad_year="25"),
+            grad_job("2", "日常实习", grad_year="25"),
+        ]))
+        before = {
+            r["external_id"]: r["fingerprint"]
+            for r in conn.execute("SELECT external_id, fingerprint FROM jobs")
+        }
+
+        ingest.refresh_grad_year(conn, GradYearAdapter([]), apply=True)
+
+        after = {
+            r["external_id"]: r["fingerprint"]
+            for r in conn.execute("SELECT external_id, fingerprint FROM jobs")
+        }
+        assert after == before, "指纹被改了 —— 下一轮 sync 会造一批空 diff 的假事件"
+
+    def test_refresh_emits_no_events(self, conn) -> None:
+        """刷新不产生事件。**归属用例**：有人把刷新实现成「调 sync」时红。
+
+        换季刷新不是一次观测，它没有「岗位有更新」的语义 —— 用户没必要为
+        「我们改了自己的推导常量」收到几百条通知。
+        """
+        ingest.sync(conn, GradYearAdapter([grad_job("1", "应届毕业生", grad_year="25")]))
+        before = conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()["n"]
+
+        ingest.refresh_grad_year(conn, GradYearAdapter([]), apply=True)
+
+        after = conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()["n"]
+        assert after == before, "刷新发了事件"
+
+    def test_refresh_dry_run_does_not_write(self, conn) -> None:
+        """默认不写库。**硬约束**：`apply` 默认改成 True 时红。
+
+        这条命令一次改几百行，所以闸门做成 API 形状 —— 不传 `apply=True`
+        代码走不到 `commit()`，而不是靠调用方记得先预演。
+        """
+        ingest.sync(conn, GradYearAdapter([grad_job("1", "应届毕业生", grad_year="25")]))
+
+        st = ingest.refresh_grad_year(conn, GradYearAdapter([]))
+
+        assert st["changed"] == 1, "预演也要如实报会改多少 —— 报 0 就没法预演了"
+        assert st["applied"] is False
+        assert _gy(conn) == "25", "预演写了库"
+
+    def test_refresh_leaves_unrecognized_label_null(self, conn) -> None:
+        """认不出的标签保持 NULL，不许兜底成某个届别。
+
+        用 `.get(x, "26")` 这种兜底时红。把认不出的岗位标成当届，
+        比留 NULL 更糟：NULL 在填充率里看得见，标错是静默错到另一届里。
+        """
+        ingest.sync(conn, GradYearAdapter([grad_job("1", "外星人招聘", grad_year=None)]))
+        assert _gy(conn) is None
+
+        st = ingest.refresh_grad_year(conn, GradYearAdapter([]), apply=True)
+
+        assert _gy(conn) is None
+        assert st["changed"] == 0
+        assert st["unchanged"] == 1, "NULL→NULL 该算「本来就对」，不是「跳过」"
+
+    def test_refresh_never_nulls_out_a_good_value(self, conn) -> None:
+        """有值的行不许被重算出的空值覆盖。**方向性守卫。**
+
+        场景是真的会发生的：源站把招聘标签改成一个推导规则认不出的字面量
+        （这里 `日常实习` → `在校生项目`，两个关键词都不含），重算掉成 None。
+        此时把 807 个好值抹成 NULL 是「误报」方向，而 `ingest.py` 开头写着宁可漏报。
+
+        跳过要被数出来并报给用户 —— 静默保留旧值和静默覆盖一样坏，
+        两者都让人看不出源站已经变了。
+
+        选标签时注意：`实习生招聘` 这种**仍然含「实习」**，规则认得出、不触发这条。
+        写这个用例时第一版就是拿它当「认不出」的例子，被这条断言当场抓住了。
+        """
+        ingest.sync(conn, GradYearAdapter([grad_job("1", "日常实习", grad_year="不限")]))
+        assert _gy(conn) == "不限"
+
+        # 源站改了字面量：新标签两个关键词都不含，认不出来
+        ingest.sync(conn, GradYearAdapter([grad_job("1", "在校生项目", grad_year="不限")]))
+        st = ingest.refresh_grad_year(conn, GradYearAdapter([]), apply=True)
+
+        assert _gy(conn) == "不限", "好值被空值覆盖了"
+        assert st["skipped_would_null"] == 1
+        assert st["changed"] == 0
+
+    def test_refresh_follows_the_season_constant(self, conn) -> None:
+        """换季改常量之后，刷新按新常量走。这条是本命令的存在理由本身。"""
+        ingest.sync(conn, GradYearAdapter([grad_job("1", "应届毕业生", grad_year="26")]))
+
+        class NextSeason(GradYearAdapter):
+            campus_year = "27"
+
+        st = ingest.refresh_grad_year(conn, NextSeason([]), apply=True)
+
+        assert _gy(conn) == "27"
+        assert st["transitions"] == {("26", "27"): 1}
+
+    def test_refresh_also_fixes_closed_jobs(self, conn) -> None:
+        """已关闭的岗位也刷。
+
+        它们的届别一样是错的，而 reopen 走的是 sync 的 UPDATE 分支、不归刷新管，
+        留着错值等 reopen 是碰运气。
+        """
+        ingest.sync(conn, GradYearAdapter([
+            grad_job("1", "应届毕业生", grad_year="25"),
+            grad_job("2", "应届毕业生", grad_year="25"),
+        ]))
+        # 2 号消失 → 关闭。守卫要 ≥5 条才拦，这里 1/2 不触发绝对量门槛
+        ingest.sync(conn, GradYearAdapter([grad_job("1", "应届毕业生", grad_year="25")]))
+        assert conn.execute(
+            "SELECT closed_at FROM jobs WHERE external_id='2'"
+        ).fetchone()["closed_at"] is not None
+
+        ingest.refresh_grad_year(conn, GradYearAdapter([]), apply=True)
+
+        assert _gy(conn, "2") == "26", "已关闭的岗位没被刷"
+
+    def test_refresh_is_scoped_to_one_source(self, conn) -> None:
+        """只动自己那个源。别的源的届别不许被顺带改。"""
+        ingest.sync(conn, GradYearAdapter([grad_job("1", "应届毕业生", grad_year="25")]))
+        ingest.sync(conn, FakeAdapter([make_job("9", grad_year="99")], key="other_src"))
+
+        ingest.refresh_grad_year(conn, GradYearAdapter([]), apply=True)
+
+        assert _gy(conn, "9") == "99", "串源了"
+
+    def test_unsupported_adapter_raises_distinctly(self, conn) -> None:
+        """没有重算规则的适配器抛 `RefreshUnsupported`，不抛通用异常。
+
+        飞书四家 8594 条届别全是 NULL，因为源站没这个字段 —— 那不是坏了，
+        是没有可重算的东西。混成一个错会让人跑去修飞书适配器。
+        """
+        ingest.sync(conn, FakeAdapter([make_job("1")]))
+
+        with pytest.raises(ingest.RefreshUnsupported):
+            ingest.refresh_grad_year(conn, FakeAdapter([]), apply=True)
+
+
+def _feishu_job(ext_id: str, url: str) -> RawJob:
+    """一条飞书岗位，apply_url 可以指定成任意形状（用来造老数据）。"""
+    return RawJob(
+        external_id=ext_id,
+        title=f"岗位 {ext_id}",
+        raw_json={"id": ext_id},
+        job_family="product",
+        cities=["北京"],
+        recruit_type="campus",
+        apply_url=url,
+    )
+
+
+def _url(conn, ext_id: str) -> str:
+    return conn.execute(
+        "SELECT apply_url FROM jobs WHERE external_id=?", (ext_id,)
+    ).fetchone()["apply_url"]
+
+
+class TestRepairApplyUrl:
+    """给存量飞书 apply_url 补 `/detail`（plan 010）。
+
+    2026-08-10 实测四个租户：少 `/detail` 的链接全渲染「页面不存在」，
+    库里 8594 条飞书链接全是死的。这一批测试钉的是**修法的三条硬约束**，
+    不只是「加了个后缀」。
+    """
+
+    OLD = "https://nio.jobs.feishu.cn/campus/position/777"
+    NEW = "https://nio.jobs.feishu.cn/campus/position/777/detail"
+
+    def test_adds_detail_suffix(self, conn) -> None:
+        ingest.sync(conn, FakeAdapter([_feishu_job("777", self.OLD)], key="feishu:nio:campus"))
+
+        st = ingest.repair_apply_url(conn, apply=True)
+
+        assert st["changed"] == 1
+        assert _url(conn, "777") == self.NEW
+
+    def test_dry_run_does_not_write(self, conn) -> None:
+        """不带 --apply 只报数，不动库。"""
+        ingest.sync(conn, FakeAdapter([_feishu_job("777", self.OLD)], key="feishu:nio:campus"))
+
+        st = ingest.repair_apply_url(conn, apply=False)
+
+        assert st["changed"] == 1
+        assert _url(conn, "777") == self.OLD, "预演却写了库"
+
+    def test_idempotent_no_double_detail(self, conn) -> None:
+        """幂等：跑第二次报 0，且**绝不能**拼成 `/detail/detail`。
+
+        这条是「做一半」的守门测试。判据必须是逐行看结尾，
+        按 source_key 整批拼的写法在这里会烂。
+        """
+        ingest.sync(conn, FakeAdapter([_feishu_job("777", self.OLD)], key="feishu:nio:campus"))
+
+        ingest.repair_apply_url(conn, apply=True)
+        st2 = ingest.repair_apply_url(conn, apply=True)
+
+        assert st2["changed"] == 0
+        assert st2["already_ok"] == 1
+        assert _url(conn, "777") == self.NEW
+        assert "/detail/detail" not in _url(conn, "777")
+
+    def test_does_not_touch_fingerprint(self, conn) -> None:
+        """只写 apply_url 一列。指纹和 last_seen_at 都不许动。
+
+        `apply_url` **在** `_fp()` 里，所以顺手重算指纹会造出一堆
+        diff 全是「我们修了个 bug」的假 job_updated。见 plan 010 §7。
+        """
+        ingest.sync(conn, FakeAdapter([_feishu_job("777", self.OLD)], key="feishu:nio:campus"))
+        before = conn.execute(
+            "SELECT fingerprint, last_seen_at FROM jobs WHERE external_id='777'"
+        ).fetchone()
+
+        ingest.repair_apply_url(conn, apply=True)
+
+        after = conn.execute(
+            "SELECT fingerprint, last_seen_at FROM jobs WHERE external_id='777'"
+        ).fetchone()
+        assert after["fingerprint"] == before["fingerprint"], "指纹被改了"
+        assert after["last_seen_at"] == before["last_seen_at"], "last_seen_at 被改了"
+
+    def test_emits_no_events(self, conn) -> None:
+        """修链接不是一次观测，不许产生任何 job_updated。"""
+        ingest.sync(conn, FakeAdapter([_feishu_job("777", self.OLD)], key="feishu:nio:campus"))
+        before = len(events_of(conn, "job_updated"))
+
+        ingest.repair_apply_url(conn, apply=True)
+
+        assert len(events_of(conn, "job_updated")) == before
+
+    def test_unknown_shape_kept_not_nulled(self, conn) -> None:
+        """形状不认识的保留原值并报出来，不写 NULL 也不硬拼。
+
+        宁可留个死链让人看见，也不静默编一个新的
+        —— `ingest.py` 开头那句「宁可漏报，不可误报」。
+        """
+        weird = "https://nio.jobs.feishu.cn/campus/whatever/777"
+        ingest.sync(conn, FakeAdapter([_feishu_job("777", weird)], key="feishu:nio:campus"))
+
+        st = ingest.repair_apply_url(conn, apply=True)
+
+        assert st["changed"] == 0
+        assert st["skipped_unknown_shape"] == 1
+        assert _url(conn, "777") == weird, "形状不认识却动了它"
+
+    def test_closed_jobs_also_repaired(self, conn) -> None:
+        """已关闭的岗位一起修：人工核对历史投递时照样要点开。"""
+        ingest.sync(conn, FakeAdapter(
+            [_feishu_job("1", self.OLD), _feishu_job("2", self.OLD)],
+            key="feishu:nio:campus",
+        ))
+        # 2 号消失 → 关闭。守卫要 ≥5 条才拦，1/2 不触发绝对量门槛
+        ingest.sync(conn, FakeAdapter([_feishu_job("1", self.OLD)], key="feishu:nio:campus"))
+        assert conn.execute(
+            "SELECT closed_at FROM jobs WHERE external_id='2'"
+        ).fetchone()["closed_at"] is not None
+
+        ingest.repair_apply_url(conn, apply=True)
+
+        assert _url(conn, "2").endswith("/detail"), "已关闭的岗位没被修"
+
+    def test_scoped_to_prefix(self, conn) -> None:
+        """只动前缀匹配的源。腾讯的链接形状不一样，不许被顺带改。"""
+        ingest.sync(conn, FakeAdapter([_feishu_job("777", self.OLD)], key="feishu:nio:campus"))
+        tencent_url = "https://join.qq.com/post.html?pid=999"
+        ingest.sync(conn, FakeAdapter([_feishu_job("999", tencent_url)], key="tencent_join"))
+
+        ingest.repair_apply_url(conn, apply=True)
+
+        assert _url(conn, "999") == tencent_url, "串源了"
+
+    def test_index_portal_also_repaired(self, conn) -> None:
+        """老源那批 `/index/position/<id>` 也是正常形状，照修。"""
+        old = "https://nio.jobs.feishu.cn/index/position/777"
+        ingest.sync(conn, FakeAdapter([_feishu_job("777", old)], key="feishu:nio"))
+
+        ingest.repair_apply_url(conn, apply=True)
+
+        assert _url(conn, "777") == old + "/detail"
+
+
+class FeishuLikeAdapter(FakeAdapter):
+    """形状照真实 FeishuAdapter：届别从 `job_subject.name.zh_cn` 推。
+
+    真实解析在 `test_adapter_feishu.py::TestGradYearFromSubject` 里测，
+    这里只测 `refresh_grad_year` 这个机制在「三层嵌套 + 大量 None」这种
+    输入形状下的行为，两处不互相绑死。
+    """
+
+    source_key = "feishu:nio:campus"
+
+    @staticmethod
+    def grad_year_from_raw(raw: dict) -> str | None:
+        from jobagent.adapters.feishu import _grad_year_from_subject
+
+        return _grad_year_from_subject(raw)
+
+
+def _subj_job(ext_id: str, subject: str | None, grad_year: str | None = None) -> RawJob:
+    """一条飞书形状的岗位：届别只写在 `job_subject` 里，`grad_year` 列初始为空。"""
+    return RawJob(
+        external_id=ext_id,
+        title="产品运营",
+        raw_json={"id": ext_id, "job_subject": {"name": {"zh_cn": subject}}},
+        job_family="operations",
+        cities=["北京"],
+        recruit_type="campus",
+        grad_year=grad_year,
+        apply_url=f"https://nio.jobs.feishu.cn/campus/position/{ext_id}/detail",
+    )
+
+
+class TestRefreshFeishuGradYear:
+    """存量刷新走通道三（plan 011）。
+
+    为什么必须走 `refresh_grad_year` 而不能靠 sync：`grad_year` 不在 `_fp()` 里，
+    指纹没变 sync 就只动 `last_seen_at`（plan 008 实测：807 行里 804 行被静默跳过）。
+    """
+
+    def test_fills_null_grad_year_from_subject(self, conn) -> None:
+        ingest.sync(conn, FeishuLikeAdapter([
+            _subj_job("1", "2027届校园招聘"),
+            _subj_job("2", "2027届校园招聘-技术提前批"),
+        ]))
+        assert _gy(conn, "1") is None, "前提：初始为空"
+
+        st = ingest.refresh_grad_year(conn, FeishuLikeAdapter([]), apply=True)
+
+        assert st["changed"] == 2
+        assert _gy(conn, "1") == "27"
+        assert _gy(conn, "2") == "27"
+
+    def test_intern_stays_null_not_unlimited(self, conn) -> None:
+        """实习项目名重算成 None → 保持 NULL，**不许变成「不限」**。
+
+        「不限」的语义是「任何届别都命中」。把 2438 条「日常实习」洗成不限，
+        等于把不知道说成确定命中。
+        """
+        ingest.sync(conn, FeishuLikeAdapter([
+            _subj_job("1", "日常实习"),
+            _subj_job("2", "ByteIntern"),
+        ]))
+
+        st = ingest.refresh_grad_year(conn, FeishuLikeAdapter([]), apply=True)
+
+        assert st["changed"] == 0
+        assert _gy(conn, "1") is None
+        assert _gy(conn, "2") is None
+
+    def test_refresh_is_idempotent(self, conn) -> None:
+        ingest.sync(conn, FeishuLikeAdapter([_subj_job("1", "2027届校园招聘")]))
+
+        ingest.refresh_grad_year(conn, FeishuLikeAdapter([]), apply=True)
+        st2 = ingest.refresh_grad_year(conn, FeishuLikeAdapter([]), apply=True)
+
+        assert st2["changed"] == 0
+        assert st2["unchanged"] == 1
+        assert _gy(conn, "1") == "27"
+
+    def test_refresh_does_not_touch_fingerprint(self, conn) -> None:
+        """只写 grad_year 一列。指纹动了会造出一堆 diff 为空的假 job_updated。"""
+        ingest.sync(conn, FeishuLikeAdapter([_subj_job("1", "2027届校园招聘")]))
+        before = conn.execute(
+            "SELECT fingerprint, last_seen_at FROM jobs WHERE external_id='1'"
+        ).fetchone()
+        events_before = len(events_of(conn, "job_updated"))
+
+        ingest.refresh_grad_year(conn, FeishuLikeAdapter([]), apply=True)
+
+        after = conn.execute(
+            "SELECT fingerprint, last_seen_at FROM jobs WHERE external_id='1'"
+        ).fetchone()
+        assert after["fingerprint"] == before["fingerprint"], "指纹被改了"
+        assert after["last_seen_at"] == before["last_seen_at"]
+        assert len(events_of(conn, "job_updated")) == events_before
+
+    def test_keeps_value_when_recompute_none(self, conn) -> None:
+        """有值不许被重算成 NULL —— 源站改了项目名文案时会走到这里。
+
+        `ingest.py` 开头写着「宁可漏报，不可误报」，静默把好值抹成 NULL 是反方向。
+        """
+        ingest.sync(conn, FeishuLikeAdapter([
+            _subj_job("1", "改了名字的新项目", grad_year="27"),
+        ]))
+
+        st = ingest.refresh_grad_year(conn, FeishuLikeAdapter([]), apply=True)
+
+        assert st["skipped_would_null"] == 1
+        assert _gy(conn, "1") == "27", "好值被抹成 NULL 了"
+
+    def test_dry_run_does_not_write(self, conn) -> None:
+        ingest.sync(conn, FeishuLikeAdapter([_subj_job("1", "2027届校园招聘")]))
+
+        st = ingest.refresh_grad_year(conn, FeishuLikeAdapter([]), apply=False)
+
+        assert st["changed"] == 1
+        assert _gy(conn, "1") is None, "预演却写了库"

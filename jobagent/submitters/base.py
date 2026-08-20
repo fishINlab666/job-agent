@@ -38,7 +38,21 @@ class FieldPlan(BaseModel):
     value: str | None = None            # 打算填什么。None = 留空
     source: str = ""                    # 值来自画像哪个路径，如 identity.name
     required: bool = False              # 页面是否标记必填
-    action: Literal["fill", "select", "upload", "skip"] = "fill"
+    # select = 原生 <select>；pick = 自定义下拉（点开容器再点列表项，飞书那套
+    # ud__select 就是这种，select_option 对它无效）
+    action: Literal["fill", "select", "pick", "upload", "skip"] = "fill"
+    # pick 专用：下拉列表项上的文案，只在它和 value 不一样时才填。
+    # 空 = 两者相同。value 是控件选完后显示的值（digest 按它算），
+    # option_text 是点击时用来找那一项的文案。见 feishu.PICK_OPTION_TEXT。
+    option_text: str | None = None
+    # 可重复段的条目作用域：selector 只在 scope 命中的**第 scope_index 个**容器里找。
+    # 空 scope = 全页找（不可重复的字段走这条）。
+    #
+    # 为什么索引不能写进 selector：CSS 的 `:has()` 表达不了「第几个」，而两张卡片
+    # 的 DOM 结构完全同构（2026-08-10 实测飞书表单），除了序号没有别的区分方式。
+    # 所以 scope 负责「哪一类卡」，scope_index 负责「第几张」。
+    scope: str | None = None
+    scope_index: int = 0
     note: str | None = None             # 留空原因 / 需人工补的说明
     filled: bool = False                # prepare 是否已成功写入页面
     sensitive: bool = False             # 展示和入库时要打码（身份证、手机号）

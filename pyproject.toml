@@ -1,6 +1,6 @@
 [project]
 name = "job-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "校招 Agent —— 发现、筛选、代投、跟踪"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -13,9 +13,21 @@ dependencies = [
     "typer>=0.27.1",
 ]
 
+[project.optional-dependencies]
+# 只有跑 MCP server 才要。不进主依赖：它会带进 20 个包（starlette / uvicorn /
+# cryptography / httpx2），而 CLI 一个都用不上。
+# 装：uv pip install -e ".[mcp]"
+mcp = [
+    "mcp>=2.0.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    # tests/test_mcp_server.py 要真的起 server 才能查注册表和跑哨兵，
+    # 所以测试环境里必须有它。不装的话那 32 条会 import 失败而不是跳过 ——
+    # 故意的：守卫测试静默消失比测试报错危险得多。
+    "mcp>=2.0.0",
 ]
 
 [tool.pytest.ini_options]

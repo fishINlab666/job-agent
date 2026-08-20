@@ -7,6 +7,7 @@
 页面用假 locator 模拟：按选择器文案返回命中数，而不是按调用顺序排一串
 side_effect。这样将来多加一次探测调用，老测试不会莫名其妙地错位。
 """
+import json
 import time
 from unittest.mock import MagicMock, patch
 
@@ -374,3 +375,65 @@ def test_is_duplicate(mock_page):
     assert not sub._is_duplicate(mock_page)
     mock_page.locator.return_value.count.return_value = 1
     assert sub._is_duplicate(mock_page)
+
+
+class TestDiscardDoesNotLeakPlaintext:
+    """放弃这条路径的落库形态必须和提交一致，否则「放弃」比「提交」漏得多。
+
+    这不是假想：`discard()` 原来用 `f.model_dump()`，把明文手机号/邮箱连同
+    selector 一起塞进 `SubmissionResult.skipped_fields`。当时没被发现是因为
+    CLI 两个调用点都把返回值丢了（`cli.py:847,861` 只调不接），所以没真的
+    入库 —— 但「现在没人接」不是安全边界，谁哪天顺手把两个分支对齐
+    （给 discard 也补上 `skipped_fields=result.skipped_fields`）就漏了。
+
+    腾讯这张表**没有身份证字段**，敏感字段只有手机号和邮箱。所以这里断言身份证
+    会恒真（值压根不在计划里），那是「因为错误的原因而通过」。身份证在飞书那边，
+    见 test_submitter_feishu.py 里的同名类。
+    """
+
+    def _seeded(self, profile):
+        from jobagent.submitters.base import (
+            PLAN_TTL_SECONDS, LiveSession, SubmissionPlan, mint_token,
+        )
+        sub = TencentJoinSubmitter()
+        fields = sub._plan_fields(profile)
+        # 填成功的字段 value 也是满的 —— `_fill` 填完会从页面把值回读一遍
+        # （tencent_join.py:356），所以不能靠「填过就没值了」来免疫。
+        for f in fields:
+            f.filled = True
+        plan = SubmissionPlan(
+            job_id="1", source_key="tencent_join", company="腾讯",
+            apply_url=JOB["apply_url"], fields=fields,
+            confirm_token=mint_token(), expires_at=time.time() + PLAN_TTL_SECONDS,
+        )
+        SESSIONS.put(LiveSession(plan, MagicMock(), lambda: None))
+        return sub, plan
+
+    def test_phone_and_email_are_masked(self, profile):
+        sub, plan = self._seeded(profile)
+
+        res = sub.discard(plan.confirm_token)
+
+        blob = json.dumps(res.skipped_fields, ensure_ascii=False)
+        # 断言的是画像里的真值不出现，而不是「有 * 号」—— 后者在
+        # 明文和打码值同时出现时照样成立。
+        assert "13800138000" not in blob
+        assert "test@example.com" not in blob
+        # 再正向确认一次：确实打码了，不是整条字段被丢掉了。
+        assert "138****8000" in blob
+        # 非敏感字段照原样留着 —— 否则「都打码」和「都丢掉」这两种错法
+        # 在上面那两条断言下不可分。
+        assert "清华大学" in blob
+
+    def test_selector_is_not_exposed(self, profile):
+        """for_storage() 的白名单里没有 selector，model_dump() 有。
+
+        选择器本身不是隐私，但它是「这条记录是怎么来的」的实现细节，
+        混进落库形态里会让人以为可以照着它复投。顺带这条也是
+        model_dump/for_storage 之间最好认的指纹。
+        """
+        sub, plan = self._seeded(profile)
+
+        res = sub.discard(plan.confirm_token)
+
+        assert all("selector" not in f for f in res.skipped_fields)

@@ -57,7 +57,18 @@ TITLE_RULES: list[tuple[tuple[str, ...], str]] = [
     (("销售", "客户成功", "解决方案"), "sales"),
     (("人力", "HR"), "hr"),
     (("法务", "法律", "公共策略"), "legal"),
-    (("数据", "安全", "硬件", "模型", "后台", "前端", "客户端"), "tech"),
+    # 「研发」「后端」在这一层而**不在第 0 层**，是量过的：
+    # 放第 0 层同样救回 85 条，但会改判 69 条已经判对的，因为第 0 层盖住所有
+    # 其他规则。典型受害者 ——
+    #   研发技术类组织招聘 - 人力与管理部      hr → tech（招研发的 HR 岗，判错）
+    #   后端研发实习生（运营平台方向）-国际支付   operations → tech
+    # 放这一层则「域词在前、职能在后」的结构还是先赢，0 改判。
+    #
+    # 为什么单独列出这两个词：这一层原本有「开发」「后台」，没有「研发」「后端」，
+    # 于是 `后端开发工程师` 判 tech、`后端研发实习生` 判 None —— 同一个岗位换个
+    # 说法就掉出分类。字节 79 条、小鹏 3 条、商汤 2 条都是这么丢的。
+    (("数据", "安全", "硬件", "模型", "后台", "后端", "前端", "客户端",
+      "研发"), "tech"),
 ]
 
 
@@ -132,7 +143,11 @@ _TERM = re.compile(r"(\d{2})\s*届")
 _TERM_RANGE = re.compile(r"(?<!\d)(\d{2})\s*[-~—－至]\s*(\d{2})\s*届")
 _TERM_LIST = re.compile(r"(?<!\d)(\d{2}(?:\s*[/、,，+&和或]\s*\d{2})+)\s*届")
 _LIST_SEP = re.compile(r"[/、,，+&和或]")
-_GRAD_UNLIMITED = ("不限", "均可", "所有", "任意", "全部", "any")
+# 中文词按子串匹配：字段值里这些词是连写的（「届别不限」「应届均可」）。
+_GRAD_UNLIMITED = ("不限", "均可", "所有", "任意", "全部")
+# ASCII 词必须按整词匹配。原先 "any" 也走子串，于是 `Anyscale 平台研发` 被判成
+# 「不限届别」——也就是「任何届别都命中」，把「不知道」洗成了「确定命中」。
+_GRAD_UNLIMITED_ASCII = re.compile(r"\bany\b")
 
 
 def parse_grad_years(raw: str | None) -> list[str] | None:
@@ -150,7 +165,8 @@ def parse_grad_years(raw: str | None) -> list[str] | None:
     text = str(raw).strip()
     if not text:
         return None
-    if any(w in text.lower() for w in _GRAD_UNLIMITED):
+    low = text.lower()
+    if any(w in low for w in _GRAD_UNLIMITED) or _GRAD_UNLIMITED_ASCII.search(low):
         return []
 
     # 区间优先：区间里的年份用枚举规则去捞只会捞到两个端点，中间的届别会漏。
@@ -173,6 +189,25 @@ def parse_grad_years(raw: str | None) -> list[str] | None:
         if y not in seen:
             seen.append(y)
     return seen or None
+
+
+def grad_years_from_title(title: str | None) -> list[str] | None:
+    """岗位标题 → 届别集合。第二条观测通道，只在结构化字段没给届别时用。
+
+    比 parse_grad_years 严一档，两处不同：
+
+    1. **必须出现「届」字**才解析。标题是自由文本，裸年份在里面是歧义的——
+       可能是招聘年度（「2026年秋季校园招聘」）、活动届次（「2026年校园大使」）、
+       毕业届别（「2026届」）。字段名能定死语义，标题不能。
+    2. **永不返回 `[]`**。「不限 / 所有 / 任意 / any」在标题里出现，多半跟届别无关
+       （撞上过 `Anyscale 平台研发`、`全部业务线-数据分析`）。`[]` 的语义是
+       「任何届别都命中」，返回它等于把「不知道」洗成「确定命中」，方向是错的。
+
+    返回值只有两种：明确的届别集合，或者 None（信息不足）。
+    """
+    if not title or "届" not in title:
+        return None
+    return parse_grad_years(title) or None
 
 
 def fingerprint(payload: dict) -> str:

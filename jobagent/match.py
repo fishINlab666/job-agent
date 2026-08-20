@@ -6,12 +6,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from pathlib import Path
 from typing import NamedTuple
 
 import yaml
 
-from .normalize import any_city_ok, parse_grad_years
+from .normalize import any_city_ok, grad_years_from_title, parse_grad_years
 
 ROOT = Path(__file__).resolve().parent.parent
 PROFILE_PATH = ROOT / "profile.yaml"
@@ -27,7 +28,8 @@ class Verdict(NamedTuple):
 
     state: str                       # hit / unknown / miss
     reason: str
-    unknowns: tuple[str, ...] = ()
+    unknowns: tuple[str, ...] = ()   # 给人看的，文案会改
+    missing: tuple[str, ...] = ()    # 给代码看的，键要稳定
 
     @property
     def ok(self) -> bool:
@@ -38,6 +40,11 @@ class Verdict(NamedTuple):
     def worth_showing(self) -> bool:
         """该不该出现在用户眼前。信息不全也要出现，只是要标注出来。"""
         return self.state in ("hit", "unknown")
+
+
+# 「缺哪一维」的机读键。和 unknowns 里的中文文案分开：文案随时会改，
+# 这些键是 --allow-missing 的参数值和测试的断言对象，改了就是破坏接口。
+MISSING_DIMS = ("job_family", "recruit_type", "grad_year", "cities")
 
 
 def city_list(job: dict) -> list[str]:
@@ -71,12 +78,14 @@ def classify(job: dict, intent: dict) -> Verdict:
             return Verdict("miss", f"命中排除词「{kw}」")
 
     unknowns: list[str] = []
+    missing: list[str] = []
 
     fams = intent.get("families") or []
     if fams:
         fam = job.get("job_family")
         if not fam:
             unknowns.append("岗位族未知")
+            missing.append("job_family")
         elif fam not in fams:
             return Verdict("miss", f"岗位族 {fam} 不在 {fams}")
 
@@ -85,6 +94,7 @@ def classify(job: dict, intent: dict) -> Verdict:
         rtype = job.get("recruit_type")
         if not rtype:
             unknowns.append("招聘类型未知")
+            missing.append("recruit_type")
         elif rtype not in rtypes:
             return Verdict("miss", f"招聘类型 {rtype} 不在 {rtypes}")
 
@@ -92,25 +102,36 @@ def classify(job: dict, intent: dict) -> Verdict:
     want_years = {str(y)[-2:] for y in (intent.get("grad_years") or [])}
     if want_years:
         job_years = parse_grad_years(job.get("grad_year"))
+        from_title = False
+        if job_years is None:
+            # 结构化字段没给，退到标题。飞书四家的字段里根本没有届别这一列，
+            # 但小鹏、蔚来的标题上明写着「【27届校招】」——标题上写着的不算「没写」。
+            job_years = grad_years_from_title(title)
+            from_title = job_years is not None
         if job_years is None:
             unknowns.append(f"届别未标注（原值 {job.get('grad_year') or '空'}）")
+            missing.append("grad_year")
         elif not job_years:
             pass                                    # 明确不限届别
         elif not (set(job_years) & want_years):
-            return Verdict("miss", f"届别 {job_years} 不在 {sorted(want_years)}")
+            src = "（据标题）" if from_title else ""
+            return Verdict("miss", f"届别 {job_years}{src} 不在 {sorted(want_years)}")
 
     want_cities = set(intent.get("cities") or [])
     if want_cities:
         job_cities = city_list(job)
         if not job_cities:
             unknowns.append("城市未标注")
+            missing.append("cities")
         elif any_city_ok(job_cities):
             pass                                    # 全国 / 不限 / 远程，都算命中
         elif not (set(job_cities) & want_cities):
             return Verdict("miss", f"城市 {sorted(job_cities)} 不含目标城市")
 
     if unknowns:
-        return Verdict("unknown", "信息不全：" + "；".join(unknowns), tuple(unknowns))
+        return Verdict(
+            "unknown", "信息不全：" + "；".join(unknowns), tuple(unknowns), tuple(missing)
+        )
     return Verdict("hit", "命中")
 
 
@@ -158,12 +179,26 @@ def partition(rows: list[dict], intent: dict) -> tuple[list[dict], list[dict]]:
         if v.state == "hit":
             hits.append(r)
         elif v.state == "unknown":
-            unknown.append({**r, "_why": v.reason})
+            unknown.append({**r, "_why": v.reason, "_missing": v.missing})
     key = lambda r: score(r, intent)                          # noqa: E731
     return sorted(hits, key=key, reverse=True), sorted(unknown, key=key, reverse=True)
 
 
-def filter_jobs(rows: list[dict], intent: dict, include_unknown: bool = False) -> list[dict]:
-    """默认只给确定命中的。include_unknown=True 时把信息不全的接在后面。"""
+def filter_jobs(
+    rows: list[dict], intent: dict, allow_missing: Iterable[str] | None = None
+) -> list[dict]:
+    """默认只给确定命中的。allow_missing 里列出的维度，缺了也算能看。
+
+    按维度放宽，不是一个布尔开关。原先只有 include_unknown 一个开关：一按下去
+    届别、岗位族、招聘类型、城市四维同时放开，于是「族、类型、城市都已确认、只差
+    届别」的 1911 条，和「连是不是运营岗都不知道」的 581 条混在同一个结果里。
+    这两种「不确定」的可信度差得远，不该共用一个开关。
+
+    allow_missing=None 与 frozenset() 同义（都只给确定命中的），不制造第三种含义。
+    传全部维度 = 老的 include_unknown=True。维度键见 MISSING_DIMS。
+    """
+    allowed = frozenset(allow_missing or ())
     hits, unknown = partition(rows, intent)
-    return hits + unknown if include_unknown else hits
+    if not allowed:
+        return hits
+    return hits + [r for r in unknown if set(r["_missing"]) <= allowed]
