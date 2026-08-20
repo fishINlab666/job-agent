@@ -268,4 +268,12 @@ def get_adapter(job: dict, source: dict | None = None, **kwargs: Any) -> Any:
         kwargs.setdefault("portal", portal)
     if host := ats.host_of(src.get("entry_url") or ""):
         kwargs.setdefault("host", host)
-    return _build("adapters", "采集器", _ADAPTERS, resolve(job, source), **kwargs)
+    adapter = _build("adapters", "采集器", _ADAPTERS, resolve(job, source), **kwargs)
+    actual_key = str(getattr(adapter, "source_key", "") or "").strip()
+    if key and actual_key != key:
+        raise RouteError(
+            "源身份对不上，不敢采集："
+            f"sources.source_key={key!r}，采集器最终使用 {actual_key or '空值'!r}。"
+            "核对 source_key 的租户段与 sources.tenant。"
+        )
+    return adapter

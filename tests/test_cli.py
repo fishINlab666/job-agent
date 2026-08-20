@@ -576,6 +576,20 @@ class TestSourceAdd:
             "SELECT COUNT(*) n FROM sources WHERE source_key='feishu:nio:campus'"
         ).fetchone()["n"] == 0, "拒绝了却把行写进去了"
 
+    def test_explicit_tenant_must_match_key_on_custom_domain(self, tmp_db) -> None:
+        """自定义域名取不出租户时，也不能让 --tenant 和键指向两家公司。"""
+        r = runner.invoke(cli.app, [
+            "source-add", "feishu:sensetime", "--company", "商汤",
+            "--entry-url", "https://hr-jobs.sensetime.com", "--tenant", "nio",
+        ])
+
+        assert r.exit_code == 1
+        output = r.output.replace("\n", "")  # Rich 会按终端宽度折行
+        assert "sensetime" in output and "nio" in output
+        assert tmp_db.execute(
+            "SELECT COUNT(*) n FROM sources WHERE source_key='feishu:sensetime'"
+        ).fetchone()["n"] == 0
+
     def test_self_built_source_is_turned_away(self, tmp_db) -> None:
         """自建源不用登记，直说，别让人以为漏了一步。"""
         r = runner.invoke(cli.app, [
