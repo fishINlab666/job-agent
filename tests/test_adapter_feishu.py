@@ -88,9 +88,14 @@ class TestFamilyNotBackfilled:
     照抄就会把 1099/2265 条打成「其他」—— 那不是其他族，是没判出来。
     """
 
-    # 这四条是 nio 全量里真实判不出的标题，不是编的
+    # 这四条是 nio 全量里真实判不出的标题，不是编的。
+    # 原来第一条是 `ONVO-乐道行销顾问-重庆`，方案 017 把 `顾问` 加进 sales 之后
+    # 它判得出来了 —— 于是这条用例不再能区分「适配器兜底了」和「标题规则命中了」。
+    # 换成库里现在仍判不出的 `实习-NSC售后服务代表`（`服务` 是域词，方案 017 §6
+    # 明确不加）。挑替补的判据是「当前代码判不出」，跑
+    # `measure_family_gaps.py by-source` 能重新找一批。
     UNDECIDABLE = [
-        "ONVO-乐道行销顾问-重庆",
+        "实习-NSC售后服务代表",
         "门店店总-蔚来天津区域公司",
         "区域用户增长（活动方向）",
         "售后服务-增值服务（西安）",
@@ -106,11 +111,14 @@ class TestFamilyNotBackfilled:
 
         谁图省事写 `or raw_category` 或 `or "other"`，这条立刻红。
         """
-        row = _post(title="ONVO-乐道行销顾问-重庆",
-                    job_function={"name": "蔚来顾问", "id": "x"})
+        # 刻意挑 raw_category 里含**职能词**的一条：`项目管理` 就在 TITLE_RULES 的
+        # product 组里。写 `or raw_category` 或者拿 raw_category 再过一遍规则，
+        # 这条会判成 product 而不是 None —— 错得看得见。
+        # 标题 `实习-PMO` 本身没有中文职能词，所以命中只可能来自 raw_category。
+        row = _post(title="实习-PMO", job_function={"name": "项目管理", "id": "x"})
         _, jobs = _fetch(monkeypatch, _serve([_body([row])]))
         assert jobs[0].job_family is None
-        assert jobs[0].raw_category == "蔚来顾问", "原文要留着，供以后扩 TITLE_RULES 看分布"
+        assert jobs[0].raw_category == "项目管理", "原文要留着，供以后扩 TITLE_RULES 看分布"
 
     def test_decidable_title_still_works(self, monkeypatch):
         _, jobs = _fetch(monkeypatch, _serve([_body([_post(title="后端开发工程师")])]))

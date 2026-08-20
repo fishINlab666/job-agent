@@ -60,6 +60,27 @@ def _city_vocab() -> set[str]:
     return {c for c in out if c}
 
 
+def _stem_map() -> dict[str, set[str]]:
+    """岗位型 → 落在它下面的 distinct 标题。只剥标题**尾部**的城市名。
+
+    存在的理由：`_titles()` 的去重挡不住把城市写进标题的源。nio 的
+    `校招实习-蔚来顾问-<城市>` 有 116 个城市、`乐道顾问` 90 个，去重后仍是 206 条
+    distinct 标题 —— 而它们是**同一个词表缺口**。「按 distinct 标题计」这条口径
+    本来就是为了「一个标题开在 N 个城市不算 N 个问题」，nio 的命名让它失效了。
+    """
+    cities = _city_vocab()
+    # 只剥「尾段是城市名」的那一段，不做别的清洗 —— 剥多了会把不同岗位并成一个。
+    tail = re.compile(r"[-—－_(（\s]\s*(" + "|".join(
+        sorted(map(re.escape, cities), key=len, reverse=True)) + r")\s*[)）]?\s*$")
+    stems: dict[str, set[str]] = collections.defaultdict(set)
+    for t in _titles():
+        s = t
+        while (m := tail.search(s)):
+            s = s[:m.start()]
+        stems[s].add(t)
+    return stems
+
+
 def by_source() -> None:
     """每个源的判不出率（行 / distinct 标题两种口径）。"""
     con = db.connect_readonly()
@@ -85,15 +106,7 @@ def by_source() -> None:
 
 def city_collapse() -> None:
     """B1：同一个岗位型在多城市各开一条，distinct 标题被城市数放大了多少倍。"""
-    cities = _city_vocab()
-    # 只剥「尾段是城市名」的那一段，不做别的清洗 —— 剥多了会把不同岗位并成一个。
-    tail = re.compile(r"[-—－_(（\s]\s*(" + "|".join(sorted(map(re.escape, cities), key=len, reverse=True)) + r")\s*[)）]?\s*$")
-    stems: dict[str, set[str]] = collections.defaultdict(set)
-    for t in _titles():
-        s = t
-        while (m := tail.search(s)):
-            s = s[:m.start()]
-        stems[s].add(t)
+    stems = _stem_map()
     infl = sorted(stems.items(), key=lambda kv: -len(kv[1]))
     print(f"distinct 标题 {len(_titles())} → 剥掉尾部城市后 {len(stems)} 个岗位型\n")
     print("放大倍数最高的 10 个岗位型：")
@@ -150,10 +163,28 @@ def vocab_curve() -> None:
     不排掉它，贪心第一个挑中的是 `实习`（502/658 = 76.3%）、第二个是 `校招`
     （92 条）—— 那是招聘类型词，加进 TITLE_RULES 会把四分之三的标题判成同一个
     族。「覆盖率高」和「能定族」是两件事，曲线本身分不出来。
+
+    **计数单位是岗位型（stem），不是 distinct 标题。** 第一版按标题算，于是
+    `蔚来顾问`(116 城) + `乐道顾问`(90 城) 被算成 206 个词表缺口，`顾问` 一个词
+    就顶了 34.2% —— 那个数量级是 nio 把城市写进标题造成的，不是真实分布。
     """
-    todo = {t for t in _titles() if n.family_from_title(t) is None}
+    stems = _stem_map()
+    # 塌成岗位型不该改变判据结论。城市名不是规则词，所以同一 stem 下的标题
+    # family 必须一致；不一致说明剥城市剥过头了（把两个真不同的岗位并成一个）。
+    disagree = [
+        s for s, ts in stems.items()
+        if len({n.family_from_title(t) for t in ts}) > 1
+    ]
+    if disagree:
+        print(f"**剥城市剥过头了**：{len(disagree)} 个岗位型下面的标题 family 不一致，"
+              f"例如 {disagree[:3]} —— 下面的数不可信，先修 _stem_map()。\n")
+        return
+    todo = {s for s in stems if n.family_from_title(s) is None}
     total = len(todo)
-    print(f"扣掉过期行后，真正判不出的 distinct 标题：{total} 条")
+    print(f"扣掉过期行后，真正判不出的岗位型：{total} 个"
+          f"（对照：distinct 标题 {len({t for t in _titles() if n.family_from_title(t) is None})} 条，"
+          f"差额来自把城市写进标题的源）")
+    print(f"{len(stems)} 个岗位型下面 family 结论全部一致，塌得住")
     print(f"排掉的装饰词（{len(DECORATION)} 个）：{'、'.join(DECORATION)}\n")
     cover: dict[str, set[str]] = collections.defaultdict(set)
     for t in todo:
@@ -166,6 +197,7 @@ def vocab_curve() -> None:
                 if re.fullmatch(r"[一-鿿]+", w):
                     cover[w].add(t)
     left, picked = set(todo), []
+    # 贪心到 25 个词就停，因为曲线过了头部就不可信了（见 docstring）。
     while left and len(picked) < 25:
         w, got = max(((w, ts & left) for w, ts in cover.items()),
                      key=lambda kv: (len(kv[1]), -len(kv[0])))
@@ -175,11 +207,119 @@ def vocab_curve() -> None:
         left -= got
         print(f"  +{len(picked):>2} 个词  {w:<6} 新覆盖 {len(got):>4}  "
               f"累计 {total - len(left):>4}/{total} = {(total - len(left)) / total:>5.1%}")
-    print(f"\n{len(picked)} 个词覆盖 {total - len(left)} 条，剩 {len(left)} 条长尾"
-          f"（{len(left) / total:.1%}），每条命中都不到 3 次")
+    print(f"\n{len(picked)} 个词覆盖 {total - len(left)} 个岗位型，剩 {len(left)} 个长尾"
+          f"（{len(left) / total:.1%}），每个命中都不到 3 次")
     print("长尾样例：")
     for t in sorted(left)[:12]:
         print(f"  {t}")
+
+
+# `candidates()` 要试算的规则。摊开成常量，理由同 DECORATION：每一条都是人工
+# 判断，得能被逐条反驳。词后面的族是「这个词在中文岗位名里指什么活」：
+#   顾问 —— 面客的销售/服务岗（乐道顾问、蔚来顾问是门店销售）
+#   服务 —— 客户服务
+#   采购 —— 供应链
+# 刻意**不含** `策略`/`分析`/`管理`/`方向`/`大区`/`研究`/`基础`/`系统`/`技术`：
+# 它们在曲线头部但**不定职能** —— `策略产品`是产品、`策略运营`是运营、
+# `广告策略`是技术；`大区`/`方向`是组织/范围词。曲线按覆盖率排，排不出这个区别。
+CANDIDATES: tuple[tuple[str, str], ...] = (
+    ("顾问", "sales"),
+    ("服务", "sales"),
+    ("采购", "other"),
+)
+
+
+def _judge_with(title: str, extra: tuple[str, str] | None,
+                *, at_end: bool = True) -> str | None:
+    """现有三层判定 + 往第 2 层塞一个候选词。extra=None 就是现状。
+
+    **必须真的插进规则表跑一遍**，不能用「含这个词且已能判出」当代价的代理：
+    第 2 层是「先命中的赢」，所以同一个词加在 sales 组（表中第 5 条）和加在
+    末尾，改判结果不一样。代理算法看不出插入位置，会把 0 误判报成 500。
+    """
+    rules = list(n.TITLE_RULES)
+    if extra is not None:
+        word, fam = extra
+        idx = next((i for i, (_, f) in enumerate(rules) if f == fam), None)
+        if idx is not None and not at_end:
+            kws, f = rules[idx]
+            rules[idx] = (kws + (word,), f)
+        else:
+            rules.append(((word,), fam))
+    if any(m in title for m in n.TECH_MARKERS):
+        return "tech"
+    for kws, fam in n.COMPOUND_RULES:
+        if any(k in title for k in kws):
+            return fam
+    d = n._first_index(title, n.DESIGN_DOMAIN_WORDS)
+    f = n._first_index(title, n.TECH_FUNCTION_WORDS)
+    if d is not None and f is not None and d < f:
+        return "tech"
+    for kws, fam in rules:
+        if any(k in title for k in kws):
+            return fam
+    return None
+
+
+def candidates() -> None:
+    """逐条**真的插进规则表**试算 CANDIDATES：救回多少、改判多少。
+
+    改判那一列才是决定要不要加的判据。覆盖率只说明「能碰到多少」，
+    碰到之后判错和判对都算碰到 —— 见 docs/plans/015 的教训。
+
+    两个插入位置都试：加进已有的同族组（组在表中的位次决定它和别的族谁先命中），
+    和加在表末尾（所有既有规则都优先）。两者改判数不同就说明这个词和别的族有交叠，
+    交叠的方向要逐条看，不能只看总数。
+    """
+    con = db.connect_readonly()
+    all_rows = [dict(r) for r in con.execute(
+        "SELECT title, job_family, source_key FROM jobs "
+        "WHERE closed_at IS NULL AND title IS NOT NULL")]
+    stems = _stem_map()
+    stem_of = {t: s for s, ts in stems.items() for t in ts}
+    titles = {r["title"] for r in all_rows}
+    base = {t: _judge_with(t, None) for t in titles}
+    # 自证试算函数和线上判据一致：extra=None 必须逐条等于 normalize 的结果。
+    drift = [t for t in titles if base[t] != n.family_from_title(t)]
+    if drift:
+        print(f"**试算函数和 normalize.py 不一致**：{len(drift)} 条，"
+              f"例如 {drift[:3]} —— 下面的数不可信。\n")
+        return
+    # 两个 distinct 数**统计的不是同一批**，分开说清楚：
+    # titles = 在架全部标题（改判要在这批上找），stems = 判不出的那批塌成的岗位型。
+    print(f"在架行 {len(all_rows)}，在架 distinct 标题 {len(titles)}；"
+          f"其中判不出的塌成 {len(stems)} 个岗位型")
+    print("（试算函数 extra=None 时与 normalize.py 逐条一致）\n")
+    has_group = {f for _, f in n.TITLE_RULES}
+    for word, fam in CANDIDATES:
+        print(f"「{word}」→ {fam}")
+        in_group = (f"加进 {fam} 组" if fam in has_group
+                    else f"{fam} 在第 2 层没有组，只能加在末尾")
+        for at_end, label in ((False, in_group), (True, "加在表末尾")):
+            if fam not in has_group and not at_end:
+                print(f"  [{label}]")
+                continue
+            new = {t: _judge_with(t, (word, fam), at_end=at_end) for t in titles}
+            rescued = {t for t in titles if base[t] is None and new[t] is not None}
+            changed = {t for t in titles
+                       if base[t] is not None and new[t] != base[t]}
+            r_rows = [r for r in all_rows if r["title"] in rescued]
+            c_rows = [r for r in all_rows if r["title"] in changed]
+            r_stems = {stem_of.get(t, t) for t in rescued}
+            print(f"  [{label}] 救回 {len(r_rows)} 行 / {len(r_stems)} 个岗位型，"
+                  f"改判 {len(c_rows)} 行 / {len(changed)} 条标题")
+            for t in sorted(changed)[:6]:
+                print(f"      {base[t]} → {new[t]}   {t}")
+            if len(changed) > 6:
+                print(f"      …… 另 {len(changed) - 6} 条")
+            # 救回的明细只打一次（两个插入位置救回的是同一批：
+            # 救回 = 原本判不出，任何插入位置都不会被既有规则抢走）。
+            if at_end:
+                srcs = collections.Counter(r["source_key"] for r in r_rows)
+                print(f"      救回源分布 {dict(srcs)}")
+                print(f"      救回的岗位型 {sorted(r_stems)[:6]}"
+                      f"{' ……' if len(r_stems) > 6 else ''}")
+        print()
 
 
 COMMANDS = {
@@ -187,6 +327,7 @@ COMMANDS = {
     "stale": stale,
     "city-collapse": city_collapse,
     "vocab-curve": vocab_curve,
+    "candidates": candidates,
     "noise": noise,
 }
 
