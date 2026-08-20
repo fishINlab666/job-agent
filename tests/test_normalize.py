@@ -534,6 +534,12 @@ class TestVocabGapWords018:
         ("法规咨询顾问", "legal"),
         ("渠道传播", "marketing"),
         ("达人传播", "marketing"),
+        ("材料交付专员", "operations"),
+        ("交付软件培训生", "tech"),
+        ("商家物流专员", "other"),
+        ("物流商家专员", "sales"),
+        ("渠道备件专员", "other"),
+        ("备件渠道专员", "sales"),
     ])
     def test_specific_function_beats_new_domain_words(
         self, title: str, expected: str

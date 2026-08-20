@@ -277,19 +277,7 @@ def _judge_with(title: str, extra: tuple[str, str] | None,
             rules[idx] = (kws + (word,), f)
         else:
             rules.append(((word,), fam))
-    if any(m in title for m in n.TECH_MARKERS):
-        return "tech"
-    for kws, fam in n.COMPOUND_RULES:
-        if any(k in title for k in kws):
-            return fam
-    d = n._first_index(title, n.DESIGN_DOMAIN_WORDS)
-    f = n._first_index(title, n.TECH_FUNCTION_WORDS)
-    if d is not None and f is not None and d < f:
-        return "tech"
-    for kws, fam in rules:
-        if any(k in title for k in kws):
-            return fam
-    return None
+    return n._family_from_title_rules(title, rules)
 
 
 def candidates() -> None:
