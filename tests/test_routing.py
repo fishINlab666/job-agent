@@ -83,6 +83,11 @@ class FakeFeishuAdapter:
         self.portal = portal
         self.host = host
 
+    @property
+    def source_key(self) -> str:
+        suffix = f":{self.portal}" if self.portal else ""
+        return f"feishu:{self.tenant}{suffix}"
+
 
 class TestResolveOrder:
     """判定依据从可靠到不可靠：库里存的 > 域名识别 > 源站配置 > 老 source_key。"""
@@ -280,6 +285,20 @@ class TestCompanyComesFromSourcesRow:
             {"source_key": "tencent_join", "company": "别的名字"},
         )
         assert a.company == "腾讯"
+
+    def test_adapter_identity_must_match_source_row(self):
+        """配置行和采集器指向不同租户时，必须在抓取前拒绝。"""
+        routing.register_adapter("feishu", FakeFeishuAdapter)
+        source = {
+            "source_key": "feishu:sensetime",
+            "company": "商汤",
+            "system": "feishu",
+            "tenant": "nio",
+            "entry_url": "https://hr-jobs.sensetime.com",
+        }
+
+        with pytest.raises(routing.RouteError, match="sensetime.*nio|nio.*sensetime"):
+            routing.get_adapter({"source_key": "feishu:sensetime"}, source)
 
 
 class TestPortalFromSourceKey:
