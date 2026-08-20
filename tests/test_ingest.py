@@ -125,6 +125,14 @@ class TestCloseGuard:
         assert run["status"] == "partial"
         assert "关闭守卫" in run["error"]
 
+        alerts = events_of(conn, "source_degraded")
+        assert len(alerts) == 1
+        payload = json.loads(alerts[0]["payload"])
+        assert payload["disappeared"] == 8
+        assert payload["live_before"] == 10
+        assert payload["error"] == run["error"]
+        assert alerts[0]["run_id"] == run["id"]
+
         still_open = conn.execute(
             "SELECT COUNT(*) n FROM jobs WHERE closed_at IS NULL"
         ).fetchone()["n"]
@@ -481,12 +489,13 @@ class TestTransactionBoundary:
 
     报告里那例 bug 的形状：同一批喂进来两条相同 external_id，撞
     `UNIQUE(source_key, external_id)`，异常往上抛 —— 而抛之前已经写进去的
-    snapshots / jobs / events 没人回滚，留在库里。下一个源的 `commit()`
+    snapshots / jobs / 岗位事件没人回滚，留在库里。下一个源的 `commit()`
     顺手把它们带进库，于是**失败的那一轮污染了成功的那一轮**。
 
     收拢的做法是业务数据全部走主连接、只在函数结尾提交一次；`runs` 那行走
-    独立的侧连接自己提交，所以主事务回滚它不跟着退。两半缺一不可，缺哪一半
-    会红哪条测试写在各自的 docstring 里。
+    独立的侧连接自己提交，所以主事务回滚它不跟着退；同一连接还会留下唯一一条
+    `source_sync_failed` 告警。两半缺一不可，缺哪一半会红哪条测试写在各自的
+    docstring 里。
 
     触发器为什么用重复 external_id：它是真实故障（报告里就是这么炸的），
     而且不用 monkeypatch —— 改 `conn.execute` 会撞
@@ -510,7 +519,10 @@ class TestTransactionBoundary:
         with pytest.raises(Exception, match=self.DUP):
             ingest.sync(conn, FakeAdapter([make_job("1"), make_job("2"), make_job("2")]))
 
-        assert self._counts(conn) == {"jobs": 0, "snapshots": 0, "events": 0}
+        assert self._counts(conn) == {"jobs": 0, "snapshots": 0, "events": 1}
+        assert [r["kind"] for r in conn.execute("SELECT kind FROM events")] == [
+            "source_sync_failed"
+        ]
 
     def test_duplicate_external_id_leaves_no_partial_rows(self, conn) -> None:
         """复现报告问题 2：库里已经有数据时，崩掉的那轮不许改动它。
@@ -524,7 +536,13 @@ class TestTransactionBoundary:
         with pytest.raises(Exception, match=self.DUP):
             ingest.sync(conn, FakeAdapter([make_job("2"), make_job("3"), make_job("3")]))
 
-        assert self._counts(conn) == before
+        after = self._counts(conn)
+        assert after["jobs"] == before["jobs"]
+        assert after["snapshots"] == before["snapshots"]
+        assert after["events"] == before["events"] + 1
+        assert conn.execute(
+            "SELECT kind FROM events ORDER BY id DESC LIMIT 1"
+        ).fetchone()["kind"] == "source_sync_failed"
         # 具体钉住：新岗位一条都没进来，老岗位还在
         assert [r["external_id"] for r in conn.execute(
             "SELECT external_id FROM jobs ORDER BY external_id"
@@ -550,12 +568,17 @@ class TestTransactionBoundary:
             assert conn.execute(
                 f"SELECT COUNT(*) n FROM {table} WHERE source_key=?", ("src_a",)
             ).fetchone()["n"] == 0, f"{table} 里混进了失败源的数据"
-        assert conn.execute(
-            "SELECT COUNT(*) n FROM events WHERE source_key=?", ("src_a",)
-        ).fetchone()["n"] == 0
-        # B 是首轮，所以 events 只有一条 source_bootstrapped —— 数量对得上说明
-        # 没有 A 的事件被算进去
-        assert [r["source_key"] for r in conn.execute("SELECT source_key FROM events")] == ["src_b"]
+        a_events = conn.execute(
+            "SELECT kind, job_id FROM events WHERE source_key=?", ("src_a",)
+        ).fetchall()
+        assert [(r["kind"], r["job_id"]) for r in a_events] == [
+            ("source_sync_failed", None)
+        ]
+        # B 是首轮，所以自己的事件仍只有一条 source_bootstrapped；A 只留下告警，
+        # 没有任何半截岗位事件混进 B 的提交。
+        assert [r["kind"] for r in conn.execute(
+            "SELECT kind FROM events WHERE source_key='src_b'"
+        )] == ["source_bootstrapped"]
 
     def test_run_row_survives_write_failure(self, conn) -> None:
         """业务数据退干净，但 `runs` 那一行**留着** —— 崩过的痕迹是排查的唯一入口。
@@ -611,7 +634,32 @@ class TestTransactionBoundary:
         run = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
         assert run["status"] == "failed"
         assert "返回 0 条" in run["error"]
-        assert self._counts(conn) == {"jobs": 0, "snapshots": 0, "events": 0}
+        alerts = events_of(conn, "source_sync_failed")
+        assert len(alerts) == 1
+        assert json.loads(alerts[0]["payload"])["error"] == run["error"]
+        assert alerts[0]["run_id"] == run["id"]
+        assert self._counts(conn) == {"jobs": 0, "snapshots": 0, "events": 1}
+
+    def test_alert_write_failure_preserves_original_error_and_run_status(
+        self, conn, monkeypatch
+    ) -> None:
+        real_add_event = db.add_event
+
+        def fail_only_health_alert(connection, kind, **kwargs):
+            if kind == "source_sync_failed":
+                raise OSError("event sink unavailable")
+            return real_add_event(connection, kind, **kwargs)
+
+        monkeypatch.setattr(db, "add_event", fail_only_health_alert)
+
+        with pytest.raises(RuntimeError, match="返回 0 条"):
+            ingest.sync(conn, FakeAdapter([]))
+
+        run = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+        assert run["status"] == "failed"
+        assert "返回 0 条" in run["error"]
+        assert "event sink unavailable" in run["error"]
+        assert len(events_of(conn, "source_sync_failed")) == 0
 
     def test_repeated_syncs_do_not_leak_connections(self, conn, monkeypatch) -> None:
         """每一个侧连接都得关掉，**失败路径也算**。常驻进程里不关就是每轮泄一个。

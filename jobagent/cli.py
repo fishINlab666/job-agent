@@ -46,6 +46,13 @@ APP_FUNNEL = (
 )
 APP_STATUSES = tuple(s for _, ss, _ in APP_FUNNEL for s in ss)
 
+SOURCE_HEALTH_EVENT_KINDS = frozenset({
+    "source_degraded", "source_sync_failed",
+})
+PROFILE_FILTERED_EVENT_KINDS = frozenset({
+    "family_first_seen", "job_opened", "job_reopened", "job_updated",
+})
+
 
 def _find_job_or_exit(
     conn, external_id: str, source_key: str | None = None
@@ -521,7 +528,8 @@ def digest(mark: bool = typer.Option(False, "--mark", help="标记为已推送")
     """每日增量：只看还没推给我、且命中画像的事件。"""
     conn = db.connect()
     rows = conn.execute(
-        """SELECT e.id, e.kind, e.company, e.payload, e.occurred_at, j.*
+        """SELECT e.id, e.kind, e.source_key AS event_source_key,
+                  e.company, e.payload, e.occurred_at, j.*
            FROM events e LEFT JOIN jobs j ON j.id = e.job_id
            WHERE e.notified_at IS NULL
            ORDER BY e.occurred_at DESC"""
@@ -539,9 +547,18 @@ def digest(mark: bool = typer.Option(False, "--mark", help="标记为已推送")
             )
         return
 
-    intent = match.load_profile().get("intent") or {}
+    needs_profile = any(
+        row["kind"] in PROFILE_FILTERED_EVENT_KINDS for row in rows
+    )
+    profile_error: str | None = None
+    try:
+        intent = match.load_profile().get("intent") or {} if needs_profile else {}
+    except FileNotFoundError as exc:
+        intent = {}
+        profile_error = str(exc)
 
     shown: list[int] = []
+    alerts: list[str] = []
     highlights: list[str] = []
     hits: list[dict] = []
     unsure: list[dict] = []
@@ -551,11 +568,27 @@ def digest(mark: bool = typer.Option(False, "--mark", help="标记为已推送")
         d = dict(r)
         kind = d["kind"]
         payload = json.loads(d["payload"] or "{}")
+        # 画像缺失时，源健康告警仍要显示；真正依赖画像的岗位事件留在队列里，
+        # 不能标成已处理，否则用户补完画像后也看不到了。
+        if profile_error and kind in PROFILE_FILTERED_EVENT_KINDS:
+            continue
         # 所有检查过的事件都算已处理。不这么做，被过滤掉的事件会永久积压在
         # 待推送队列里，下次 digest 又全部重扫一遍。
         shown.append(d["id"])
 
-        if kind == "family_first_seen":
+        if kind == "source_degraded":
+            label = d["company"] or d["event_source_key"] or "未知来源"
+            alerts.append(
+                f"⚠ {label} 数据源异常：{payload.get('disappeared')}/"
+                f"{payload.get('live_before')} 个岗位本轮消失，已暂停关闭。"
+                f"{payload.get('error') or ''}"
+            )
+        elif kind == "source_sync_failed":
+            label = d["company"] or d["event_source_key"] or "未知来源"
+            alerts.append(
+                f"⛔ {label} 同步失败：{payload.get('error') or '原因未记录'}"
+            )
+        elif kind == "family_first_seen":
             fam = payload.get("job_family")
             if not intent.get("families") or fam in intent["families"]:
                 highlights.append(
@@ -582,6 +615,16 @@ def digest(mark: bool = typer.Option(False, "--mark", help="标记为已推送")
                 "job_family" in diff or "cities" in diff or "title" in diff
             ):
                 changed.append((d, diff))
+
+    if alerts:
+        console.print()
+        for alert in alerts:
+            console.print(f"  [bold red]{alert}[/bold red]")
+
+    if profile_error:
+        console.print(
+            f"[yellow]岗位提醒暂未处理：{profile_error}。补好画像后会继续显示。[/yellow]"
+        )
 
     if highlights:
         console.print()
@@ -637,7 +680,8 @@ def digest(mark: bool = typer.Option(False, "--mark", help="标记为已推送")
         )
         _print_unsure(conn, unsure, limit=15)
 
-    if not hits and not unsure and not highlights and not changed:
+    if (not profile_error and not alerts and not hits and not unsure
+            and not highlights and not changed):
         # 「没有新增」和「压根没同步过」对人的下一步动作要求不同，得分开说。
         # 判据取 runs 表有没有行，不取 jobs —— sync 跑了但源站关站、抓到 0 条
         # 也是可能的，那种情况让人再跑一次 sync 是把人往错的方向指。

@@ -469,6 +469,24 @@ class TestOnlyJobSideEvents:
             f"代投侧事件漏出来了：{sorted(k for k in kinds if k.startswith('apply'))}"
         assert "LEAKCANARY" not in json.dumps(r, ensure_ascii=False)
 
+    def test_source_health_events_cross_readonly_boundary(
+        self, db_with_data
+    ) -> None:
+        conn = db.connect(db_with_data)
+        db.add_event(
+            conn, "source_degraded", source_key="tencent_join", company="腾讯",
+            payload={"disappeared": 8, "live_before": 10, "error": "关闭守卫"},
+        )
+        db.add_event(
+            conn, "source_sync_failed", source_key="tencent_join", company="腾讯",
+            payload={"error": "上游接口失败"},
+        )
+        conn.commit()
+        conn.close()
+
+        kinds = {event["kind"] for event in call("job_changes", {"limit": 100})["events"]}
+        assert {"source_degraded", "source_sync_failed"} <= kinds
+
     def test_asking_for_an_apply_kind_is_refused(self, db_with_data) -> None:
         """点名要 apply_blocked 要被拒，不是静默返回空。
 
@@ -680,14 +698,15 @@ class TestWhitelistCoversEveryIngestKind:
         """
         c = db.connect(db_with_data)
         job_id = c.execute("SELECT id FROM jobs WHERE external_id='J1'").fetchone()["id"]
-        # 最新的那条挂在 source_bootstrapped 上 —— 它在白名单里**排最后**。
+        # 最新的那条挂在当前白名单字母序**最后**的 kind 上。
         # 这个选择是刻意的：不重排时代码是按 sorted(kinds) 逐个取的，
         # 所以最新事件必须落在排序靠后的 kind 上，否则「碰巧先取到它」会让
         # 缺失的重排也通过。（第一版用 job_closed 就是这个毛病：它按字母序
         # 恰好排在 job_opened 前面，去掉重排照样绿。）
+        last_kind = sorted(mcp_server.JOB_EVENT_KINDS)[-1]
         for kind, when in (
             ("job_closed", "2050-01-01T00:00:00"),
-            ("source_bootstrapped", "2099-01-01T00:00:00"),
+            (last_kind, "2099-01-01T00:00:00"),
         ):
             c.execute(
                 """INSERT INTO events(kind, source_key, company, job_id, payload, occurred_at)
@@ -697,12 +716,9 @@ class TestWhitelistCoversEveryIngestKind:
         c.commit()
         c.close()
 
-        assert sorted(mcp_server.JOB_EVENT_KINDS)[-1] == "source_bootstrapped", (
-            "白名单的字母序变了，这条测试的前提没了 —— 最新事件要挂在排最后的 kind 上"
-        )
         evs = call("job_changes", {"limit": 1})["events"]
         assert len(evs) == 1
-        assert evs[0]["kind"] == "source_bootstrapped", (
+        assert evs[0]["kind"] == last_kind, (
             "拿到的不是全局最近那条。各 kind 分别截 limit 条再拼起来，"
             "条数对，内容错。"
         )
