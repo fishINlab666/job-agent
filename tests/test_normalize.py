@@ -298,6 +298,18 @@ class TestAdvisorIsSales:
         t = '校招实习-蔚来顾问-"未来星"营销管训班-合肥'
         assert family_from_title(t) == "marketing"
 
+    @pytest.mark.parametrize("title,expected", [
+        ("人力资源顾问", "hr"),
+        ("法律顾问", "legal"),
+        ("硬件顾问", "tech"),
+        ("产品顾问", "product"),
+    ])
+    def test_advisor_is_only_a_fallback(
+        self, title: str, expected: str
+    ) -> None:
+        """明确职能必须先赢；裸 `顾问` 只能兜底成 sales。"""
+        assert family_from_title(title) == expected
+
 
 class TestProcurementIsOther:
     """方案 017：`采购` 判 other，且必须在第 2 层末尾。"""
@@ -343,7 +355,7 @@ class TestProcurementIsOther:
         记的 `采购方向` 那个病一样，只是镜像：那次是 `采购` 当域词，这次是
         `结构` 当域词。
 
-        所以现在守两件事：`采购` 在这 30 个词之前，且 `other` 兜底仍在具体职能之后。
+        所以现在守两件事：`采购` 在这 30 个词之前，泛化的 `顾问` 在所有具体职能之后。
         """
         fams = [fam for _, fam in TITLE_RULES]
         words = [ws for ws, _ in TITLE_RULES]
@@ -351,7 +363,8 @@ class TestProcurementIsOther:
         for w in ("软件", "结构", "物流", "备件"):
             idx = next(i for i, ws in enumerate(words) if w in ws)
             assert proc < idx, f"`采购` 必须在 `{w}` 之前，否则 IoT采购履行经理 判 tech"
-        assert fams[-1] == "other", "第 2 层末尾不是 other，兜底语义没了"
+        assert words[-1] == ("顾问",) and fams[-1] == "sales", \
+            "泛化的 `顾问` 必须在所有具体职能之后兜底"
         # `other` 现在有 3 组（采购/物流/备件），不再是 1 组。断言「恰好 3」
         # 而不是「>= 1」：多出第 4 组说明有人又加了供应链词，那要走 018 §6 的判据
         # （先跑 measure_family_gaps.py db-effect，再看边际贡献是不是 0）。
@@ -490,17 +503,48 @@ class TestVocabGapWords018:
         ("交付实习生（上海大区）", "operations"),
         ("【27届校招】履约培训生", "operations"),
         ("【27届校招】产销培训生", "operations"),
+        ("管理咨询实习生-飞书", "sales"),
         ("【27届校招】海外售后赋能培训生-东南亚", "sales"),
         ("新零售实习生（上海大区）", "sales"),
+        ("商家分析实习生 - 抖音电商", "sales"),
         ("【27届校招】渠道拓展培训生", "sales"),
+        ("增长达人实习生-AI创新业务", "sales"),
+        ("IDC商务结算 - AI算力基础设施", "finance"),
         ("税务实习生", "finance"),
         ("【27届校招】资金培训生", "finance"),
         ("【27届校招】内控培训生", "finance"),
         ("【27届校招】成本培训生", "finance"),
+        ("UK/EU定价和补贴策略实习生-TikTok Shop", "finance"),
+        ("企业文化传播实习生-企业文化", "marketing"),
+        ("【27届校招】标准法规培训生", "legal"),
+        ("供应链与物流实习生-TikTok Shop", "other"),
         ("【27届校招】备件培训生", "other"),
     ])
     def test_word_rescues_its_target(self, title: str, expected: str) -> None:
         """删掉对应的词，这条就从 expected 掉回 None。"""
+        assert family_from_title(title) == expected
+
+    @pytest.mark.parametrize("title,expected", [
+        ("商家结算专员", "finance"),
+        ("渠道结算专员", "finance"),
+        ("达人结算专员", "finance"),
+        ("材料成本专员", "finance"),
+        ("结构成本专员", "finance"),
+        ("交付结算", "finance"),
+        ("法规咨询顾问", "legal"),
+        ("渠道传播", "marketing"),
+        ("达人传播", "marketing"),
+        ("材料交付专员", "operations"),
+        ("交付软件培训生", "tech"),
+        ("商家物流专员", "other"),
+        ("物流商家专员", "sales"),
+        ("渠道备件专员", "other"),
+        ("备件渠道专员", "sales"),
+    ])
+    def test_specific_function_beats_new_domain_words(
+        self, title: str, expected: str
+    ) -> None:
+        """新增域词不得抢走同层中更明确的财务、法务或市场职能。"""
         assert family_from_title(title) == expected
 
     def test_all_words_are_in_layer_two(self) -> None:
@@ -591,7 +635,9 @@ class TestVocabGapWords018:
         assert len(declared) == 30, f"测试里这份不是 30 个，是 {len(declared)}"
         # 反向：normalize.py 第 2 层里，凡是单词条且在 017 之后的组，都该在 NEW_018 里。
         singles = [ws[0] for ws, _ in TITLE_RULES if len(ws) == 1]
-        unexpected = [w for w in singles if w not in declared and w != "采购"]
+        unexpected = [
+            w for w in singles if w not in declared and w not in {"采购", "顾问"}
+        ]
         assert not unexpected, \
             f"normalize.py 第 2 层多了没在测试里声明的单词条：{unexpected}"
         for word, fam in NEW_018:

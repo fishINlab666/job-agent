@@ -187,7 +187,9 @@ class TestRegionTailStripped:
         assert not re.search(city_re, "新零售实习生（上海大区）"), \
             "城市正则本来就该匹配不到，如果匹配到了说明它剥得太狠"
 
-    def test_city_collapse_restores_the_region_regex(self, capsys) -> None:
+    def test_city_collapse_restores_the_region_regex(
+        self, capsys, monkeypatch
+    ) -> None:
         """`city_collapse()` 为了打「只剥城市」那一档会临时把 `REGION_TAIL` 换掉。
 
         换掉不还原的话，同一个进程里后面每一次 `_stem_map()` 都会退回 428 口径，
@@ -195,11 +197,18 @@ class TestRegionTailStripped:
         [[boundary-resting-on-downstream-coincidence]] 的形状：现在恰好没人在
         同一进程里连着调两个子命令，所以「不还原」眼下不出事。
         """
+        titles = {
+            "新零售实习生（上海大区）",
+            "新零售实习生（北京大区）",
+            "不带地域的岗位",
+        }
+        monkeypatch.setattr(mfg, "_titles", lambda: titles)
+        monkeypatch.setattr(mfg, "_city_vocab", lambda: {"上海", "北京"})
         before = mfg.REGION_TAIL
         mfg.city_collapse()
         capsys.readouterr()
         assert mfg.REGION_TAIL is before, "临时替换的正则没还原"
-        assert len(mfg._stem_map()) == 399, "还原后基数必须回到 399 口径"
+        assert set(mfg._stem_map()) == {"新零售实习生", "不带地域的岗位"}
 
 
 class TestKeepAndRejectAreDisjoint:

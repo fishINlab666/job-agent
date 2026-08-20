@@ -11,7 +11,7 @@
 #   2. **每条改坏先打出落点。** mutate_016 的第 3 条 perl 插错了行（插在 UPDATE
 #      之后而不是之前），只跳过了发事件，所以「没红」是脚本 bug 不是测试缺失。
 #      现在每条改坏后 diff 一下，看不到 diff 就直接算脚本错。
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 
 NORM=jobagent/normalize.py
@@ -25,7 +25,6 @@ BEFORE_MEAS=$(shasum -a 256 "$MEAS" | cut -d' ' -f1)
 # 不写 .pyc：重排式改坏会留过期字节码，还原后假装还是红的。
 export PYTHONDONTWRITEBYTECODE=1
 PYTEST=(.venv/bin/pytest -q -p no:cacheprovider)
-FAILED=0
 
 restore() { cp "$TMP/normalize.py.orig" "$NORM"; cp "$TMP/measure.py.orig" "$MEAS"; }
 
@@ -51,7 +50,7 @@ landed() {
     echo "  ✗ **改坏没落上**（文件和原件相同）—— perl 表达式没匹配到，先修脚本"
     return 1
   fi
-  echo "  落点：$(diff "$orig" "$f" | grep '^[<>]' | head -4 | sed 's/^/         /')"
+  echo "  落点已确认：$f 与原件不同"
   return 0
 }
 
@@ -62,40 +61,37 @@ run() {
   echo "改坏：$label"
   local f=$NORM orig=$TMP/normalize.py.orig
   [ "$which" = meas ] && { f=$MEAS; orig=$TMP/measure.py.orig; }
-  if ! landed "$f" "$orig"; then FAILED=1; restore; return; fi
-  local out
-  out=$("${PYTEST[@]}" -k "$red_k" 2>&1 | tail -1)
-  echo "  该红的一组（-k '$red_k'）：$out"
-  # 判据顺序有讲究：先问「跑了吗」，再问「红了吗」。
-  # -k 一条都没匹配上时 pytest 的末行是 `768 deselected in 0.48s` ——
-  # 既没有 "no tests ran" 也没有 "0 selected"，所以只能反过来判：
-  # 末行里没有 passed/failed/error 任何一个，就说明一条都没跑。
-  # 第一版按 "no tests ran" 认，结果这种情况掉进了下面的「没红」分支，
-  # 报成「判据没有测试守着」—— 同一个 ✗ 指向两个相反的结论。
-  case "$out" in
-    *passed*|*failed*|*error*) : ;;
-    *) echo "  ✗ **-k 一条测试都没匹配上** —— 测试大概改名了，这条等于没验"
-       FAILED=1; restore; return ;;
-  esac
-  case "$out" in
-    *failed*|*error*) echo "  ✓ 红了" ;;
-    *)                echo "  ✗ **没红** —— 这条判据没有测试守着"; FAILED=1 ;;
-  esac
-  out=$("${PYTEST[@]}" -k "$other_k" 2>&1 | tail -1)
-  echo "  另一组（-k '$other_k'，期望 $other_expect）：$out"
+  landed "$f" "$orig"
+  local red_output other_output red_tail other_tail red_rc=0 other_rc=0
+  red_output=$("${PYTEST[@]}" -k "$red_k" 2>&1) || red_rc=$?
+  other_output=$("${PYTEST[@]}" -k "$other_k" 2>&1) || other_rc=$?
+  red_tail=${red_output##*$'\n'}
+  other_tail=${other_output##*$'\n'}
+  echo "  该红的一组（-k '$red_k'）：$red_tail"
+  echo "  另一组（-k '$other_k'，期望 ${other_expect}）：$other_tail"
+  if [[ $red_rc -ne 1 || $red_tail != *failed* || $red_tail == *"no tests ran"* ]]; then
+    echo "  ✗ 目标组没有按预期失败"
+    return 1
+  fi
+  if [[ $other_rc -ne 0 ]]; then
+    echo "  ✗ 另一组没有保持全绿"
+    return 1
+  fi
+  echo "  ✓ 变异结果符合预期"
   restore
 }
 
 echo "=== 基线 ==="
-"${PYTEST[@]}" 2>&1 | tail -1
+baseline_output=$("${PYTEST[@]}" 2>&1)
+echo "${baseline_output##*$'\n'}"
 
 # 1. `顾问` 不加 —— 回到 issue #8 的现状
-perl -0pi -e 's/"解决方案", "顾问"/"解决方案"/' "$NORM"
-run "顾问 不加进 sales 组" "TestAdvisorIsSales" "TestProcurementIsOther or TestServiceIsDeliberately"
+perl -0pi -e 's/\n    \(\("顾问",\), "sales"\),//' "$NORM"
+run "顾问 不加进 sales 组" "TestAdvisorIsSales" "TestServiceIsDeliberately"
 
 # 2. `顾问` 写成 sales 之外的族 —— 判得出但判错
-perl -0pi -e 's/"解决方案", "顾问"\), "sales"/"解决方案"), "sales"),\n    (("顾问",), "hr"/' "$NORM"
-run "顾问 判成 hr" "TestAdvisorIsSales" "TestProcurementIsOther"
+perl -0pi -e 's/\(\("顾问",\), "sales"\)/(("顾问",), "hr")/' "$NORM"
+run "顾问 判成 hr" "TestAdvisorIsSales" "TestServiceIsDeliberately"
 
 # 3. `采购` 挪进 COMPOUND_RULES —— 实测会改判 5 条
 perl -0pi -e 's/\(\("物业", "办公规划", "行政"\), "other"\)/(("物业", "办公规划", "行政", "采购"), "other")/' "$NORM"
@@ -113,7 +109,7 @@ run "采购 组挪到 tech 组之前" \
     "TestAdvisorIsSales"
 
 # 5. `服务` 加进 sales 组 —— 数据上看着划算的那个错
-perl -0pi -e 's/"解决方案", "顾问"/"解决方案", "顾问", "服务"/' "$NORM"
+perl -0pi -e 's/"解决方案"\), "sales"/"解决方案", "服务"), "sales"/' "$NORM"
 run "服务 加进 sales 组" "TestServiceIsDeliberatelyNotSales" "TestAdvisorIsSales" \
     "全绿（顾问不受影响）"
 
@@ -139,8 +135,6 @@ AFTER_MEAS=$(shasum -a 256 "$MEAS" | cut -d' ' -f1)
 # 还原后必须回到全绿，且不许有过期 .pyc 撑着
 find . -name '*.pyc' -newer "$TMP/normalize.py.orig" -not -path './.venv/*' -delete 2>/dev/null
 echo "=== 还原后 ==="
-"${PYTEST[@]}" 2>&1 | tail -1
-rm -rf "$TMP"
-[ "$FAILED" = 0 ] && echo "=== 7 条改坏全部单独变红 ✓ ===" \
-  || { echo "=== **有条目没红或没落上，见上面的 ✗** ==="; exit 1; }
-
+final_output=$("${PYTEST[@]}" 2>&1)
+echo "${final_output##*$'\n'}"
+echo "=== 7 条改坏全部单独变红 ✓ ==="
