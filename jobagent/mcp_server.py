@@ -97,10 +97,11 @@ WRITE_VERBS = frozenset({
 
 
 #: `intent` 里允许过边界的键。见 `_intent()` 里为什么是白名单。
-INTENT_KEYS = frozenset({
-    "grad_years", "families", "cities", "recruit_types",
-    "boost_keywords", "exclude_keywords",
-})
+INTENT_KEYS = match.INTENT_KEYS
+
+PROFILE_UNAVAILABLE = (
+    "画像不可用，无法判断匹配；请检查 profile.yaml 的 intent 配置。"
+)
 
 
 def _conn() -> sqlite3.Connection:
@@ -160,15 +161,16 @@ def list_jobs(
     返回里 `notes` 是给人看的提醒（例如 allow_missing 没生效），有内容就该转述。
     """
     queries.validate_allow_missing(allow_missing)
+    queries.validate_positive_limit(limit)
     intent = None
     if matched:
         try:
             intent = _intent()
-        except (FileNotFoundError, ValueError) as exc:
+        except (FileNotFoundError, ValueError):
             return {
                 "total": 0,
                 "returned": 0,
-                "notes": [f"画像不可用，无法判断匹配：{exc}"],
+                "notes": [PROFILE_UNAVAILABLE],
                 "matched_unavailable": True,
                 "jobs": [],
             }
@@ -231,7 +233,7 @@ def explain_match(external_id: str, source_key: str | None = None) -> dict:
 
     try:
         intent = _intent()
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, ValueError):
         return {
             "found": True,
             "profile_ready": False,
@@ -240,7 +242,7 @@ def explain_match(external_id: str, source_key: str | None = None) -> dict:
             "company": job["company"],
             "title": job["title"],
             "state": "unknown",
-            "reason": f"画像不可用，无法判断匹配：{exc}",
+            "reason": PROFILE_UNAVAILABLE,
             "missing": ["profile"],
         }
 
@@ -276,6 +278,7 @@ def list_sync_runs(source_key: str | None = None, limit: int = 20) -> dict:
     `finished_at` 为 null = 这一轮没收尾（进程被杀，或正在跑）。这条痕迹是故意
     留着的，不要当成数据缺失。
     """
+    queries.validate_positive_limit(limit)
     return {"runs": queries.sync_runs(_conn(), source_key=source_key, limit=limit)}
 
 
@@ -332,6 +335,8 @@ def job_changes(
     某条事件带 `payload_raw` 说明它的 payload 存坏了解不开 —— 那是数据问题，
     不是「这次没有变动」。
     """
+    queries.validate_positive_limit(limit)
+    queries.validate_since(since)
     if kind is not None and kind not in JOB_EVENT_KINDS:
         raise ValueError(
             f"不认识的事件种类 {kind!r}，可选：{'/'.join(sorted(JOB_EVENT_KINDS))}"

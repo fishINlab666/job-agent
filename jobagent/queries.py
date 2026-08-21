@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime
 from typing import Any, Iterable
 
 from . import db, match
@@ -43,6 +44,26 @@ def validate_allow_missing(allow_missing: Iterable[str] | None) -> set[str]:
             f"不认识的维度 {sorted(bad)}，可选：{'/'.join(match.MISSING_DIMS)}"
         )
     return allowed
+
+
+def validate_positive_limit(limit: int) -> int:
+    """只接受正整数上限，不暴露 SQLite 对 0/负数 LIMIT 的特殊解释。"""
+    if limit <= 0:
+        raise ValueError("limit 必须是正整数")
+    return limit
+
+
+def validate_since(since: str | None) -> str | None:
+    """只接受带时区的 ISO 时间，避免非法文本被当成“没有变动”。"""
+    if since is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(since.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("since 必须是带时区的 ISO 时间") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("since 必须是带时区的 ISO 时间")
+    return since
 
 
 def _row_to_job(row: sqlite3.Row) -> dict:

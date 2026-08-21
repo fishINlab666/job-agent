@@ -76,6 +76,40 @@ class TestProfileIntentLoading:
         with pytest.raises(ValueError, match="求职意图"):
             match_module.load_intent(profile)
 
+    def test_all_empty_intent_lists_are_rejected_for_matching(self, tmp_path) -> None:
+        profile = tmp_path / "empty-intent.yaml"
+        profile.write_text(
+            json.dumps({"intent": {"families": [], "cities": []}}),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="求职意图"):
+            match_module.load_intent(profile)
+
+    def test_unknown_intent_key_is_rejected_instead_of_becoming_a_hit(
+        self, tmp_path
+    ) -> None:
+        profile = tmp_path / "typo-intent.yaml"
+        profile.write_text(
+            json.dumps({"intent": {"family": ["operations"]}}),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="family"):
+            match_module.load_intent(profile)
+
+    def test_scalar_intent_value_is_rejected_instead_of_iterating_characters(
+        self, tmp_path
+    ) -> None:
+        profile = tmp_path / "scalar-intent.yaml"
+        profile.write_text(
+            json.dumps({"intent": {"families": "operations"}}),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="families"):
+            match_module.load_intent(profile)
+
 
 def job(**over):
     """一个确定命中的岗位，用例只覆盖自己关心的那个字段。"""

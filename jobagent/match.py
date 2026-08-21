@@ -18,6 +18,11 @@ from .normalize import any_city_ok, grad_years_from_title, parse_grad_years
 ROOT = Path(__file__).resolve().parent.parent
 PROFILE_PATH = ROOT / "profile.yaml"
 
+INTENT_KEYS = frozenset({
+    "grad_years", "families", "cities", "recruit_types",
+    "boost_keywords", "exclude_keywords",
+})
+
 
 class Verdict(NamedTuple):
     """三态判定。
@@ -73,7 +78,24 @@ def load_intent(path: Path | None = None) -> dict:
     """从画像读取求职意图；嵌套与旧扁平格式共用 profile 层解析规则。"""
     p = path or PROFILE_PATH
     intent = profile_config.intent_from_dict(load_profile(p))
-    if not intent:
+    unknown = sorted(set(intent) - INTENT_KEYS)
+    if unknown:
+        raise ValueError(
+            f"画像 intent 有不认识的字段：{', '.join(unknown)}"
+        )
+    invalid_shapes = sorted(
+        key for key, value in intent.items() if not isinstance(value, list)
+    )
+    if invalid_shapes:
+        raise ValueError(
+            "画像 intent 这些字段应该是列表："
+            + ", ".join(invalid_shapes)
+        )
+    has_value = any(
+        any(str(item).strip() for item in values)
+        for values in intent.values()
+    )
+    if not has_value:
         raise ValueError(f"画像里没有可用的求职意图：{p}")
     return intent
 
