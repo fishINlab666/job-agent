@@ -132,7 +132,8 @@ class TestPrintUnsure:
             )
         # unsure 列表里来自这个源的 5 条
         unsure = [
-            {"source_key": "degraded_src", "company": "A公司", "title": f"岗位{i}",
+            {"source_key": "degraded_src", "external_id": f"a{i}",
+             "company": "A公司", "title": f"岗位{i}",
              "cities": "[]", "apply_url": "-", "_why": "届别未知"}
             for i in range(5)
         ]
@@ -174,10 +175,12 @@ class TestPrintUnsure:
         tmp_db.commit()
 
         unsure = [
-            {"source_key": "ok_src", "company": "公司", "title": "缺3个",
+            {"source_key": "ok_src", "external_id": "j2",
+             "company": "公司", "title": "缺3个",
              "grad_year": None, "job_family": None, "cities": "[]",
              "recruit_type": "campus", "apply_url": "-", "_why": "xx"},
-            {"source_key": "ok_src", "company": "公司", "title": "缺1个",
+            {"source_key": "ok_src", "external_id": "j1",
+             "company": "公司", "title": "缺1个",
              "grad_year": 2026, "job_family": None, "cities": "[\"上海\"]",
              "recruit_type": "campus", "apply_url": "-", "_why": "xx"},
         ]

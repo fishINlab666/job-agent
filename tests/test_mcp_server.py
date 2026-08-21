@@ -435,14 +435,21 @@ class TestIdentityDoesNotCrossTheBoundary:
             "有工具没进哨兵清单：" f"{swept ^ registered}"
         )
 
-    def test_missing_profile_degrades_instead_of_crashing(
+    def test_missing_profile_is_explicitly_unavailable_not_a_fake_hit(
         self, db_with_data, tmp_path, monkeypatch
     ) -> None:
-        """档案不存在时匹配退化成「什么都不排除」，不是整个工具挂掉。"""
+        """档案不存在时不能把空 intent 洗成「全部命中」。"""
         from jobagent import match
         monkeypatch.setattr(match, "PROFILE_PATH", tmp_path / "nope.yaml")
-        assert mcp_server._intent() == {}
-        assert call("list_jobs", {"matched": True})["total"] >= 0
+        listed = call("list_jobs", {"matched": True})
+        explained = call("explain_match", {"external_id": "J1"})
+
+        assert listed["matched_unavailable"] is True
+        assert listed["total"] == 0 and listed["jobs"] == []
+        assert any("画像" in note for note in listed["notes"])
+        assert explained["profile_ready"] is False
+        assert explained["state"] == "unknown"
+        assert explained["reason"] != "命中"
 
 
 class TestOnlyJobSideEvents:
@@ -797,6 +804,33 @@ class TestToolContract:
         r = asyncio.run(go())
         assert r.is_error
         assert "不认识的维度" in r.content[0].text
+
+    @pytest.mark.parametrize(
+        "arguments,bad_key",
+        [
+            ({"matched": True, "grad_year": "27"}, "grad_year"),
+            ({"matched": True, "unexpected": True}, "unexpected"),
+        ],
+    )
+    def test_unknown_tool_argument_is_rejected_before_the_tool_runs(
+        self, db_with_data, arguments, bad_key, monkeypatch
+    ) -> None:
+        """拼错/臆造的参数必须报错，不能被 FastMCP 静默丢掉。"""
+        from mcp import Client
+
+        def must_not_run():
+            raise AssertionError("未知参数没有在工具执行前被拦住")
+
+        monkeypatch.setattr(mcp_server, "_conn", must_not_run)
+
+        async def go():
+            async with Client(mcp_server.mcp) as client:
+                return await client.call_tool("list_jobs", arguments)
+
+        result = asyncio.run(go())
+        assert result.is_error
+        assert "不认识的参数" in result.content[0].text
+        assert bad_key in result.content[0].text
 
     def test_notes_reach_the_caller(self, db_with_data) -> None:
         """`allow_missing` 没生效这件事要传到模型那一侧，不能只留在 Python 里。"""

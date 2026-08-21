@@ -331,6 +331,21 @@ class TestApplications:
         assert "投递记录 1 条" in r.output
         assert "被拦" in r.output
 
+    def test_lists_source_and_external_job_id(self, tmp_db, monkeypatch) -> None:
+        seed(tmp_db, "COPY-ME-APP", 100, "2026")
+        app_row(
+            tmp_db,
+            ext_id="COPY-ME-APP",
+            job_id=job_id_of(tmp_db, "COPY-ME-APP"),
+        )
+        monkeypatch.setattr(cli.console, "width", 240)
+
+        result = runner.invoke(cli.app, ["applications"])
+
+        assert result.exit_code == 0, result.output
+        assert "tencent_join" in result.output
+        assert "COPY-ME-APP" in result.output
+
     def test_empty_says_so(self, tmp_db) -> None:
         """空表要明说「没有」，不是打一张空表框。"""
         r = runner.invoke(cli.app, ["applications"])
@@ -761,3 +776,29 @@ class TestJobIdentity:
         assert "feishu:nio" in output and "tencent_join" in output
         assert "--source" in output
         assert not isinstance(result.exception, AssertionError)
+
+
+class TestMatchedJobsUsability:
+    def test_missing_profile_exits_with_a_fix_instead_of_a_traceback(
+        self, tmp_db, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(match, "PROFILE_PATH", tmp_path / "missing-profile.yaml")
+
+        result = runner.invoke(cli.app, ["jobs", "--matched"])
+
+        assert result.exit_code == 1
+        assert "画像" in result.output
+        assert "profile.yaml.example" in result.output
+        assert "Traceback" not in result.output
+
+    def test_jobs_show_copyable_source_and_external_id(
+        self, tmp_db, monkeypatch
+    ) -> None:
+        seed(tmp_db, "COPY-ME-JOB", 100, "2026")
+        monkeypatch.setattr(cli.console, "width", 240)
+
+        result = runner.invoke(cli.app, ["jobs"])
+
+        assert result.exit_code == 0, result.output
+        assert "tencent_join" in result.output
+        assert "COPY-ME-JOB" in result.output

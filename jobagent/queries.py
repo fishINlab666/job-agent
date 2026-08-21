@@ -35,6 +35,16 @@ class AmbiguousJobError(ValueError):
         )
 
 
+def validate_allow_missing(allow_missing: Iterable[str] | None) -> set[str]:
+    """校验并归一化匹配放宽维度，供 CLI/MCP 在读取画像前先行拒错。"""
+    allowed = set(allow_missing or ())
+    if bad := allowed - set(match.MISSING_DIMS):
+        raise ValueError(
+            f"不认识的维度 {sorted(bad)}，可选：{'/'.join(match.MISSING_DIMS)}"
+        )
+    return allowed
+
+
 def _row_to_job(row: sqlite3.Row) -> dict:
     """把 jobs 行转成 dict，`cities` 解成 list。
 
@@ -78,11 +88,7 @@ def open_jobs(
         ).fetchall()
     ]
 
-    allowed = set(allow_missing or ())
-    if bad := allowed - set(match.MISSING_DIMS):
-        raise ValueError(
-            f"不认识的维度 {sorted(bad)}，可选：{'/'.join(match.MISSING_DIMS)}"
-        )
+    allowed = validate_allow_missing(allow_missing)
 
     notes: list[str] = []
     if allowed and not matched:

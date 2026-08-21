@@ -40,7 +40,11 @@ uv run python -m jobagent.cli init
 
 ### 配置画像
 
-编辑 `profile.yaml` 设置你的筛选条件：
+先复制示例，再编辑 `profile.yaml` 设置筛选条件：
+
+```bash
+cp profile.yaml.example profile.yaml
+```
 
 ```yaml
 intent:
@@ -55,8 +59,12 @@ identity:  # M6 自动填表用
   name: "张三"
   phone: "13800138000"
   email: "zhangsan@example.com"
-  school: "清华大学"
-  major: "计算机科学与技术"
+
+education:
+  - school: "清华大学"
+    major: "计算机科学与技术"
+    degree: "硕士"
+    end: "2027-06"
 ```
 
 ### 基本使用
@@ -69,7 +77,7 @@ uv run python -m jobagent.cli sync
 uv run python -m jobagent.cli status
 
 # 查看匹配岗位（按画像筛选）
-uv run python -m jobagent.cli jobs
+uv run python -m jobagent.cli jobs --matched
 
 # 查看增量推送（新增/变更）
 uv run python -m jobagent.cli digest
@@ -97,7 +105,7 @@ uv run python -m jobagent.cli observation-review-day 2026-08-21 \
 uv run python -m jobagent.cli schedule-uninstall
 
 # M6: 自动投递岗位（第一个参数是源站的 external_id，不是 jobs.id）
-uv run python -m jobagent.cli apply <external_id> \
+uv run python -m jobagent.cli apply <external_id> --source <source_key> \
   --profile-path profile.yaml \
   --user-data-dir ~/.cache/playwright-tencent
 

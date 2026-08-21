@@ -1,22 +1,29 @@
-name: 张三
-phone: '13800138000'
-email: zhangsan@example.com
-school: 清华大学
-major: 计算机科学与技术
-degree: 硕士
-grad_year: 2027
-grad_month: 6
-# resume_path: ~/Documents/resume.pdf  # 可选：简历文件路径（PDF/DOC/DOCX）
+# 用于岗位匹配。jobs --matched 和 digest 都读取这一段。
+intent:
+  grad_years: ["27"]
+  families:
+    - operations
+    - product
+  cities:
+    - 北京
+    - 上海
+    - 深圳
+    - 杭州
+  recruit_types:
+    - campus
+    - intern
+  boost_keywords: ["内容运营", "产品运营", "用户运营", "策略"]
+  exclude_keywords: ["外包", "派遣", "客服专员"]
 
-# 用于匹配的画像配置（与 apply 命令无关，仅供 digest/jobs 使用）
-families:
-  - operations
-  - product
-cities:
-  - 北京
-  - 上海
-  - 深圳
-  - 杭州
-recruit_types:
-  - campus
-  - intern
+# 仅在明确执行 apply 时用于填表；MCP 和自动观察不会读取或返回这些值。
+identity:
+  name: 张三
+  phone: "13800138000"
+  email: zhangsan@example.com
+  # resume_path: ~/Documents/resume.pdf
+
+education:
+  - school: 清华大学
+    major: 计算机科学与技术
+    degree: 硕士
+    end: "2027-06"

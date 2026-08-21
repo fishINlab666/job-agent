@@ -10,8 +10,11 @@ grad_year 没写、cities 写「全国」的岗位一律被过滤掉，用户永
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from jobagent import match as match_module
 from jobagent.match import (
     MISSING_DIMS,
     city_list,
@@ -35,6 +38,43 @@ INTENT = {
     "recruit_types": ["campus", "intern"],
     "exclude_keywords": ["外包", "派遣"],
 }
+
+
+class TestProfileIntentLoading:
+    """匹配层和填表层必须认同同一份画像格式。"""
+
+    def test_nested_and_legacy_flat_profiles_produce_the_same_intent(
+        self, tmp_path
+    ) -> None:
+        nested = tmp_path / "nested.yaml"
+        legacy = tmp_path / "legacy.yaml"
+        intent = {
+            "families": ["operations"],
+            "cities": ["北京"],
+            "recruit_types": ["campus"],
+            "grad_years": ["27"],
+        }
+        nested.write_text(
+            json.dumps({"intent": intent}, ensure_ascii=False), encoding="utf-8"
+        )
+        legacy.write_text(
+            json.dumps({**intent, "grad_years": [2027]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        assert match_module.load_intent(nested) == intent
+        assert match_module.load_intent(legacy) == intent
+
+    def test_missing_profile_is_not_an_empty_intent(self, tmp_path) -> None:
+        with pytest.raises(FileNotFoundError, match="档案不存在"):
+            match_module.load_intent(tmp_path / "missing.yaml")
+
+    def test_empty_profile_is_rejected_for_matching(self, tmp_path) -> None:
+        profile = tmp_path / "empty.yaml"
+        profile.write_text("identity: {}\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="求职意图"):
+            match_module.load_intent(profile)
 
 
 def job(**over):

@@ -204,6 +204,7 @@ def _print_unsure(conn, unsure: list[dict], limit: int = 15) -> None:
             cities = "/".join(match.city_list(j)[:3]) or "未写"
             console.print(
                 f"  ? {j['company']} · {j['title']} · {cities}"
+                f"  [dim][{j['source_key']} / {j['external_id']}][/dim]"
                 f"  [dim]{j['_why']}[/dim]"
             )
             console.print(f"    [dim]{j.get('apply_url') or '-'}[/dim]")
@@ -762,11 +763,23 @@ def jobs(
     # 全绿，只有改了一边才会分叉，而分叉的表现是 CLI 和 MCP 对同一个问题给出
     # 不同答案。守这条归属的测试见 tests/test_queries.py。
     try:
+        queries.validate_allow_missing(allowed)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    try:
+        intent = match.load_intent() if matched else None
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]画像不可用[/red] {exc}")
+        console.print("[yellow]提示[/yellow] 复制 profile.yaml.example 为 profile.yaml 后填写")
+        raise typer.Exit(1) from exc
+
+    try:
         rows, notes = queries.open_jobs(
             conn,
             family=family, city=city, recruit_type=recruit_type,
             matched=matched, allow_missing=allowed,
-            intent=(match.load_profile().get("intent") or {}) if matched else None,
+            intent=intent,
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -776,6 +789,8 @@ def jobs(
     total = len(rows)
     table = Table(title=f"开放岗位 {total} 条" + (f"（显示前 {limit}）" if total > limit else ""))
     table.add_column("公司", style="cyan", no_wrap=True)
+    table.add_column("来源", style="dim", no_wrap=True)
+    table.add_column("岗位编号", no_wrap=True)
     table.add_column("岗位")
     table.add_column("族", no_wrap=True)
     table.add_column("类型", no_wrap=True)
@@ -788,7 +803,7 @@ def jobs(
         if r.get("_why"):
             title = f"{title} [yellow]?[/yellow]"
         table.add_row(
-            r["company"], title,
+            r["company"], r["source_key"], r["external_id"], title,
             FAM_ZH.get(r["job_family"], r["job_family"] or "-"),
             RTYPE_ZH.get(r["recruit_type"], r["recruit_type"] or "-"),
             "/".join(cities[:4]) + ("…" if len(cities) > 4 else ""),
@@ -831,8 +846,8 @@ def digest(mark: bool = typer.Option(False, "--mark", help="标记为已推送")
     )
     profile_error: str | None = None
     try:
-        intent = match.load_profile().get("intent") or {} if needs_profile else {}
-    except FileNotFoundError as exc:
+        intent = match.load_intent() if needs_profile else {}
+    except (FileNotFoundError, ValueError) as exc:
         intent = {}
         profile_error = str(exc)
 
@@ -933,18 +948,23 @@ def digest(mark: bool = typer.Option(False, "--mark", help="标记为已推送")
                 parts.append(
                     f"城市: {_fmt_cities(cty['from'])} → {_fmt_cities(cty['to'])}"
                 )
-            console.print(f"  • {job['title']} ({job['company']}) — {'; '.join(parts)}")
+            console.print(
+                f"  • {job['title']} ({job['company']}) "
+                f"[{job['source_key']} / {job['external_id']}] — {'; '.join(parts)}"
+            )
 
     if hits:
         table = Table(title=f"新增岗位 {len(hits)} 条（已按画像筛选）")
         table.add_column("公司", style="cyan")
+        table.add_column("来源", style="dim", no_wrap=True)
+        table.add_column("岗位编号", no_wrap=True)
         table.add_column("岗位")
         table.add_column("族", no_wrap=True)
         table.add_column("城市")
         table.add_column("投递链接", style="dim")
         for d in sorted(hits, key=lambda x: match.score(x, intent), reverse=True):
             table.add_row(
-                d["company"], d["title"],
+                d["company"], d["source_key"], d["external_id"], d["title"],
                 FAM_ZH.get(d["job_family"], d["job_family"] or "-"),
                 "/".join(json.loads(d["cities"] or "[]")[:3]),
                 d.get("apply_url") or "-",
@@ -1345,7 +1365,8 @@ def applications(
         color = style_of.get(st, "red")
         # 岗位行没了就退化成 external_id 并标记，不留空白：空白会被读成
         # 「这条记录坏了」，而它其实是完好的记录 + 消失的岗位。
-        title = r["job_title"] or f"[dim]<岗位行已不在>[/dim] {r['external_id']}"
+        title = r["job_title"] or "[dim]<岗位行已不在>[/dim]"
+        title += f"\n[dim]{r['source_key']} / {r['external_id']}[/dim]"
         # blocked 的 error 是给人看的整段建议（最长 60+ 字），只取第一句：
         # 后面几句是「怎么办」，那属于 --funnel 的输出，不该挤在表格里。
         note = r["error"] or r["note"] or ""
@@ -1364,6 +1385,10 @@ def applications(
             (r["created_at"] or "")[5:16].replace("T", " "), note,
         )
     console.print(table)
+
+    console.print("[dim]岗位引用（apply 时使用 source_key / external_id）：[/dim]")
+    for r in rows[:limit]:
+        console.print(f"  [dim]#{r['id']} {r['source_key']} / {r['external_id']}[/dim]")
 
     shots = [r for r in rows[:limit] if r["screenshot_path"]]
     if shots:
