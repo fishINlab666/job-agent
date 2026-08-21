@@ -210,7 +210,7 @@ def _flatten(raw: dict) -> dict[str, ProfileField]:
     return out
 
 
-def _intent(raw: dict) -> dict[str, Any]:
+def intent_from_dict(raw: dict) -> dict[str, Any]:
     """求职意图。嵌套 intent 优先，退回扁平顶层 key。"""
     nested = raw.get("intent")
     if isinstance(nested, dict) and nested:
@@ -234,7 +234,7 @@ def from_dict(raw: dict | None, source_path: str = "") -> FormProfile:
     narrative = raw.get("narrative") if isinstance(raw.get("narrative"), dict) else {}
     return FormProfile(
         fields=_flatten(raw),
-        intent=_intent(raw),
+        intent=intent_from_dict(raw),
         narrative={k: str(v or "") for k, v in (narrative or {}).items()},
         source_path=source_path,
     )

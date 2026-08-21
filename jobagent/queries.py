@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime
 from typing import Any, Iterable
 
 from . import db, match
@@ -33,6 +34,36 @@ class AmbiguousJobError(ValueError):
         super().__init__(
             f"岗位编号 {external_id!r} 出现在多个来源：{', '.join(source_keys)}"
         )
+
+
+def validate_allow_missing(allow_missing: Iterable[str] | None) -> set[str]:
+    """校验并归一化匹配放宽维度，供 CLI/MCP 在读取画像前先行拒错。"""
+    allowed = set(allow_missing or ())
+    if bad := allowed - set(match.MISSING_DIMS):
+        raise ValueError(
+            f"不认识的维度 {sorted(bad)}，可选：{'/'.join(match.MISSING_DIMS)}"
+        )
+    return allowed
+
+
+def validate_positive_limit(limit: int) -> int:
+    """只接受正整数上限，不暴露 SQLite 对 0/负数 LIMIT 的特殊解释。"""
+    if limit <= 0:
+        raise ValueError("limit 必须是正整数")
+    return limit
+
+
+def validate_since(since: str | None) -> str | None:
+    """只接受带时区的 ISO 时间，避免非法文本被当成“没有变动”。"""
+    if since is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(since.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("since 必须是带时区的 ISO 时间") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("since 必须是带时区的 ISO 时间")
+    return since
 
 
 def _row_to_job(row: sqlite3.Row) -> dict:
@@ -78,11 +109,7 @@ def open_jobs(
         ).fetchall()
     ]
 
-    allowed = set(allow_missing or ())
-    if bad := allowed - set(match.MISSING_DIMS):
-        raise ValueError(
-            f"不认识的维度 {sorted(bad)}，可选：{'/'.join(match.MISSING_DIMS)}"
-        )
+    allowed = validate_allow_missing(allow_missing)
 
     notes: list[str] = []
     if allowed and not matched:

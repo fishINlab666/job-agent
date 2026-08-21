@@ -296,3 +296,22 @@ class TestSourceHealthAlerts:
             "SELECT kind FROM events WHERE notified_at IS NULL ORDER BY id"
         ).fetchall()
         assert [row["kind"] for row in pending] == ["job_opened"]
+
+
+class TestDigestJobReference:
+    def test_new_job_shows_source_and_external_id(self, env, capsys) -> None:
+        """摘要里看到的岗位要能直接对应到 apply 的两个定位参数。"""
+        ingest.sync(env, FakeAdapter([make_job("existing")]))
+        env.execute("UPDATE events SET notified_at=?", (db.now(),))
+        env.commit()
+        ingest.sync(
+            env,
+            FakeAdapter([make_job("existing"), make_job("COPY-ME-DIGEST")]),
+        )
+        cli.console.width = 240
+
+        cli.digest(mark=False)
+        output = capsys.readouterr().out
+
+        assert "fake_src" in output
+        assert "COPY-ME-DIGEST" in output

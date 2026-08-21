@@ -372,18 +372,13 @@ class TestIdentityDoesNotCrossTheBoundary:
         assert "identity" not in got and "education" not in got
         assert got["families"] == ["operations"], "白名单把该过的键也挡掉了"
 
-    def test_an_unknown_intent_key_is_not_handed_over(
+    def test_an_unknown_intent_key_is_rejected_instead_of_silently_dropped(
         self, tmp_path, monkeypatch
     ) -> None:
-        """`intent` 里多一个没见过的键时，默认**不**交出去。
+        """`intent` 里多一个没见过的键时，明确报错。
 
-        这条守的是白名单 vs 黑名单的差别，而那个差别在今天的档案上看不出来 ——
-        `intent` 里本来就没有 identity，所以「挑白名单」和「排除 identity」给出
-        一样的结果，把实现换成黑名单不会有任何测试变红（红队验过）。
-
-        差别只在 profile **将来长出新键**时显现：黑名单默认放行，白名单默认拦下。
-        所以这里自己造一个未来的键。它叫 `id_card_backup` 是刻意的 ——
-        真出现这种键时，黑名单式实现会把身份证号直接送进对话。
+        只是静默丢掉会把 `family` 这种拼写错误洗成空 intent，最后所有
+        岗位都变成“命中”。默认拒绝同时保住隐私和正确性。
         """
         import yaml
         from jobagent import match
@@ -397,11 +392,8 @@ class TestIdentityDoesNotCrossTheBoundary:
         }, allow_unicode=True), encoding="utf-8")
         monkeypatch.setattr(match, "PROFILE_PATH", p)
 
-        got = mcp_server._intent()
-        assert got == {"families": ["operations"]}, (
-            "intent 里的未知键被一起交了出去。白名单要默认拦下没见过的键 ——"
-            "黑名单式实现在这里会放行。"
-        )
+        with pytest.raises(ValueError, match="id_card_backup"):
+            mcp_server._intent()
 
     def test_intent_still_crosses(self, db_with_data, profile_with_identity) -> None:
         """先证明匹配真的读到了这份档案。
@@ -435,14 +427,21 @@ class TestIdentityDoesNotCrossTheBoundary:
             "有工具没进哨兵清单：" f"{swept ^ registered}"
         )
 
-    def test_missing_profile_degrades_instead_of_crashing(
+    def test_missing_profile_is_explicitly_unavailable_not_a_fake_hit(
         self, db_with_data, tmp_path, monkeypatch
     ) -> None:
-        """档案不存在时匹配退化成「什么都不排除」，不是整个工具挂掉。"""
+        """档案不存在时不能把空 intent 洗成「全部命中」。"""
         from jobagent import match
         monkeypatch.setattr(match, "PROFILE_PATH", tmp_path / "nope.yaml")
-        assert mcp_server._intent() == {}
-        assert call("list_jobs", {"matched": True})["total"] >= 0
+        listed = call("list_jobs", {"matched": True})
+        explained = call("explain_match", {"external_id": "J1"})
+
+        assert listed["matched_unavailable"] is True
+        assert listed["total"] == 0 and listed["jobs"] == []
+        assert any("画像" in note for note in listed["notes"])
+        assert explained["profile_ready"] is False
+        assert explained["state"] == "unknown"
+        assert explained["reason"] != "命中"
 
 
 class TestOnlyJobSideEvents:
@@ -797,6 +796,114 @@ class TestToolContract:
         r = asyncio.run(go())
         assert r.is_error
         assert "不认识的维度" in r.content[0].text
+
+    @pytest.mark.parametrize(
+        "arguments,bad_key",
+        [
+            ({"matched": True, "grad_year": "27"}, "grad_year"),
+            ({"matched": True, "unexpected": True}, "unexpected"),
+        ],
+    )
+    def test_unknown_tool_argument_is_rejected_before_the_tool_runs(
+        self, db_with_data, arguments, bad_key, monkeypatch
+    ) -> None:
+        """拼错/臆造的参数必须报错，不能被 FastMCP 静默丢掉。"""
+        from mcp import Client
+
+        def must_not_run():
+            raise AssertionError("未知参数没有在工具执行前被拦住")
+
+        monkeypatch.setattr(mcp_server, "_conn", must_not_run)
+
+        async def go():
+            async with Client(mcp_server.mcp) as client:
+                return await client.call_tool("list_jobs", arguments)
+
+        result = asyncio.run(go())
+        assert result.is_error
+        assert "不认识的参数" in result.content[0].text
+        assert bad_key in result.content[0].text
+
+    @pytest.mark.parametrize(
+        "tool,arguments",
+        [
+            ("list_jobs", {"limit": 0}),
+            ("list_jobs", {"limit": -1}),
+            ("list_sync_runs", {"limit": 0}),
+            ("list_sync_runs", {"limit": -1}),
+            ("job_changes", {"limit": 0}),
+            ("job_changes", {"limit": -1}),
+        ],
+    )
+    def test_non_positive_limit_is_rejected_before_querying(
+        self, db_with_data, tool, arguments, monkeypatch
+    ) -> None:
+        """负数不能交给 SQLite 解释，否则会返回看似正常的假答案。"""
+        from mcp import Client
+
+        def must_not_query():
+            raise AssertionError("非法 limit 没有在查询前被拦住")
+
+        monkeypatch.setattr(mcp_server, "_conn", must_not_query)
+
+        async def go():
+            async with Client(mcp_server.mcp) as client:
+                return await client.call_tool(tool, arguments)
+
+        result = asyncio.run(go())
+        assert result.is_error
+        assert "limit" in result.content[0].text
+        assert "正整数" in result.content[0].text
+
+    @pytest.mark.parametrize("since", ["not-an-iso-date", "2026-08-21T10:00:00"])
+    def test_invalid_since_is_rejected_before_querying(
+        self, db_with_data, since, monkeypatch
+    ) -> None:
+        """非法或无时区时间不能被当成“没有变动”。"""
+        from mcp import Client
+
+        def must_not_query():
+            raise AssertionError("非法 since 没有在查询前被拦住")
+
+        monkeypatch.setattr(mcp_server, "_conn", must_not_query)
+
+        async def go():
+            async with Client(mcp_server.mcp) as client:
+                return await client.call_tool("job_changes", {"since": since})
+
+        result = asyncio.run(go())
+        assert result.is_error
+        assert "since" in result.content[0].text
+        assert "时区" in result.content[0].text
+
+    def test_profile_errors_do_not_expose_local_paths(
+        self, db_with_data, tmp_path, monkeypatch
+    ) -> None:
+        """MCP 返回会进对话，不该带出本机用户名和绝对路径。"""
+        from jobagent import match
+
+        private_path = tmp_path / "Users" / "private-user" / "profile.yaml"
+        monkeypatch.setattr(match, "PROFILE_PATH", private_path)
+
+        outputs = [
+            call("list_jobs", {"matched": True}),
+            call("explain_match", {"external_id": "J1"}),
+        ]
+        serialized = json.dumps(outputs, ensure_ascii=False)
+        assert str(private_path) not in serialized
+        assert "private-user" not in serialized
+        assert "画像不可用" in serialized
+
+    def test_mcp_setup_does_not_promise_a_grad_year_tool_argument(self) -> None:
+        setup = (
+            Path(mcp_server.__file__).resolve().parent.parent
+            / "docs" / "MCP_SETUP.md"
+        ).read_text(encoding="utf-8")
+        row = next(
+            line for line in setup.splitlines()
+            if line.startswith("| `list_jobs`")
+        )
+        assert "届别筛" not in row
 
     def test_notes_reach_the_caller(self, db_with_data) -> None:
         """`allow_missing` 没生效这件事要传到模型那一侧，不能只留在 Python 里。"""

@@ -32,6 +32,36 @@ from mcp.server import MCPServer
 
 from . import db, match, queries
 
+
+class RejectUnknownToolArguments:
+    """拒绝工具 schema 之外的参数，避免 SDK 默认静默丢弃拼错的键。"""
+
+    async def __call__(self, ctx: Any, call_next: Any) -> Any:
+        if ctx.method == "tools/call" and isinstance(ctx.params, dict):
+            name = ctx.params.get("name")
+            arguments = ctx.params.get("arguments") or {}
+            if isinstance(name, str) and isinstance(arguments, dict):
+                schemas = {
+                    tool.name: set((tool.input_schema or {}).get("properties", {}))
+                    for tool in await mcp.list_tools()
+                }
+                if name in schemas:
+                    unknown = sorted(set(arguments) - schemas[name])
+                    if unknown:
+                        return {
+                            "content": [{
+                                "type": "text",
+                                "text": (
+                                    f"不认识的参数 {unknown}；{name} 可用参数："
+                                    f"{sorted(schemas[name])}"
+                                ),
+                            }],
+                            "isError": True,
+                            "resultType": "complete",
+                        }
+        return await call_next(ctx)
+
+
 mcp = MCPServer(
     name="job-agent",
     instructions=(
@@ -39,6 +69,7 @@ mcp = MCPServer(
         "看采集历史和数据源健康度。**这里没有投递工具**，代投只在命令行里做，"
         "因为提交不可逆、必须人工逐字段确认。"
     ),
+    middleware=[RejectUnknownToolArguments()],
 )
 
 #: 名词短语式的工具名，白名单单列。
@@ -66,10 +97,11 @@ WRITE_VERBS = frozenset({
 
 
 #: `intent` 里允许过边界的键。见 `_intent()` 里为什么是白名单。
-INTENT_KEYS = frozenset({
-    "grad_years", "families", "cities", "recruit_types",
-    "boost_keywords", "exclude_keywords",
-})
+INTENT_KEYS = match.INTENT_KEYS
+
+PROFILE_UNAVAILABLE = (
+    "画像不可用，无法判断匹配；请检查 profile.yaml 的 intent 配置。"
+)
 
 
 def _conn() -> sqlite3.Connection:
@@ -88,7 +120,8 @@ def _intent() -> dict:
     education、internships，都不往下传、不进任何返回值。写成一个函数而不是在每个
     工具里各读一次，是为了让「敏感数据在哪儿被读进来」只有一处可看、可测。
 
-    档案不存在时返回 `{}`：匹配退化成「什么都不排除」，而不是让整个工具挂掉。
+    档案不存在或没有求职意图时向调用方抛出明确错误。调用工具负责把它翻译成
+    `matched_unavailable` / `profile_ready=False`，不能再把空画像洗成全部命中。
 
     只取 intent **还不够**，所以下面还按白名单挑了一遍键。原因是红队验出来的：
     把这里改成 `return match.load_profile()`（整份 profile 往下传），哨兵测试
@@ -100,10 +133,7 @@ def _intent() -> dict:
     白名单比「排除 identity」稳：profile 将来加一个 `contacts` 之类的段落时，
     黑名单会默认放它过去，白名单会默认拦下来。
     """
-    try:
-        raw = match.load_profile().get("intent") or {}
-    except FileNotFoundError:
-        return {}
+    raw = match.load_intent()
     return {k: v for k, v in raw.items() if k in INTENT_KEYS}
 
 
@@ -130,16 +160,32 @@ def list_jobs(
 
     返回里 `notes` 是给人看的提醒（例如 allow_missing 没生效），有内容就该转述。
     """
+    queries.validate_allow_missing(allow_missing)
+    queries.validate_positive_limit(limit)
+    intent = None
+    if matched:
+        try:
+            intent = _intent()
+        except (FileNotFoundError, ValueError):
+            return {
+                "total": 0,
+                "returned": 0,
+                "notes": [PROFILE_UNAVAILABLE],
+                "matched_unavailable": True,
+                "jobs": [],
+            }
+
     rows, notes = queries.open_jobs(
         _conn(),
         family=family, city=city, recruit_type=recruit_type, company=company,
         matched=matched, allow_missing=allow_missing,
-        intent=_intent() if matched else None,
+        intent=intent,
     )
     return {
         "total": len(rows),
         "returned": min(len(rows), limit),
         "notes": notes,
+        "matched_unavailable": False,
         "jobs": [
             {
                 "source_key": r["source_key"],
@@ -170,10 +216,9 @@ def explain_match(external_id: str, source_key: str | None = None) -> dict:
       unknown —— **信息不全，既没被排除也没被确认**，`missing` 列出缺哪几维。
                  这类要由人看一眼，不要当成不合格。
     """
+    conn = _conn()
     try:
-        out = queries.explain_match(
-            _conn(), external_id, _intent(), source_key=source_key
-        )
+        job = queries.find_job(conn, external_id, source_key=source_key)
     except queries.AmbiguousJobError as exc:
         return {
             "found": False,
@@ -182,9 +227,30 @@ def explain_match(external_id: str, source_key: str | None = None) -> dict:
             "source_keys": exc.source_keys,
             "hint": "编号来自多个来源，请把 list_jobs 返回的 source_key 一并传入。",
         }
-    if out is None:
+    if job is None:
         return {"found": False, "external_id": external_id,
                 "hint": "库里没这条。external_id 要用 list_jobs 返回的那个值。"}
+
+    try:
+        intent = _intent()
+    except (FileNotFoundError, ValueError):
+        return {
+            "found": True,
+            "profile_ready": False,
+            "source_key": job["source_key"],
+            "external_id": job["external_id"],
+            "company": job["company"],
+            "title": job["title"],
+            "state": "unknown",
+            "reason": PROFILE_UNAVAILABLE,
+            "missing": ["profile"],
+        }
+
+    out = queries.explain_match(
+        conn, external_id, intent, source_key=source_key
+    )
+    assert out is not None
+    out["profile_ready"] = True
     return {"found": True, **out}
 
 
@@ -212,6 +278,7 @@ def list_sync_runs(source_key: str | None = None, limit: int = 20) -> dict:
     `finished_at` 为 null = 这一轮没收尾（进程被杀，或正在跑）。这条痕迹是故意
     留着的，不要当成数据缺失。
     """
+    queries.validate_positive_limit(limit)
     return {"runs": queries.sync_runs(_conn(), source_key=source_key, limit=limit)}
 
 
@@ -268,6 +335,8 @@ def job_changes(
     某条事件带 `payload_raw` 说明它的 payload 存坏了解不开 —— 那是数据问题，
     不是「这次没有变动」。
     """
+    queries.validate_positive_limit(limit)
+    queries.validate_since(since)
     if kind is not None and kind not in JOB_EVENT_KINDS:
         raise ValueError(
             f"不认识的事件种类 {kind!r}，可选：{'/'.join(sorted(JOB_EVENT_KINDS))}"
