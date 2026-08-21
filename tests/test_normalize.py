@@ -681,6 +681,28 @@ class TestVocabGapWords018:
         )
 
 
+class TestSourceAwareDepartmentTail:
+    """issue #13：字节岗位名尾段是部门，不能反过来决定岗位族。"""
+
+    def test_bytedance_prefers_decidable_role_head(self) -> None:
+        title = "AI产品经理（商业化系统方向） - 飞书商业运营与策略"
+        assert family_from_title(
+            title, source_key="feishu:bytedance:campus"
+        ) == "product"
+
+    def test_bytedance_falls_back_to_full_title_when_head_is_unknown(self) -> None:
+        title = "国际化岗位 - 飞书商业运营与策略"
+        assert family_from_title(
+            title, source_key="feishu:bytedance:campus"
+        ) == "operations"
+
+    def test_other_sources_keep_full_title_semantics(self) -> None:
+        title = "AI产品经理（商业化系统方向） - 飞书商业运营与策略"
+        assert family_from_title(
+            title, source_key="feishu:nio:campus"
+        ) == "operations"
+
+
 class TestCityNormalization:
     def test_strips_headquarters_suffix(self) -> None:
         assert normalize_city("深圳总部") == "深圳"

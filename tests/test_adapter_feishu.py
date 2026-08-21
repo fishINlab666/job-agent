@@ -149,6 +149,16 @@ class TestFamilyNotBackfilled:
         _, jobs = _fetch(monkeypatch, _serve([_body([_post(title="后端开发工程师")])]))
         assert jobs[0].job_family == "tech"
 
+    def test_bytedance_department_tail_does_not_override_role(self, monkeypatch):
+        title = "AI产品经理（商业化系统方向） - 飞书商业运营与策略"
+        _, jobs = _fetch(
+            monkeypatch,
+            _serve([_body([_post(title=title)])]),
+            tenant="bytedance",
+            portal="campus",
+        )
+        assert jobs[0].job_family == "product"
+
 
 class TestBothCategoryFields:
     """两个分类字段互斥，哪个有值按租户不同 —— 都得认。
