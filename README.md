@@ -77,6 +77,25 @@ uv run python -m jobagent.cli digest
 # 标记已读
 uv run python -m jobagent.cli digest --mark
 
+# 立即跑一轮五家公司观察（腾讯、蔚来、小鹏、字节、商汤）
+uv run python -m jobagent.cli observe
+
+# 安装每天 09:30 / 14:30 / 20:30 的 macOS 自动观察
+uv run python -m jobagent.cli schedule-install
+
+# 查看三工作日观察进度；周末照常运行，但不占验收天数
+uv run python -m jobagent.cli observation-status
+
+# 每天只读预览三轮 × 五家公司的官网对照汇总
+uv run python -m jobagent.cli observation-review-day 2026-08-21
+
+# 人工逐项看完后，一次确认当天 15 份证据
+uv run python -m jobagent.cli observation-review-day 2026-08-21 \
+  --accept --reviewer "你的名字" --note "已逐项查看三轮五家公司"
+
+# 停止自动观察（历史记录和岗位数据库保留）
+uv run python -m jobagent.cli schedule-uninstall
+
 # M6: 自动投递岗位（第一个参数是源站的 external_id，不是 jobs.id）
 uv run python -m jobagent.cli apply <external_id> \
   --profile-path profile.yaml \
@@ -88,6 +107,18 @@ uv run python -m jobagent.cli applications --funnel          # 分档汇总 + �
 uv run python -m jobagent.cli applications --status blocked  # 只看被拦的
 uv run python -m jobagent.cli applications --company 蔚来     # 一家公司的全部源
 ```
+
+自动观察只访问公开招聘接口，不打开登录浏览器、不读取 `identity`、不执行投递。
+公开接口短暂超时只会在同一次运行里多试一次；仍失败时其余公司继续跑，整轮明确标红。
+失败、有岗位变化、每天 20:30 完成时会通过 macOS Notification Center 提醒；通知发送
+失败也会落库并阻止该轮冒充正式验收。电脑休眠后若延迟超过 60 分钟才补跑，记录仍保留，
+但不能冒充原计划时段。
+
+每轮定时观察还会通过独立的官方 API 路径保存完整岗位编号候选，但候选不会自动代签
+“官网已核对”。`observation-review-day` 把当天三轮 × 五家公司收成一次只读汇总；只有用户
+看完后明确加 `--accept`，系统才在一个数据库事务里写入 15 份最终证据。岗位编号集合不同、
+少一轮、少一家公司、同步失败、官网候选失败或通知失败都会拒绝确认。旧的单轮 JSON
+`observe-review` 仍保留用于诊断性手工核对，不是自动观察的推荐日常入口。
 
 **M7 是只读的**，没有任何改状态的开关：状态变更必须走 `apply` 的
 prepare/execute 两阶段闸门，从查看命令里改终态等于给那条闸门开后门。
