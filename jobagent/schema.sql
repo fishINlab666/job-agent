@@ -145,6 +145,30 @@ CREATE TABLE IF NOT EXISTS observation_sources (
 CREATE INDEX IF NOT EXISTS idx_observation_truth
     ON observation_sources(truth_status, observation_id);
 
+-- 本机通知也是观察闭环的一部分。skipped 表示按策略不打扰，不等于发送失败。
+CREATE TABLE IF NOT EXISTS observation_notifications (
+    observation_id INTEGER PRIMARY KEY REFERENCES observation_batches(id),
+    policy         TEXT NOT NULL, -- failure / changes / daily-complete / daily-incomplete / no-change
+    status         TEXT NOT NULL, -- sent / skipped / failed
+    attempted_at   TEXT NOT NULL,
+    error          TEXT
+);
+
+-- 独立官方接口生成的待审候选。它不能代签最终真值，每轮每源只保存一次。
+CREATE TABLE IF NOT EXISTS observation_truth_candidates (
+    observation_id INTEGER NOT NULL,
+    source_key     TEXT NOT NULL,
+    status         TEXT NOT NULL, -- captured / failed / skipped
+    official_url  TEXT NOT NULL,
+    captured_at   TEXT NOT NULL,
+    official_ids_json TEXT,
+    official_ids_sha256 TEXT,
+    error          TEXT,
+    PRIMARY KEY(observation_id, source_key),
+    FOREIGN KEY(observation_id, source_key)
+        REFERENCES observation_sources(observation_id, source_key)
+);
+
 -- 独立官网核对证据。保存完整官方岗位编号清单及本轮变化事件清单，不能只靠人手填
 -- “漏报=0/误报=0”代签。每个源每轮只允许一份，不覆盖历史结论。
 CREATE TABLE IF NOT EXISTS observation_truth_evidence (

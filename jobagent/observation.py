@@ -15,12 +15,12 @@ from pathlib import Path
 import sqlite3
 from typing import Callable, Iterable
 
-from . import db, ingest, routing
-from .targets import OBSERVATION_SOURCES
+from . import db, ingest, network, official_truth, routing
+from .targets import OBSERVATION_SLOTS, OBSERVATION_SOURCES
 
 
 Syncer = Callable[[object, dict], dict]
-SCHEDULE_SLOTS = ("09:30", "14:30", "20:30")
+SCHEDULE_SLOTS = OBSERVATION_SLOTS
 SCHEDULE_GRACE_MINUTES = 60
 TRUTH_CAPTURE_GRACE_MINUTES = 120
 
@@ -58,6 +58,19 @@ def _last_run_id(conn, source_key: str) -> int | None:
     return int(row["id"]) if row else None
 
 
+class _RetryingFetchAdapter:
+    """只重试 adapter.fetch；底层 ingest run 始终只有一条。"""
+
+    def __init__(self, adapter):
+        self._adapter = adapter
+
+    def __getattr__(self, name: str):
+        return getattr(self._adapter, name)
+
+    def fetch(self):
+        return network.retry_timeouts(self._adapter.fetch)
+
+
 def sync_source(conn, spec: dict) -> dict:
     """登记并同步一个已批准目标源，返回带底层 run_id 的摘要。"""
     db.register_source(
@@ -75,7 +88,7 @@ def sync_source(conn, spec: dict) -> dict:
     adapter = routing.get_adapter(
         {"source_key": spec["source_key"]}, dict(source) if source else None
     )
-    stats = ingest.sync(conn, adapter)
+    stats = ingest.sync(conn, _RetryingFetchAdapter(adapter))
     run_id = _last_run_id(conn, spec["source_key"])
     real_change_count = conn.execute(
         """SELECT COUNT(*) AS count FROM events
@@ -249,6 +262,7 @@ def record_truth(
     verified_event_ids: Iterable[int],
     note: str,
     checked_at: str | None = None,
+    commit: bool = True,
 ) -> None:
     """保存可复查的官网清单，并由程序计算漏报、误报和未核对变化。"""
     row = conn.execute(
@@ -416,10 +430,45 @@ def record_truth(
                 source_key,
             ),
         )
+        if commit:
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def accept_day(
+    conn,
+    observed_date: str,
+    *,
+    reviewer: str,
+    note: str,
+    checked_at: str | None = None,
+) -> dict:
+    """用户明确确认后，把完整 15 格在同一个事务中写成最终证据。"""
+    review = official_truth.review_day(conn, observed_date)
+    if not review["ready"]:
+        raise official_truth.ReviewNotReadyError("；".join(review["problems"]))
+    try:
+        for item in review["items"]:
+            record_truth(
+                conn,
+                item["observation_id"],
+                item["source_key"],
+                official_url=item["official_url"],
+                captured_at=item["captured_at"],
+                reviewer=reviewer,
+                official_job_ids=item["official_ids"],
+                verified_event_ids=item["verified_event_ids"],
+                note=note,
+                checked_at=checked_at,
+                commit=False,
+            )
         conn.commit()
     except Exception:
         conn.rollback()
         raise
+    return {"date": observed_date, "accepted": len(review["items"])}
 
 
 def _next_workday(day: date) -> date:
@@ -447,10 +496,26 @@ def progress(conn) -> dict:
     results_by_batch: dict[int, list[dict]] = defaultdict(list)
     for row in conn.execute("SELECT * FROM observation_sources").fetchall():
         results_by_batch[int(row["observation_id"])].append(dict(row))
-    evidence_keys = {
-        (int(row["observation_id"]), row["source_key"])
+    evidence_by_key = {
+        (int(row["observation_id"]), row["source_key"]): row
         for row in conn.execute(
-            "SELECT observation_id, source_key FROM observation_truth_evidence"
+            """SELECT observation_id, source_key, official_url, captured_at,
+                      official_ids_sha256
+               FROM observation_truth_evidence"""
+        ).fetchall()
+    }
+    candidates_by_key = {
+        (int(row["observation_id"]), row["source_key"]): row
+        for row in conn.execute(
+            """SELECT observation_id, source_key, status, official_url, captured_at,
+                      official_ids_sha256
+               FROM observation_truth_candidates"""
+        ).fetchall()
+    }
+    notifications_by_batch = {
+        int(row["observation_id"]): row
+        for row in conn.execute(
+            "SELECT observation_id, policy, status FROM observation_notifications"
         ).fetchall()
     }
 
@@ -467,14 +532,32 @@ def progress(conn) -> dict:
         for batch in slot_batches:
             assert batch is not None
             rows = results_by_batch[int(batch["id"])]
+            change_count = sum(int(row["change_count"]) for row in rows)
+            if change_count:
+                expected_notification = ("changes", "sent")
+            elif batch["slot"] == "20:30":
+                expected_notification = ("daily-complete", "sent")
+            else:
+                expected_notification = ("no-change", "skipped")
+            notification = notifications_by_batch.get(int(batch["id"]))
             if (
                 batch["status"] != "ok"
+                or notification is None
+                or (notification["policy"], notification["status"])
+                != expected_notification
                 or {row["source_key"] for row in rows} != expected_keys
                 or any(
                     row["status"] != "ok"
                     or row["truth_status"] != "verified"
                     or row["bootstrap"]
-                    or (int(batch["id"]), row["source_key"]) not in evidence_keys
+                    or not _candidate_matches_evidence(
+                        candidates_by_key.get(
+                            (int(batch["id"]), row["source_key"])
+                        ),
+                        evidence_by_key.get(
+                            (int(batch["id"]), row["source_key"])
+                        ),
+                    )
                     for row in rows
                 )
             ):
@@ -511,3 +594,12 @@ def progress(conn) -> dict:
         "qualified_dates": longest,
         "has_verified_change": has_change,
     }
+
+
+def _candidate_matches_evidence(candidate, evidence) -> bool:
+    if candidate is None or evidence is None or candidate["status"] != "captured":
+        return False
+    return all(
+        candidate[field] == evidence[field]
+        for field in ("official_url", "captured_at", "official_ids_sha256")
+    )

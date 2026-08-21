@@ -6,6 +6,9 @@
 from __future__ import annotations
 
 
+OBSERVATION_SLOTS: tuple[str, ...] = ("09:30", "14:30", "20:30")
+
+
 OBSERVATION_SOURCES: tuple[dict[str, str | None], ...] = (
     {
         "source_key": "tencent_join",

@@ -3,13 +3,26 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import date
 from pathlib import Path
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import ats, db, ingest, match, observation, profile, queries, routing, scheduler
+from . import (
+    ats,
+    db,
+    ingest,
+    match,
+    notifications,
+    observation,
+    official_truth,
+    profile,
+    queries,
+    routing,
+    scheduler,
+)
 from .targets import OBSERVATION_SOURCES
 from .submitters.base import SubmissionPlan
 
@@ -19,6 +32,10 @@ _run_observation = observation.run
 _install_observation_schedule = scheduler.install
 _uninstall_observation_schedule = scheduler.uninstall
 _observation_progress = observation.progress
+_capture_official_candidates = official_truth.capture_candidates
+_deliver_observation_notification = notifications.deliver_observation
+_review_observation_day = official_truth.review_day
+_accept_observation_day = observation.accept_day
 
 # 这里原来有两张 {source_key: cls} 表。现在注册表移到 jobagent/routing.py，
 # 键从「公司入口」换成「招聘系统」，登记动作在 adapters/ 和 submitters/ 的包
@@ -369,6 +386,8 @@ def observe(
     if trigger == "scheduled" and slot not in observation.SCHEDULE_SLOTS:
         choices = " / ".join(observation.SCHEDULE_SLOTS)
         raise typer.BadParameter(f"定时观察只允许 {choices}")
+    candidate_report = None
+    notification_result = None
     try:
         with observation.exclusive_run(db_path or db.DB_PATH):
             conn = db.connect(db_path)
@@ -380,6 +399,16 @@ def observe(
                     trigger=trigger,
                     slot=slot,
                 )
+                if trigger == "scheduled":
+                    candidate_report = _capture_official_candidates(
+                        conn, report, OBSERVATION_SOURCES
+                    )
+                    notification_report = report
+                    if candidate_report["status"] != "ok":
+                        notification_report = {**report, "status": "partial"}
+                    notification_result = _deliver_observation_notification(
+                        conn, notification_report, slot=slot
+                    )
             finally:
                 conn.close()
     except (observation.AlreadyRunningError, observation.DuplicateObservationError) as exc:
@@ -406,8 +435,28 @@ def observe(
             f" · 新增 {result['opened']} · 变更 {result['updated']}"
             f" · 关闭 {result['closed']} · {result['status']}{baseline}"
         )
-    console.print("[dim]官网核对状态：待确认；未核对不计入连续工作日验收。[/dim]")
-    if report["status"] != "ok":
+    if candidate_report is not None:
+        for result in candidate_report["results"]:
+            if result["status"] != "captured":
+                console.print(
+                    f"  [red]官网候选失败[/red] {result['source_key']}：{result['error']}"
+                )
+        if candidate_report["status"] == "ok":
+            console.print("[dim]官网候选已保存；仍需每日人工确认，不能自动代签。[/dim]")
+    else:
+        console.print("[dim]手工观察不生成官网验收候选。[/dim]")
+    if notification_result is not None and notification_result["status"] == "failed":
+        console.print(
+            f"[red]本机通知失败[/red]：{notification_result['error']}"
+        )
+    if (
+        report["status"] != "ok"
+        or (candidate_report is not None and candidate_report["status"] != "ok")
+        or (
+            notification_result is not None
+            and notification_result["status"] == "failed"
+        )
+    ):
         raise typer.Exit(1)
 
 
@@ -436,6 +485,16 @@ def observe_review(
     conn = db.connect(db_path)
     db.init(conn)
     try:
+        batch = conn.execute(
+            "SELECT trigger FROM observation_batches WHERE id=?",
+            (observation_id,),
+        ).fetchone()
+        if batch is not None and batch["trigger"] == "scheduled":
+            console.print(
+                "[red]定时观察不能逐公司确认。[/red]"
+                "请使用 observation-review-day 一次核对当天 15 份证据。"
+            )
+            raise typer.Exit(1)
         observation.record_truth(
             conn,
             observation_id,
@@ -482,6 +541,64 @@ def observation_status(
         )
     else:
         console.print("[dim]观察窗口仍在累计。周末记录保留但不占工作日名额。[/dim]")
+
+
+@app.command(name="observation-review-day")
+def observation_review_day(
+    observed_date: str = typer.Argument(..., help="要核对的工作日（YYYY-MM-DD）"),
+    db_path: Path | None = typer.Option(None, "--db", help="观察数据库路径"),
+    accept: bool = typer.Option(False, "--accept", help="明确确认并一次写入 15 份证据"),
+    reviewer: str = typer.Option("", "--reviewer", help="确认人"),
+    note: str = typer.Option("", "--note", help="确认说明"),
+) -> None:
+    """预览一天的官网清单；只有 --accept 才写最终验收证据。"""
+    try:
+        date.fromisoformat(observed_date)
+    except ValueError as exc:
+        raise typer.BadParameter("日期必须是 YYYY-MM-DD") from exc
+    if accept and (not reviewer.strip() or not note.strip()):
+        raise typer.BadParameter("--accept 必须同时提供 --reviewer 和 --note")
+
+    path = db_path or db.DB_PATH
+    conn = db.connect(path) if accept else db.connect_readonly(path)
+    try:
+        if accept:
+            db.init(conn)
+        review = _review_observation_day(conn, observed_date)
+        for item in review["items"]:
+            count = item.get("official_count", "?")
+            digest = item.get("official_ids_sha256", "")[:12] or "未提供"
+            console.print(
+                f"  {item['slot']} · {item['company']} · "
+                f"官网/系统 {count}/{item.get('system_count', '?')} · "
+                f"清单摘要 {digest} · 变化 {item['change_count']} 条"
+            )
+            for event in item.get("events", []):
+                label = event.get("title") or event.get("external_id") or "未知岗位"
+                console.print(
+                    f"    变化 #{event['id']} · {event['kind']} · {label}"
+                )
+        if not review["ready"]:
+            for problem in review["problems"]:
+                console.print(f"[red]未就绪[/red] {problem}")
+            raise typer.Exit(1)
+        if not accept:
+            console.print(
+                "[green]当天 15 份官网候选可以确认。[/green]"
+                "当前只是预览，尚未写入最终验收。"
+            )
+            return
+        result = _accept_observation_day(
+            conn,
+            observed_date,
+            reviewer=reviewer.strip(),
+            note=note.strip(),
+        )
+    finally:
+        conn.close()
+    console.print(
+        f"[green]每日官网核对已确认[/green] · {result['accepted']} 份证据"
+    )
 
 
 @app.command(name="schedule-install")
