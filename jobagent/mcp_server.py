@@ -238,6 +238,7 @@ def list_sync_runs(source_key: str | None = None, limit: int = 20) -> dict:
 JOB_EVENT_KINDS = frozenset({
     "job_opened", "job_closed", "job_updated", "source_bootstrapped",
     "job_reopened", "family_first_seen", "batch_started",
+    "source_degraded", "source_sync_failed",
 })
 
 #: 这一层**永远**排除的事件种类，随 `job_changes` 的返回值一起交出去。
@@ -252,11 +253,12 @@ EXCLUDED_KINDS = ("apply_*",)
 def job_changes(
     kind: str | None = None, since: str | None = None, limit: int = 50
 ) -> dict:
-    """岗位变动事件：新开、关闭、改动、复活、某族首现、批次启动、某个源首次接入。
+    """岗位变动事件：新开、关闭、改动、复活、岗位族/批次、源接入与源异常。
 
     kind: job_opened / job_closed / job_updated / job_reopened / family_first_seen
-    / batch_started / source_bootstrapped。**省略则给全部采集侧事件 —— 不是这张表
-    的全部。** 返回值里的 `excluded_kinds` 写明了差在哪。
+    / batch_started / source_bootstrapped / source_degraded / source_sync_failed。
+    **省略则给全部采集侧事件 —— 不是这张表的全部。** 返回值里的
+    `excluded_kinds` 写明了差在哪。
     since: ISO 时间字符串，只看这之后的。
 
     **只有采集侧的事件。** 投递记录不在这一层 —— 代投全程在命令行里做，

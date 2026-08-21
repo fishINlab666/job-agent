@@ -241,3 +241,58 @@ class TestNoCrashMeansNoWedge:
             "SELECT COUNT(*) n FROM events WHERE notified_at IS NULL"
         ).fetchone()["n"]
         assert pending_after == 0, "渲染没崩，但 notified_at 没写进去"
+
+
+class TestSourceHealthAlerts:
+    """源坏了必须比“没有新增”更早、更明确地告诉用户。"""
+
+    def test_close_guard_alert_does_not_need_profile(
+        self, env, capsys
+    ) -> None:
+        ingest.sync(env, FakeAdapter([make_job(str(i)) for i in range(10)]))
+        env.execute("UPDATE events SET notified_at=?", (db.now(),))
+        env.commit()
+        ingest.sync(env, FakeAdapter([make_job("0"), make_job("1")]))
+        match.PROFILE_PATH.unlink()
+
+        cli.digest(mark=False)
+        out = capsys.readouterr().out
+
+        assert "数据源异常" in out
+        assert "8/10" in out
+        assert "暂停关闭" in out
+        assert "没有新增" not in out
+
+    def test_sync_failure_alert_does_not_need_profile(
+        self, env, capsys
+    ) -> None:
+        with pytest.raises(RuntimeError):
+            ingest.sync(env, FakeAdapter([]))
+        match.PROFILE_PATH.unlink()
+
+        cli.digest(mark=False)
+        out = capsys.readouterr().out
+
+        assert "同步失败" in out
+        assert "返回 0 条" in out
+        assert "没有新增" not in out
+
+    def test_mixed_queue_marks_alert_but_keeps_job_pending_without_profile(
+        self, env, capsys
+    ) -> None:
+        ingest.sync(env, FakeAdapter([make_job(str(i)) for i in range(10)]))
+        env.execute("UPDATE events SET notified_at=?", (db.now(),))
+        env.commit()
+        # 一条新岗位事件 + 大批消失告警同时进入待通知队列。
+        ingest.sync(env, FakeAdapter([make_job("0"), make_job("new")]))
+        match.PROFILE_PATH.unlink()
+
+        cli.digest(mark=True)
+        out = capsys.readouterr().out
+
+        assert "数据源异常" in out
+        assert "画像" in out and "岗位提醒" in out
+        pending = env.execute(
+            "SELECT kind FROM events WHERE notified_at IS NULL ORDER BY id"
+        ).fetchall()
+        assert [row["kind"] for row in pending] == ["job_opened"]

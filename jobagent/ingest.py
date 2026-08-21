@@ -504,6 +504,19 @@ def sync(conn, adapter: Adapter, *, dry_run: bool = False) -> dict:
             f"超过阈值 {CLOSE_GUARD_RATIO:.0%}，本轮不执行关闭"
             if guard else None
         )
+        if guard:
+            db.add_event(
+                conn,
+                "source_degraded",
+                source_key=adapter.source_key,
+                company=adapter.company,
+                payload={
+                    "disappeared": len(disappeared),
+                    "live_before": len(live_before),
+                    "error": err,
+                },
+                run_id=run_id,
+            )
         if dry_run:
             conn.rollback()
         else:
@@ -512,7 +525,30 @@ def sync(conn, adapter: Adapter, *, dry_run: bool = False) -> dict:
         # 业务数据先退，再写痕迹 —— 顺序是硬的：主连接还持着写事务时
         # 侧连接写 runs 会撞 database is locked。
         conn.rollback()
-        db.finish_run(side, run_id, "failed", 0, str(exc))
+        error = str(exc)
+        if write:
+            try:
+                db.add_event(
+                    side,
+                    "source_sync_failed",
+                    source_key=adapter.source_key,
+                    company=adapter.company,
+                    payload={"error": error},
+                    run_id=run_id,
+                )
+                db.finish_run(side, run_id, "failed", 0, error)
+            except Exception as record_exc:
+                # 告警链自己坏了不能遮住真正的采集错误。先撤掉可能只写了一半的
+                # 告警，再尽力把 run 收成 failed；无论二次留痕是否成功，最后都
+                # 重新抛最初的 exc，而不是 record_exc。
+                side.rollback()
+                fallback_error = f"{error}；失败告警未写入：{record_exc}"
+                try:
+                    db.finish_run(side, run_id, "failed", 0, fallback_error)
+                except Exception:
+                    side.rollback()
+        else:
+            db.finish_run(side, run_id, "failed", 0, error)
         raise
     else:
         db.finish_run(side, run_id, status, len(jobs), err)
