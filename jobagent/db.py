@@ -33,6 +33,16 @@ SOURCE_COLUMNS: list[tuple[str, str]] = [
     ("apply_limit", "INTEGER"),
 ]
 
+# 自动观察候选曾在本地生成过不含准点标记的数据库。真实发布前把这条迁移也保留，
+# 避免已有观察记录因为 CREATE TABLE IF NOT EXISTS 不补列而无法继续使用。
+OBSERVATION_BATCH_COLUMNS: list[tuple[str, str]] = [
+    ("on_time", "INTEGER NOT NULL DEFAULT 0"),
+]
+
+OBSERVATION_SOURCE_COLUMNS: list[tuple[str, str]] = [
+    ("unverified_change_count", "INTEGER"),
+]
+
 # 哪些终态算「名额已经花掉了」。判据是**提交按钮点没点下去**，不是投成没投成：
 #   submitted  源站确认收到，肯定占用
 #   duplicate  源站说投过了，说明之前那次占用了
@@ -103,12 +113,50 @@ def migrate(conn: sqlite3.Connection) -> list[str]:
     同一件事必然对不上账，所以合回 applications，submissions 里的数据搬过去。
     """
     done: list[str] = []
-    for table, cols in (("applications", APPLICATION_COLUMNS), ("sources", SOURCE_COLUMNS)):
+    for table, cols in (
+        ("applications", APPLICATION_COLUMNS),
+        ("sources", SOURCE_COLUMNS),
+        ("observation_batches", OBSERVATION_BATCH_COLUMNS),
+        ("observation_sources", OBSERVATION_SOURCE_COLUMNS),
+    ):
         have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         for col, decl in cols:
             if col not in have:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
                 done.append(f"{table} += {col}")
+
+    # 早期自动观察候选允许同一工作日/时段串行重跑。历史不删除；重复组全部标成
+    # 不参与验收，也不替它们选“赢家”。只有唯一的旧批次才补进稳定时段占位表。
+    conn.execute("DROP INDEX IF EXISTS idx_observation_scheduled_slot")
+    duplicate_slots = conn.execute(
+        """SELECT observed_date, slot
+           FROM observation_batches
+           WHERE trigger='scheduled'
+           GROUP BY observed_date, slot HAVING COUNT(*) > 1"""
+    ).fetchall()
+    invalidated_groups = 0
+    for observed_date, slot in duplicate_slots:
+        changed = conn.execute(
+            """UPDATE observation_batches SET on_time=0
+               WHERE trigger='scheduled' AND observed_date=? AND slot=? AND on_time!=0""",
+            (observed_date, slot),
+        ).rowcount
+        removed_claims = conn.execute(
+            """DELETE FROM observation_slot_claims
+               WHERE observed_date=? AND slot=?""",
+            (observed_date, slot),
+        ).rowcount
+        invalidated_groups += int(bool(changed or removed_claims))
+    if invalidated_groups:
+        done.append(f"重复自动观察时段 {invalidated_groups} 组已保守失效")
+    conn.execute(
+        """INSERT OR IGNORE INTO observation_slot_claims(
+               observed_date, slot, observation_id)
+           SELECT observed_date, slot, MIN(id)
+           FROM observation_batches
+           WHERE trigger='scheduled'
+           GROUP BY observed_date, slot HAVING COUNT(*)=1"""
+    )
 
     # 索引建在补列之后：老库缺列时 schema.sql 里的索引语句会失败
     conn.execute(

@@ -96,6 +96,80 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_pending ON events(notified_at, occurred_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind, occurred_at DESC);
 
+-- 自动观察：一轮包含五个源；runs 仍保存每个源的底层采集证据，这两张表只负责
+-- 把它们收成用户能判断的「今天这轮是否完整、官网是否已经核对」。
+CREATE TABLE IF NOT EXISTS observation_batches (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at  TEXT NOT NULL,
+    finished_at TEXT,
+    observed_date TEXT NOT NULL,
+    trigger     TEXT NOT NULL,       -- manual / scheduled
+    slot        TEXT NOT NULL,       -- manual / 09:30 / 14:30 / 20:30
+    is_workday  INTEGER NOT NULL,    -- 周一至周五为 1；法定节假日由验收时排除
+    on_time     INTEGER NOT NULL,    -- 在计划时刻后 60 分钟内启动才算该时段有效
+    status      TEXT NOT NULL        -- running / ok / partial / failed
+);
+CREATE INDEX IF NOT EXISTS idx_observation_date
+    ON observation_batches(observed_date, slot);
+
+-- 计划时段的唯一占位。单独建表而不是在历史批次上加 UNIQUE：早期候选允许同一
+-- 时段重跑，直接建唯一索引会让带旧数据的数据库连迁移都无法启动。
+CREATE TABLE IF NOT EXISTS observation_slot_claims (
+    observed_date TEXT NOT NULL,
+    slot          TEXT NOT NULL,
+    observation_id INTEGER NOT NULL UNIQUE REFERENCES observation_batches(id),
+    PRIMARY KEY(observed_date, slot)
+);
+
+CREATE TABLE IF NOT EXISTS observation_sources (
+    observation_id INTEGER NOT NULL REFERENCES observation_batches(id),
+    source_key     TEXT NOT NULL,
+    company        TEXT NOT NULL,
+    run_id         INTEGER REFERENCES runs(id),
+    status         TEXT NOT NULL,    -- ok / partial / failed
+    bootstrap      INTEGER NOT NULL DEFAULT 0,
+    fetched        INTEGER NOT NULL DEFAULT 0,
+    opened         INTEGER NOT NULL DEFAULT 0,
+    updated        INTEGER NOT NULL DEFAULT 0,
+    closed         INTEGER NOT NULL DEFAULT 0,
+    change_count   INTEGER NOT NULL DEFAULT 0,
+    error          TEXT,
+    truth_status   TEXT NOT NULL DEFAULT 'pending', -- pending / verified / mismatch
+    missed_count   INTEGER,
+    false_positive_count INTEGER,
+    unverified_change_count INTEGER,
+    checked_at     TEXT,
+    truth_note     TEXT,
+    PRIMARY KEY(observation_id, source_key)
+);
+CREATE INDEX IF NOT EXISTS idx_observation_truth
+    ON observation_sources(truth_status, observation_id);
+
+-- 独立官网核对证据。保存完整官方岗位编号清单及本轮变化事件清单，不能只靠人手填
+-- “漏报=0/误报=0”代签。每个源每轮只允许一份，不覆盖历史结论。
+CREATE TABLE IF NOT EXISTS observation_truth_evidence (
+    observation_id INTEGER NOT NULL,
+    source_key     TEXT NOT NULL,
+    official_url  TEXT NOT NULL,
+    captured_at   TEXT NOT NULL,
+    reviewer      TEXT NOT NULL,
+    official_ids_json TEXT NOT NULL,
+    official_ids_sha256 TEXT NOT NULL,
+    system_ids_sha256 TEXT NOT NULL,
+    missed_ids_json TEXT NOT NULL,
+    false_positive_ids_json TEXT NOT NULL,
+    change_event_ids_json TEXT NOT NULL,
+    verified_event_ids_json TEXT NOT NULL,
+    unverified_event_ids_json TEXT NOT NULL,
+    unexpected_event_ids_json TEXT NOT NULL,
+    checked_at    TEXT NOT NULL,
+    note          TEXT NOT NULL,
+    evidence_sha256 TEXT NOT NULL UNIQUE,
+    PRIMARY KEY(observation_id, source_key),
+    FOREIGN KEY(observation_id, source_key)
+        REFERENCES observation_sources(observation_id, source_key)
+);
+
 -- 投递记录：代投的副产品
 -- 两阶段代投的两半都记在这张表里：
 --   prepare 成功 → prefilled（表填好了，等人确认）

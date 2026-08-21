@@ -77,6 +77,18 @@ uv run python -m jobagent.cli digest
 # 标记已读
 uv run python -m jobagent.cli digest --mark
 
+# 立即跑一轮五家公司观察（腾讯、蔚来、小鹏、字节、商汤）
+uv run python -m jobagent.cli observe
+
+# 安装每天 09:30 / 14:30 / 20:30 的 macOS 自动观察
+uv run python -m jobagent.cli schedule-install
+
+# 查看三工作日观察进度；周末照常运行，但不占验收天数
+uv run python -m jobagent.cli observation-status
+
+# 停止自动观察（历史记录和岗位数据库保留）
+uv run python -m jobagent.cli schedule-uninstall
+
 # M6: 自动投递岗位（第一个参数是源站的 external_id，不是 jobs.id）
 uv run python -m jobagent.cli apply <external_id> \
   --profile-path profile.yaml \
@@ -88,6 +100,16 @@ uv run python -m jobagent.cli applications --funnel          # 分档汇总 + �
 uv run python -m jobagent.cli applications --status blocked  # 只看被拦的
 uv run python -m jobagent.cli applications --company 蔚来     # 一家公司的全部源
 ```
+
+自动观察只访问公开招聘接口，不打开登录浏览器、不读取 `identity`、不执行投递。
+单家公司失败时其余公司继续跑，但整轮返回失败状态并指出具体公司；未完成同期官网核对的
+轮次不会被计入连续三工作日验收。电脑休眠后若延迟超过 60 分钟才补跑，记录仍保留，
+但不能冒充原计划时段。官网核对通过 JSON 证据文件录入，文件至少包含固定
+`source_key`、`official_url`、采集时间、核对者、官网完整岗位编号清单、已逐项核对的
+变化事件编号和说明；系统自行计算漏报、误报，不能手填两个零代签。录入命令为
+`observe-review <轮次> <source_key> --evidence <证据.json>`，JSON 字段名依次是
+`source_key`、`official_url`、`captured_at`、`reviewer`、`external_ids`、
+`verified_event_ids`、`note`。
 
 **M7 是只读的**，没有任何改状态的开关：状态变更必须走 `apply` 的
 prepare/execute 两阶段闸门，从查看命令里改终态等于给那条闸门开后门。

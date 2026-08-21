@@ -73,6 +73,7 @@ from rich.table import Table
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from jobagent import db, ingest, routing  # noqa: E402
+from jobagent.targets import OBSERVATION_SOURCES  # noqa: E402
 
 console = Console()
 app = typer.Typer(add_completion=False)
@@ -80,51 +81,8 @@ app = typer.Typer(add_completion=False)
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = ROOT / "data" / "jobagent-5.db"
 
-SOURCES: list[dict] = [
-    {
-        "source_key": "tencent_join",
-        "company": "腾讯",
-        "system": "tencent_join",
-        "entry_url": "https://join.qq.com/post.html",
-        "tenant": None,
-    },
-    # 门户在 source_key 第三段里（`routing.portal_of` 取它），不另开一列 ——
-    # 这个键就是判据本身，也是关闭守卫的分母边界。见 003 §6。
-    {
-        "source_key": "feishu:nio:campus",
-        "company": "蔚来",
-        "system": "feishu",
-        # entry_url 带门户路径：这一列是给核对的人点开的，指到租户首页
-        # 会让他看到社招列表，然后以为我们采错了。
-        "entry_url": "https://nio.jobs.feishu.cn/campus/",
-        "tenant": "nio",
-    },
-    {
-        "source_key": "feishu:xiaopeng:campus",
-        "company": "小鹏汽车",
-        "system": "feishu",
-        # 用户给的入口是子门户 /398875（335 条），campus 是它的父门户（436 条）
-        # 且完全包含它。采父门户，核对时以官网 campus 那一页为准。
-        "entry_url": "https://xiaopeng.jobs.feishu.cn/campus/",
-        "tenant": "xiaopeng",
-    },
-    {
-        "source_key": "feishu:bytedance:campus",
-        "company": "字节跳动",
-        "system": "feishu",
-        "entry_url": "https://bytedance.jobs.feishu.cn/campus/",
-        "tenant": "bytedance",
-    },
-    {
-        "source_key": "feishu:sensetime:edu",
-        "company": "商汤科技",
-        "system": "feishu",
-        # 自定义域名。host 从这一列取（`routing.get_adapter` 读 entry_url），
-        # 不从岗位链接里现推 —— 那等于放宽域名判据。
-        "entry_url": "https://hr-jobs.sensetime.com/edu/",
-        "tenant": "sensetime",
-    },
-]
+# 实测脚本与生产观察共用同一份公司池；入口、租户和门户不允许各抄一份。
+SOURCES = OBSERVATION_SOURCES
 
 # 试过但没留在清单里的租户，记在这儿免得下一个人再探一遍。
 # 探法是**看页面标题自称什么**，不是猜租户名 —— 猜 slug 那一轮 18 个里 16 个
