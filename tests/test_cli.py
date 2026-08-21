@@ -411,7 +411,7 @@ class TestApplications:
             "排序用了 submitted_at"
 
     def test_funnel_buckets_all_statuses(self, tmp_db) -> None:
-        """7 个状态各自归到正确的档，尤其 duplicate/closed 不算失败。
+        """所有已知状态各自归档，尤其 duplicate/closed 不算结果未知。
 
         把它们混进失败档会让「代投不好用」这个结论凭空多出两类本来正常的
         记录：duplicate 是「已经投过了」，closed 是「岗位关了」。
@@ -422,10 +422,11 @@ class TestApplications:
         r = runner.invoke(cli.app, ["applications", "--funnel"])
 
         assert r.exit_code == 0, r.output
-        assert "警告" not in r.output, "7 个已知状态不该触发未知告警"
-        # 失败档只该有 failed 那 1 条；duplicate+closed 归在无需投递（2 条）
-        lines = [ln for ln in r.output.splitlines() if "失败" in ln]
-        assert lines and "1" in lines[0], lines
+        assert "警告" not in r.output, "已知状态不该触发未知告警"
+        # 新 unknown 与历史 failed 都要求人工核对，不能诱导自动重试；
+        # duplicate+closed 仍归在无需投递（2 条）。
+        lines = [ln for ln in r.output.splitlines() if "结果未知" in ln]
+        assert lines and "2" in lines[0], lines
         no_need = [ln for ln in r.output.splitlines() if "无需投递" in ln]
         assert no_need and "2" in no_need[0], no_need
 

@@ -88,6 +88,9 @@ class SubmissionPlan(BaseModel):
     apply_url: str = ""
     status: Literal["ready", "blocked"] = "ready"
     blocker: str | None = None
+    # ready 计划也可能有需要用户在确认前看见的风险，例如页面改版后某些字段
+    # 找不到。它们不是硬阻断，不能塞进 blocker 后被 ready 分支静默吞掉。
+    warnings: list[str] = Field(default_factory=list)
     fields: list[FieldPlan] = Field(default_factory=list)
     screenshot_path: str | None = None
     confirm_token: str = ""

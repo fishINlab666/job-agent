@@ -12,11 +12,13 @@
 from __future__ import annotations
 
 import itertools
+import time
 
 import pytest
 from typer.testing import CliRunner
 
 from jobagent import cli, db
+from jobagent.submitters.base import SubmissionPlan, SubmissionResult
 
 runner = CliRunner()
 
@@ -80,13 +82,117 @@ class TestConsumingStatuses:
         used, _ = db.quota_state(tmp_db, "A公司")
         assert used == 1
 
-    def test_pre_click_statuses_do_not_consume(self, tmp_db):
-        """没点到提交的那些不算：blocked/prefilled/abandoned 停在确认环节，
-        closed 是源站以岗位已关为由拒收、没落单。"""
-        for st in ("prefilled", "blocked", "abandoned", "closed"):
+    def test_released_pre_click_statuses_do_not_consume(self, tmp_db):
+        """明确被拦或放弃已经释放占位，不再占额度。"""
+        for st in ("blocked", "abandoned"):
             add_app(tmp_db, "A公司", st)
         used, _ = db.quota_state(tmp_db, "A公司")
         assert used == 0
+
+    def test_inflight_and_postclick_unknown_statuses_consume(self, tmp_db):
+        """占位后到结果确认前都按可能占用处理；closed 也发生在点击之后。"""
+        for st in ("reserved", "prefilled", "submitting", "closed", "unknown"):
+            add_app(tmp_db, "A公司", st)
+        used, _ = db.quota_state(tmp_db, "A公司")
+        assert used == 5
+
+
+class TestApplicationReservation:
+    def _seed_job(
+        self, conn, external_id: str, *, company: str = "A公司", limit: int | None = None
+    ) -> int:
+        source_key = f"source:{external_id}"
+        db.register_source(
+            conn, source_key, company, "feishu", "https://example.com/jobs",
+            apply_limit=limit,
+        )
+        cur = conn.execute(
+            """INSERT INTO jobs(source_key, external_id, company, title,
+                   fingerprint, first_seen_at, last_seen_at)
+               VALUES(?,?,?,'岗位','fp',?,?)""",
+            (source_key, external_id, company, db.now(), db.now()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+    def _reserve(self, conn, job_id: int, external_id: str, **kwargs):
+        return db.reserve_application(
+            conn,
+            job_id=job_id,
+            source_key=f"source:{external_id}",
+            external_id=external_id,
+            company="A公司",
+            **kwargs,
+        )
+
+    def test_reservation_claims_the_only_quota_slot(self, tmp_db):
+        first_job = self._seed_job(tmp_db, "J1", limit=1)
+        second_job = self._seed_job(tmp_db, "J2", limit=1)
+
+        first = self._reserve(tmp_db, first_job, "J1")
+
+        assert first.used == 0 and first.limit == 1
+        with pytest.raises(db.QuotaExceeded):
+            self._reserve(tmp_db, second_job, "J2")
+        rows = tmp_db.execute(
+            "SELECT external_id, status FROM applications ORDER BY id"
+        ).fetchall()
+        assert [(row["external_id"], row["status"]) for row in rows] == [
+            ("J1", "reserved")
+        ]
+
+    def test_same_job_needs_explicit_repeat_after_terminal_attempt(self, tmp_db):
+        job_id = self._seed_job(tmp_db, "J1")
+        first = self._reserve(tmp_db, job_id, "J1")
+        db.transition_application(
+            tmp_db, first.app_id, expected_status="reserved", status="submitted"
+        )
+
+        with pytest.raises(db.DuplicateApplication):
+            self._reserve(tmp_db, job_id, "J1")
+
+        retry = self._reserve(tmp_db, job_id, "J1", allow_repeat=True)
+        assert retry.app_id != first.app_id
+
+    def test_inflight_attempt_cannot_be_overridden(self, tmp_db):
+        job_id = self._seed_job(tmp_db, "J1")
+        self._reserve(tmp_db, job_id, "J1")
+
+        with pytest.raises(db.ApplicationInProgress):
+            self._reserve(tmp_db, job_id, "J1", allow_repeat=True)
+
+    def test_older_inflight_attempt_still_blocks_when_a_newer_terminal_row_exists(
+        self, tmp_db
+    ):
+        """历史脏数据里即使后面又有终态，旧进行中记录也不能被 --again 绕过。"""
+        job_id = self._seed_job(tmp_db, "J1")
+        self._reserve(tmp_db, job_id, "J1")
+        tmp_db.execute(
+            """INSERT INTO applications(
+                   job_id, source_key, external_id, company, status, created_at)
+               VALUES(?,'source:J1','J1','A公司','failed',?)""",
+            (job_id, db.now()),
+        )
+        tmp_db.commit()
+
+        with pytest.raises(db.ApplicationInProgress):
+            self._reserve(tmp_db, job_id, "J1", allow_repeat=True)
+
+    def test_transition_requires_the_expected_state(self, tmp_db):
+        job_id = self._seed_job(tmp_db, "J1")
+        reservation = self._reserve(tmp_db, job_id, "J1")
+
+        with pytest.raises(db.ApplicationStateError):
+            db.transition_application(
+                tmp_db,
+                reservation.app_id,
+                expected_status="prefilled",
+                status="submitting",
+            )
+        status = tmp_db.execute(
+            "SELECT status FROM applications WHERE id=?", (reservation.app_id,)
+        ).fetchone()["status"]
+        assert status == "reserved"
 
 
 class TestCountedByCompany:
@@ -219,3 +325,346 @@ class TestApplyGate:
         r = runner.invoke(cli.app, ["apply", "J1", "--profile-path", str(prof)])
         assert "额度 1/2" in r.output
         assert "投递上限" not in r.output
+
+
+class TestSafeApplyWorkflow:
+    def _seed_job(self, conn, external_id: str = "J1") -> int:
+        db.register_source(
+            conn,
+            "tencent_join",
+            "A公司",
+            "tencent_join",
+            "https://join.qq.com/post.html",
+        )
+        cur = conn.execute(
+            """INSERT INTO jobs(source_key, external_id, company, title,
+                   apply_url, apply_system, fingerprint, first_seen_at, last_seen_at)
+               VALUES('tencent_join',?,'A公司','产品运营','https://join.qq.com/x',
+                      'tencent_join','fp',?,?)""",
+            (external_id, db.now(), db.now()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+    def _profile(self, tmp_path):
+        path = tmp_path / "profile.yaml"
+        path.write_text(
+            "name: 测试用户\nphone: '13800000000'\nemail: test@example.com\n",
+            encoding="utf-8",
+        )
+        return path
+
+    @staticmethod
+    def _plan(*, status="ready", blocker=None, warnings=None):
+        return SubmissionPlan(
+            job_id="J1",
+            source_key="tencent_join",
+            company="A公司",
+            title="产品运营",
+            status=status,
+            blocker=blocker,
+            warnings=warnings or [],
+            confirm_token="tok-1" if status == "ready" else "",
+            expires_at=time.time() + 300,
+        )
+
+    def test_reserves_before_prepare_and_reuses_the_same_row_when_blocked(
+        self, tmp_db, tmp_path, monkeypatch
+    ):
+        self._seed_job(tmp_db)
+
+        class InspectingSubmitter:
+            def prepare(inner_self, _job, _form):
+                rows = tmp_db.execute(
+                    "SELECT id, status FROM applications WHERE external_id='J1'"
+                ).fetchall()
+                assert [row["status"] for row in rows] == ["reserved"]
+                return self._plan(status="blocked", blocker="需要登录")
+
+        monkeypatch.setattr(cli.routing, "get_submitter", lambda *_a, **_k: InspectingSubmitter())
+        result = runner.invoke(
+            cli.app,
+            ["apply", "J1", "--profile-path", str(self._profile(tmp_path))],
+        )
+
+        rows = tmp_db.execute(
+            "SELECT status, error FROM applications WHERE external_id='J1'"
+        ).fetchall()
+        assert [(row["status"], row["error"]) for row in rows] == [
+            ("blocked", "需要登录")
+        ]
+        assert result.exit_code == 1
+
+    def test_existing_attempt_is_blocked_before_prepare(
+        self, tmp_db, tmp_path, monkeypatch
+    ):
+        job_id = self._seed_job(tmp_db)
+        tmp_db.execute(
+            """INSERT INTO applications(
+                   job_id, source_key, external_id, company, status, created_at)
+               VALUES(?,'tencent_join','J1','A公司','submitted',?)""",
+            (job_id, db.now()),
+        )
+        tmp_db.commit()
+
+        class MustNotPrepare:
+            def prepare(self, *_a, **_k):
+                raise AssertionError("已有投递记录时不应打开浏览器")
+
+        monkeypatch.setattr(cli.routing, "get_submitter", lambda *_a, **_k: MustNotPrepare())
+        result = runner.invoke(
+            cli.app,
+            ["apply", "J1", "--profile-path", str(self._profile(tmp_path))],
+        )
+
+        assert result.exit_code == 1
+        assert "已有投递记录" in result.output
+        assert not isinstance(result.exception, AssertionError)
+
+    def test_again_is_the_only_explicit_repeat_path(
+        self, tmp_db, tmp_path, monkeypatch
+    ):
+        job_id = self._seed_job(tmp_db)
+        tmp_db.execute(
+            """INSERT INTO applications(
+                   job_id, source_key, external_id, company, status, created_at)
+               VALUES(?,'tencent_join','J1','A公司','submitted',?)""",
+            (job_id, db.now()),
+        )
+        tmp_db.commit()
+        called = []
+
+        class RepeatSubmitter:
+            def prepare(inner_self, *_a, **_k):
+                called.append("prepare")
+                return self._plan(status="blocked", blocker="测试到此停止")
+
+        monkeypatch.setattr(cli.routing, "get_submitter", lambda *_a, **_k: RepeatSubmitter())
+        result = runner.invoke(
+            cli.app,
+            [
+                "apply", "J1", "--again",
+                "--profile-path", str(self._profile(tmp_path)),
+            ],
+        )
+
+        assert called == ["prepare"]
+        assert "未知选项" not in result.output
+
+    def test_ready_warning_is_visible_before_confirmation(
+        self, tmp_db, tmp_path, monkeypatch
+    ):
+        self._seed_job(tmp_db)
+        plan = self._plan(warnings=["这些字段没找到，已跳过：邮箱"])
+
+        class WarningSubmitter:
+            def prepare(self, *_a, **_k):
+                return plan
+
+            def discard(self, _token):
+                return None
+
+        monkeypatch.setattr(cli.routing, "get_submitter", lambda *_a, **_k: WarningSubmitter())
+        result = runner.invoke(
+            cli.app,
+            ["apply", "J1", "--profile-path", str(self._profile(tmp_path))],
+            input="n\n",
+        )
+
+        assert "这些字段没找到，已跳过：邮箱" in result.output
+
+    def test_failed_execute_is_persisted_and_shown_as_unknown(
+        self, tmp_db, tmp_path, monkeypatch
+    ):
+        self._seed_job(tmp_db)
+
+        class FailedSubmitter:
+            def prepare(inner_self, *_a, **_k):
+                return self._plan()
+
+            def execute(inner_self, _token):
+                return SubmissionResult(
+                    status="failed", job_id="J1", company="A公司",
+                    error="提交后没有识别到稳定结果",
+                )
+
+        monkeypatch.setattr(cli.routing, "get_submitter", lambda *_a, **_k: FailedSubmitter())
+        result = runner.invoke(
+            cli.app,
+            ["apply", "J1", "--profile-path", str(self._profile(tmp_path))],
+            input="y\n",
+        )
+
+        row = tmp_db.execute(
+            "SELECT status FROM applications WHERE external_id='J1'"
+        ).fetchone()
+        assert row["status"] == "unknown"
+        events = tmp_db.execute(
+            "SELECT kind FROM events WHERE job_id IS NOT NULL ORDER BY id"
+        ).fetchall()
+        assert [event["kind"] for event in events] == ["apply_unknown"]
+        assert "提交结果未确认" in result.output
+        assert "先去源站核对" in result.output
+
+    def test_execute_exception_leaves_unknown_instead_of_prefilled(
+        self, tmp_db, tmp_path, monkeypatch
+    ):
+        self._seed_job(tmp_db)
+
+        class ExplodingSubmitter:
+            def prepare(inner_self, *_a, **_k):
+                return self._plan()
+
+            def execute(inner_self, _token):
+                raise TimeoutError("点击后连接中断")
+
+        monkeypatch.setattr(cli.routing, "get_submitter", lambda *_a, **_k: ExplodingSubmitter())
+        result = runner.invoke(
+            cli.app,
+            ["apply", "J1", "--profile-path", str(self._profile(tmp_path))],
+            input="y\n",
+        )
+
+        row = tmp_db.execute(
+            "SELECT status FROM applications WHERE external_id='J1'"
+        ).fetchone()
+        assert row["status"] == "unknown"
+        events = tmp_db.execute(
+            "SELECT kind FROM events WHERE job_id IS NOT NULL ORDER BY id"
+        ).fetchall()
+        assert [event["kind"] for event in events] == ["apply_unknown"]
+        assert "提交结果未确认" in result.output
+
+    def test_reconcile_requires_explicit_source_confirmation(
+        self, tmp_db, monkeypatch
+    ):
+        job_id = self._seed_job(tmp_db)
+        reservation = db.reserve_application(
+            tmp_db, job_id=job_id, source_key="tencent_join",
+            external_id="J1", company="A公司",
+        )
+
+        result = runner.invoke(
+            cli.app, ["application-reconcile", str(reservation.app_id)]
+        )
+
+        assert result.exit_code == 1
+        assert "先去招聘官网核对" in result.output
+        status = tmp_db.execute(
+            "SELECT status FROM applications WHERE id=?", (reservation.app_id,)
+        ).fetchone()["status"]
+        assert status == "reserved"
+
+    def test_reconcile_releases_a_stale_attempt_after_double_confirmation(
+        self, tmp_db
+    ):
+        job_id = self._seed_job(tmp_db)
+        reservation = db.reserve_application(
+            tmp_db, job_id=job_id, source_key="tencent_join",
+            external_id="J1", company="A公司",
+        )
+
+        result = runner.invoke(
+            cli.app,
+            [
+                "application-reconcile", str(reservation.app_id),
+                "--confirmed-not-submitted",
+            ],
+            input="y\n",
+        )
+
+        assert result.exit_code == 0, result.output
+        row = tmp_db.execute(
+            "SELECT status, note FROM applications WHERE id=?", (reservation.app_id,)
+        ).fetchone()
+        assert row["status"] == "abandoned"
+        assert "源站" in row["note"]
+        event = tmp_db.execute(
+            "SELECT kind FROM events WHERE job_id=? ORDER BY id DESC LIMIT 1", (job_id,)
+        ).fetchone()
+        assert event["kind"] == "apply_reconciled_not_submitted"
+
+    def test_reconcile_never_releases_a_confirmed_submission(self, tmp_db):
+        job_id = self._seed_job(tmp_db)
+        reservation = db.reserve_application(
+            tmp_db, job_id=job_id, source_key="tencent_join",
+            external_id="J1", company="A公司",
+        )
+        db.transition_application(
+            tmp_db, reservation.app_id,
+            expected_status="reserved", status="submitted",
+        )
+
+        result = runner.invoke(
+            cli.app,
+            [
+                "application-reconcile", str(reservation.app_id),
+                "--confirmed-not-submitted",
+            ],
+            input="y\n",
+        )
+
+        assert result.exit_code == 1
+        assert "不能释放" in result.output
+        status = tmp_db.execute(
+            "SELECT status FROM applications WHERE id=?", (reservation.app_id,)
+        ).fetchone()["status"]
+        assert status == "submitted"
+
+    def test_reconcile_never_releases_an_attempt_that_may_still_be_clicking(
+        self, tmp_db
+    ):
+        job_id = self._seed_job(tmp_db)
+        reservation = db.reserve_application(
+            tmp_db, job_id=job_id, source_key="tencent_join",
+            external_id="J1", company="A公司",
+        )
+        db.transition_application(
+            tmp_db, reservation.app_id,
+            expected_status="reserved", status="submitting",
+        )
+
+        result = runner.invoke(
+            cli.app,
+            [
+                "application-reconcile", str(reservation.app_id),
+                "--confirmed-not-submitted",
+            ],
+            input="y\n",
+        )
+
+        assert result.exit_code == 1
+        assert "不能释放" in result.output
+        status = tmp_db.execute(
+            "SELECT status FROM applications WHERE id=?", (reservation.app_id,)
+        ).fetchone()["status"]
+        assert status == "submitting"
+
+    def test_reconcile_preserves_the_original_unknown_error(self, tmp_db):
+        job_id = self._seed_job(tmp_db)
+        reservation = db.reserve_application(
+            tmp_db, job_id=job_id, source_key="tencent_join",
+            external_id="J1", company="A公司",
+        )
+        db.transition_application(
+            tmp_db, reservation.app_id,
+            expected_status="reserved", status="unknown",
+            error="点击后连接中断",
+        )
+
+        result = runner.invoke(
+            cli.app,
+            [
+                "application-reconcile", str(reservation.app_id),
+                "--confirmed-not-submitted",
+            ],
+            input="y\n",
+        )
+
+        assert result.exit_code == 0, result.output
+        row = tmp_db.execute(
+            "SELECT status, error FROM applications WHERE id=?", (reservation.app_id,)
+        ).fetchone()
+        assert (row["status"], row["error"]) == (
+            "abandoned", "点击后连接中断",
+        )

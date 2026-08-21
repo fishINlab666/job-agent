@@ -51,8 +51,10 @@ RTYPE_ZH = {"campus": "应届", "intern": "实习", "social": "社招"}
 
 
 APP_STATUS_ZH = {
-    "prefilled": "填好待确认", "submitted": "已提交", "duplicate": "投过了",
-    "closed": "岗位已关", "failed": "失败", "blocked": "被拦", "abandoned": "已放弃",
+    "reserved": "已预占", "prefilled": "填好待确认", "submitting": "提交中",
+    "submitted": "已提交", "duplicate": "投过了", "unknown": "结果未知",
+    "closed": "岗位已关", "failed": "历史失败", "blocked": "被拦",
+    "abandoned": "已放弃",
 }
 
 # 漏斗的分档。**写死每个状态的归属，不许用「其他」兜底** —— 见
@@ -62,13 +64,16 @@ APP_STATUS_ZH = {
 # 顺序就是展示顺序，也是这条链路的真实先后。
 APP_FUNNEL = (
     ("被拦", ("blocked",), "yellow"),
-    ("填好待确认", ("prefilled",), "cyan"),
+    ("进行中", ("reserved", "prefilled", "submitting"), "cyan"),
     ("已提交", ("submitted",), "green"),
-    ("失败", ("failed",), "red"),
+    ("结果未知", ("unknown", "failed"), "red"),
     ("无需投递", ("duplicate", "closed"), "dim"),
     ("已放弃", ("abandoned",), "dim"),
 )
 APP_STATUSES = tuple(s for _, ss, _ in APP_FUNNEL for s in ss)
+RECONCILABLE_APPLICATION_STATUSES = frozenset({
+    "reserved", "prefilled", "unknown", "failed", "closed",
+})
 
 SOURCE_HEALTH_EVENT_KINDS = frozenset({
     "source_degraded", "source_sync_failed",
@@ -1118,6 +1123,9 @@ def apply(
     headless: bool = typer.Option(False, help="无头模式。确认环节要看页面，默认关"),
     user_data_dir: str = typer.Option(None, help="浏览器用户数据目录（持久化登录态）"),
     dry_run: bool = typer.Option(False, "--dry-run", help="只填表看计划，不给确认机会"),
+    again: bool = typer.Option(
+        False, "--again", help="核对过源站后，显式重试已有终态记录的同一岗位"
+    ),
 ) -> None:
     """代投单个岗位：先填好表停下，你确认了才提交。
 
@@ -1150,14 +1158,34 @@ def apply(
         raise typer.Exit(1)
     console.print(f"[dim]路由 {route.key}（{route.basis}）[/dim]")
 
-    # ---- 阶段零：限投额度 ----
-    # 放在开浏览器之前：拦下来的话不必启动 playwright，也不会在源站留下访问痕迹。
-    # 两阶段闸门保的是「这一次是你确认过的」，保不了「这是第几次」，这里补那一半。
-    used, limit = db.quota_state(conn, job["company"])
-    if limit is not None and used >= limit:
+    # ---- 阶段零：防重 + 限投额度 + 占位 ----
+    # 三件事必须在同一笔 SQLite 写事务里完成。否则两个进程都能在人工确认期间
+    # 看见「还剩一个名额」，然后各自开浏览器，最终投出两份。
+    try:
+        reservation = db.reserve_application(
+            conn,
+            job_id=job["id"], source_key=src, external_id=job["external_id"],
+            company=job["company"], allow_repeat=again,
+        )
+    except db.ApplicationInProgress as exc:
         console.print(
-            f"[red]不投了[/red] 已达 {job['company']} 的投递上限 {limit}"
-            f"（已用 {used}）"
+            f"[red]不投了[/red] 该岗位已有进行中的投递（{APP_STATUS_ZH.get(exc.status, exc.status)}）"
+        )
+        console.print("[dim]先去源站核对，不要同时打开第二次投递。[/dim]")
+        raise typer.Exit(1) from exc
+    except db.DuplicateApplication as exc:
+        console.print(
+            f"[red]不投了[/red] 该岗位已有投递记录（{APP_STATUS_ZH.get(exc.status, exc.status)}）"
+        )
+        console.print(
+            "[dim]先用 applications 查看并去源站核对；确认确实需要重投时，"
+            "显式加 --again。[/dim]"
+        )
+        raise typer.Exit(1) from exc
+    except db.QuotaExceeded as exc:
+        console.print(
+            f"[red]不投了[/red] 已达 {job['company']} 的投递上限 {exc.limit}"
+            f"（已用 {exc.used}）"
         )
         console.print(
             "[dim]名额花在哪了：[/dim][cyan]applications --company "
@@ -1170,16 +1198,16 @@ def apply(
             conn,
             job_id=job["id"], source_key=src, external_id=job["external_id"],
             company=job["company"],
-            error=f"已达该公司投递上限 {limit}（已用 {used}）",
+            error=f"已达该公司投递上限 {exc.limit}（已用 {exc.used}）",
         )
         db.add_event(conn, "apply_blocked", source_key=src, company=job["company"],
                      job_id=job["id"],
                      payload={"blocker": "quota_exhausted",
-                              "limit": limit, "used": used})
+                              "limit": exc.limit, "used": exc.used})
         conn.commit()
-        raise typer.Exit(1)
-    if limit is not None:
-        console.print(f"[dim]额度 {used}/{limit}[/dim]")
+        raise typer.Exit(1) from exc
+    if reservation.limit is not None:
+        console.print(f"[dim]额度 {reservation.used}/{reservation.limit}[/dim]")
 
     # ---- 阶段一：填表，停在提交按钮前 ----
     console.print(f"[dim]启动浏览器，填表但不提交…[/dim]")
@@ -1189,25 +1217,29 @@ def apply(
         console.print(f"[yellow]未能填表[/yellow] {plan.blocker}")
         if plan.screenshot_path:
             console.print(f"  截图: {plan.screenshot_path}")
-        _record_blocked(conn, job, src, plan)
+        _record_blocked(conn, job, src, plan, app_id=reservation.app_id)
         raise typer.Exit(1)
 
-    _render_plan(plan, job, form)
-
-    app_id = db.record_prefill(
+    db.mark_application_prefilled(
         conn,
-        job_id=job["id"], source_key=src, external_id=job["external_id"],
-        company=job["company"], confirm_token=plan.confirm_token,
+        reservation.app_id,
+        confirm_token=plan.confirm_token,
         filled_fields=[f.for_storage() for f in plan.filled_fields],
         skipped_fields=[f.for_storage() for f in plan.skipped_fields],
         screenshot_path=plan.screenshot_path,
+        warnings=plan.warnings,
     )
+    app_id = reservation.app_id
+    _render_plan(plan, job, form)
 
     # ---- 阶段二：人工确认 ----
     if dry_run:
         console.print("[dim]--dry-run：只看计划，不提交。浏览器关掉。[/dim]")
         submitter.discard(plan.confirm_token)
-        db.finalize_application(conn, app_id, status="abandoned", note="dry_run")
+        db.complete_application(
+            conn, app_id, expected_status="prefilled",
+            status="abandoned", note="dry_run",
+        )
         return
 
     if plan.missing_required:
@@ -1221,7 +1253,10 @@ def apply(
     if not ok:
         console.print("[yellow]已放弃[/yellow] 没有提交，浏览器已关闭。")
         submitter.discard(plan.confirm_token)
-        db.finalize_application(conn, app_id, status="abandoned", note="用户放弃")
+        db.complete_application(
+            conn, app_id, expected_status="prefilled",
+            status="abandoned", note="用户放弃",
+        )
         db.add_event(conn, "apply_abandoned", source_key=src,
                      company=job["company"], job_id=job["id"])
         conn.commit()
@@ -1229,11 +1264,33 @@ def apply(
 
     # ---- 阶段三：提交 ----
     console.print("[dim]提交中…[/dim]")
-    result = submitter.execute(plan.confirm_token)
+    db.transition_application(
+        conn, app_id, expected_status="prefilled", status="submitting"
+    )
+    try:
+        result = submitter.execute(plan.confirm_token)
+    except Exception as exc:
+        # execute 开始后无法可靠判断按钮是否已经生效。这里绝不能写 failed 并建议
+        # 重试；保守记 unknown，让用户先去源站核对。
+        error = f"{type(exc).__name__}: {exc}"
+        db.complete_application(
+            conn, app_id, expected_status="submitting",
+            status="unknown", error=error,
+            note="execute_exception_outcome_unknown",
+        )
+        db.add_event(
+            conn, "apply_unknown", source_key=src, company=job["company"],
+            job_id=job["id"], payload={"title": job["title"], "error": error},
+        )
+        conn.commit()
+        console.print("[red]提交结果未确认[/red] 点击后连接中断或程序异常。")
+        console.print("[yellow]先去源站核对，不要直接重投。[/yellow]")
+        raise typer.Exit(1) from exc
 
-    db.finalize_application(
+    persisted_status = "unknown" if result.status == "failed" else result.status
+    db.complete_application(
         conn, app_id,
-        status=result.status,
+        expected_status="submitting", status=persisted_status,
         submitted_at=result.submitted_at,
         error=result.error,
         screenshot_path=result.screenshot_path,
@@ -1241,7 +1298,7 @@ def apply(
         skipped_fields=result.skipped_fields or None,
         note=result.note,
     )
-    db.add_event(conn, f"apply_{result.status}", source_key=src,
+    db.add_event(conn, f"apply_{persisted_status}", source_key=src,
                  company=job["company"], job_id=job["id"],
                  payload={"title": job["title"], "error": result.error})
     conn.commit()
@@ -1253,12 +1310,80 @@ def apply(
     elif result.status == "blocked":
         console.print(f"[red]已中止，没有提交[/red] {result.error}")
         console.print("[dim]页面内容和你确认时不一致，或者确认超时了。重跑一次。[/dim]")
+    elif persisted_status == "unknown":
+        console.print(f"[red]提交结果未确认[/red] {result.error or ''}")
+        console.print("[yellow]先去源站核对，不要直接重投。[/yellow]")
     else:
-        console.print(f"[red]提交失败[/red] {result.error}")
+        console.print(f"[red]提交未完成[/red] {result.error}")
     if result.screenshot_path:
         console.print(f"  截图: {result.screenshot_path}")
     if not result.success:
         raise typer.Exit(1)
+
+
+@app.command()
+def application_reconcile(
+    attempt_id: int = typer.Argument(..., help="applications 列表里的记录 #"),
+    confirmed_not_submitted: bool = typer.Option(
+        False,
+        "--confirmed-not-submitted",
+        help="已在招聘官网确认这次没有形成投递记录",
+    ),
+) -> None:
+    """人工核对源站后，释放一条悬挂或结果未知的投递占位。"""
+    conn = db.connect()
+    row = conn.execute(
+        "SELECT * FROM applications WHERE id=?", (attempt_id,)
+    ).fetchone()
+    if row is None:
+        console.print(f"[red]找不到投递记录 #{attempt_id}[/red]")
+        raise typer.Exit(1)
+    attempt = dict(row)
+
+    if not confirmed_not_submitted:
+        console.print("[red]尚未释放[/red] 先去招聘官网核对是否已有这条投递。")
+        console.print(
+            "[dim]确认官网确实没有后，重新运行并显式加 "
+            "--confirmed-not-submitted。[/dim]"
+        )
+        raise typer.Exit(1)
+
+    status = attempt["status"]
+    if status not in RECONCILABLE_APPLICATION_STATUSES:
+        console.print(
+            f"[red]不能释放[/red] 记录 #{attempt_id} 当前是 "
+            f"{APP_STATUS_ZH.get(status, status)}。"
+        )
+        raise typer.Exit(1)
+
+    console.print("[bold]即将释放投递占位[/bold]")
+    console.print(f"  记录: #{attempt_id}")
+    console.print(f"  公司: {attempt['company'] or '-'}")
+    console.print(f"  岗位引用: {attempt['source_key']} / {attempt['external_id']}")
+    console.print(f"  当前状态: {APP_STATUS_ZH.get(status, status)}")
+    if not typer.confirm("我已在招聘官网确认没有这条投递，释放占位？", default=False):
+        console.print("[yellow]未释放[/yellow]")
+        return
+
+    resolution_note = "用户在源站确认未形成投递后手动释放"
+    if attempt["note"]:
+        resolution_note = f"{attempt['note']}；{resolution_note}"
+    try:
+        db.transition_application(
+            conn, attempt_id, expected_status=status, status="abandoned",
+            error=attempt["error"], note=resolution_note,
+        )
+    except db.ApplicationStateError as exc:
+        console.print(f"[red]未释放[/red] {exc}")
+        raise typer.Exit(1) from exc
+    db.add_event(
+        conn, "apply_reconciled_not_submitted",
+        source_key=attempt["source_key"], company=attempt["company"],
+        job_id=attempt["job_id"],
+        payload={"application_id": attempt_id, "previous_status": status},
+    )
+    conn.commit()
+    console.print("[green]已释放[/green] 这次占位已记为放弃，可以重新开始投递。")
 
 
 @app.command()
@@ -1271,9 +1396,9 @@ def applications(
 ) -> None:
     """看投递记录：投了什么、卡在哪、截图在哪。
 
-    只读。**不提供任何改状态的开关**（`--mark-abandoned` 之类都没有）：
-    状态变更必须走 `apply` 的 prepare/execute 两阶段闸门，从一个查看命令里
-    改终态等于给那条硬约束开后门。见 docs/plans/012 §5。
+    本命令只读，不提供任何改状态开关。悬挂或结果未知的记录只有在用户去源站
+    核对后，才能另走 ``application-reconcile`` 的显式确认闸门；提交中的记录
+    连该闸门也不能释放。
     """
     conn = db.connect()
 
@@ -1411,7 +1536,12 @@ def _render_app_funnel(rows: list[dict]) -> None:
     # 尝试数和岗位数必须分开报。实测 14 次尝试只覆盖 7 个岗位（腾讯一个岗位重试
     # 了 7 次），把 14 读成「14 个岗位试过了」就是翻倍高估覆盖面。
     jobs_n = len({r["external_id"] for r in rows})
-    table = Table(title=f"投递漏斗（{len(rows)} 次尝试，{jobs_n} 个岗位）")
+    # expand 避免新增状态列稍宽后把标题从「3 次尝试」中间断行；这段标题是用户
+    # 判断尝试数和岗位数的关键口径，不能被表格内容宽度挤碎。
+    table = Table(
+        title=f"投递漏斗（{len(rows)} 次尝试，{jobs_n} 个岗位）",
+        expand=True,
+    )
     table.add_column("阶段", no_wrap=True)
     table.add_column("条数", justify="right", no_wrap=True)
     for label, states, color in APP_FUNNEL:
@@ -1514,6 +1644,8 @@ def _render_plan(plan: SubmissionPlan, job: dict, form: "profile.FormProfile") -
     for f in plan.fields:
         if f.note:
             console.print(f"  [dim]{f.label}: {f.note}[/dim]")
+    for warning in plan.warnings:
+        console.print(f"  [bold yellow]注意：{warning}[/bold yellow]")
     if plan.screenshot_path:
         console.print(f"  [dim]填表后截图: {plan.screenshot_path}[/dim]")
     console.print(f"  [dim]确认有效期 {int((plan.expires_at - plan.created_at) / 60)} 分钟[/dim]")
@@ -1750,14 +1882,22 @@ def _render_health(
                       "错的方向会是「把活岗位标成关闭」，而这个动作没有回滚。[/dim]")
 
 
-def _record_blocked(conn, job: dict, src: str, plan: SubmissionPlan) -> None:
+def _record_blocked(
+    conn, job: dict, src: str, plan: SubmissionPlan, *, app_id: int | None = None
+) -> None:
     """prepare 没走通，也要留痕：不然用户只看到一句报错，查不到发生过什么。"""
-    db.record_blocked(
-        conn,
-        job_id=job["id"], source_key=src, external_id=job["external_id"],
-        company=job["company"], error=plan.blocker,
-        screenshot_path=plan.screenshot_path,
-    )
+    if app_id is None:
+        db.record_blocked(
+            conn,
+            job_id=job["id"], source_key=src, external_id=job["external_id"],
+            company=job["company"], error=plan.blocker,
+            screenshot_path=plan.screenshot_path,
+        )
+    else:
+        db.transition_application(
+            conn, app_id, expected_status="reserved", status="blocked",
+            error=plan.blocker, screenshot_path=plan.screenshot_path,
+        )
     db.add_event(conn, "apply_blocked", source_key=src, company=job["company"],
                  job_id=job["id"], payload={"blocker": plan.blocker})
     conn.commit()

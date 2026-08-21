@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,16 +44,52 @@ OBSERVATION_SOURCE_COLUMNS: list[tuple[str, str]] = [
     ("unverified_change_count", "INTEGER"),
 ]
 
-# 哪些终态算「名额已经花掉了」。判据是**提交按钮点没点下去**，不是投成没投成：
-#   submitted  源站确认收到，肯定占用
-#   duplicate  源站说投过了，说明之前那次占用了
-#   failed     全都写在 execute() 点击之后（见 submitters/tencent_join.py:211）。
-#              点击超时不等于没点上，可能只是页面没稳。这里往「算占用」偏是故意的：
-#              少算一次的代价是投穿不可逆上限，多算一次的代价是用户去源站看一眼
-#              再决定。两边不对等，所以取保守的那边。
-# 不算的：closed（源站以岗位已关为由拒收，没落单）、blocked（令牌校验没过，
-# 压根没点）、prefilled / abandoned（停在确认环节）。
-CONSUMING_STATUSES: tuple[str, ...] = ("submitted", "duplicate", "failed")
+# 预占开始后就先算额度：否则两个进程能在人工确认期间同时通过。点击后的 closed / failed /
+# unknown 也按可能落单处理；少算的代价是不可逆投穿，多算只需要用户去源站核对。
+CONSUMING_STATUSES: tuple[str, ...] = (
+    "reserved", "prefilled", "submitting", "submitted", "duplicate",
+    "failed", "unknown", "closed",
+)
+INFLIGHT_APPLICATION_STATUSES: tuple[str, ...] = (
+    "reserved", "prefilled", "submitting",
+)
+REPEAT_BLOCKING_STATUSES: tuple[str, ...] = (
+    "submitted", "duplicate", "failed", "unknown", "closed",
+)
+
+
+class ApplicationReservationError(RuntimeError):
+    pass
+
+
+class ApplicationInProgress(ApplicationReservationError):
+    def __init__(self, status: str) -> None:
+        super().__init__(f"该岗位已有进行中的投递（{status}）")
+        self.status = status
+
+
+class DuplicateApplication(ApplicationReservationError):
+    def __init__(self, status: str) -> None:
+        super().__init__(f"该岗位已有投递记录（{status}）")
+        self.status = status
+
+
+class QuotaExceeded(ApplicationReservationError):
+    def __init__(self, used: int, limit: int) -> None:
+        super().__init__(f"已达投递上限 {limit}（已用 {used}）")
+        self.used = used
+        self.limit = limit
+
+
+class ApplicationStateError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ApplicationReservation:
+    app_id: int
+    used: int
+    limit: int | None
 
 
 def now() -> str:
@@ -392,6 +429,154 @@ def quota_state(conn: sqlite3.Connection, company: str) -> tuple[int, int | None
     ).fetchone()
     limit = row[0] if row else None
     return int(used), (int(limit) if limit is not None else None)
+
+
+def reserve_application(
+    conn: sqlite3.Connection,
+    *,
+    job_id: int,
+    source_key: str,
+    external_id: str,
+    company: str,
+    allow_repeat: bool = False,
+) -> ApplicationReservation:
+    """原子完成同岗位防重、公司额度检查和 ``reserved`` 占位。"""
+    if conn.in_transaction:
+        raise ApplicationStateError("预占开始前连接已有未提交事务")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        statuses = INFLIGHT_APPLICATION_STATUSES + REPEAT_BLOCKING_STATUSES
+        existing = conn.execute(
+            f"""SELECT status FROM applications
+                WHERE source_key=? AND external_id=?
+                  AND status IN ({','.join('?' * len(statuses))})
+                ORDER BY id DESC""",
+            (source_key, external_id, *statuses),
+        ).fetchall()
+        inflight = next(
+            (row for row in existing if row["status"] in INFLIGHT_APPLICATION_STATUSES),
+            None,
+        )
+        if inflight:
+            raise ApplicationInProgress(inflight["status"])
+        if existing and not allow_repeat:
+            raise DuplicateApplication(existing[0]["status"])
+
+        used, limit = quota_state(conn, company)
+        if limit is not None and used >= limit:
+            raise QuotaExceeded(used, limit)
+
+        cur = conn.execute(
+            """INSERT INTO applications(
+                   job_id, source_key, external_id, company, status, created_at)
+               VALUES(?,?,?,?,'reserved',?)""",
+            (job_id, source_key, external_id, company, now()),
+        )
+        reservation = ApplicationReservation(
+            app_id=int(cur.lastrowid), used=used, limit=limit,
+        )
+        conn.commit()
+        return reservation
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def transition_application(
+    conn: sqlite3.Connection,
+    app_id: int,
+    *,
+    expected_status: str,
+    status: str,
+    error: str | None = None,
+    note: str | None = None,
+    screenshot_path: str | None = None,
+) -> None:
+    """只从调用方刚观察到的状态推进，拒绝覆盖并发或重复动作。"""
+    changed = conn.execute(
+        """UPDATE applications SET status=?, error=?, note=COALESCE(?, note),
+                  screenshot_path=COALESCE(?, screenshot_path)
+           WHERE id=? AND status=?""",
+        (status, error, note, screenshot_path, app_id, expected_status),
+    ).rowcount
+    if changed != 1:
+        conn.rollback()
+        raise ApplicationStateError(
+            f"投递记录 {app_id} 不再是 {expected_status}，拒绝改成 {status}"
+        )
+    conn.commit()
+
+
+def mark_application_prefilled(
+    conn: sqlite3.Connection,
+    app_id: int,
+    *,
+    confirm_token: str,
+    filled_fields: list[dict],
+    skipped_fields: list[dict],
+    screenshot_path: str | None = None,
+    warnings: list[str] | None = None,
+) -> None:
+    """把同一条预占记录推进到待确认，不另造第二条投递记录。"""
+    changed = conn.execute(
+        """UPDATE applications SET
+               status='prefilled', filled_fields=?, skipped_fields=?,
+               screenshot_path=COALESCE(?, screenshot_path), confirm_token=?,
+               prepared_at=?, note=COALESCE(?, note)
+           WHERE id=? AND status='reserved'""",
+        (
+            json.dumps(filled_fields, ensure_ascii=False),
+            json.dumps(skipped_fields, ensure_ascii=False),
+            screenshot_path, confirm_token or None, now(),
+            " / ".join(warnings) if warnings else None,
+            app_id,
+        ),
+    ).rowcount
+    if changed != 1:
+        conn.rollback()
+        raise ApplicationStateError(
+            f"投递记录 {app_id} 不再是 reserved，拒绝写入待确认计划"
+        )
+    conn.commit()
+
+
+def complete_application(
+    conn: sqlite3.Connection,
+    app_id: int,
+    *,
+    expected_status: str,
+    status: str,
+    submitted_at: str | None = None,
+    error: str | None = None,
+    screenshot_path: str | None = None,
+    filled_fields: list[dict] | None = None,
+    skipped_fields: list[dict] | None = None,
+    note: str | None = None,
+) -> None:
+    """按预期状态原子收尾，避免重复点击或并发结果覆盖现有事实。"""
+    changed = conn.execute(
+        """UPDATE applications SET
+               status=?, submitted_at=COALESCE(?, submitted_at),
+               error=?, screenshot_path=COALESCE(?, screenshot_path),
+               filled_fields=COALESCE(?, filled_fields),
+               skipped_fields=COALESCE(?, skipped_fields),
+               note=COALESCE(?, note)
+           WHERE id=? AND status=?""",
+        (
+            status, submitted_at, error, screenshot_path,
+            json.dumps(filled_fields, ensure_ascii=False)
+            if filled_fields is not None else None,
+            json.dumps(skipped_fields, ensure_ascii=False)
+            if skipped_fields is not None else None,
+            note, app_id, expected_status,
+        ),
+    ).rowcount
+    if changed != 1:
+        conn.rollback()
+        raise ApplicationStateError(
+            f"投递记录 {app_id} 不再是 {expected_status}，拒绝收尾为 {status}"
+        )
+    conn.commit()
 
 
 def record_blocked(
