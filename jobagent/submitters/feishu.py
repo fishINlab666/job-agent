@@ -499,8 +499,8 @@ class FeishuSubmitter:
 
             plan.screenshot_path = self._shot(page, job_id, "prefilled")
 
-            # 这几句都往 blocker 里汇，所以先攒起来再拼 —— 直接赋值会互相覆盖，
-            # 后写的那条把前一条顶掉，用户就少看到一半原因。
+            # ready 计划不能把提示塞进 blocker：blocker 只在硬阻断分支展示，
+            # 否则用户确认时看不到这些页面风险。
             notes: list[str] = []
             # 部分 label 失效：填了一些但不是全部。不拦，但要在计划里说出来，
             # 让用户在确认环节看得见「这几项是因为页面变了才没填」。
@@ -511,7 +511,7 @@ class FeishuSubmitter:
                 rest = "；".join(f"{k}：{v}" for k, v in errors.items())
                 notes.append(f"页面上还有这些校验提示：{rest}")
             if notes:
-                plan.blocker = " / ".join(notes)
+                plan.warnings.extend(notes)
 
             plan.confirm_token = mint_token()
             plan.expires_at = time.time() + PLAN_TTL_SECONDS

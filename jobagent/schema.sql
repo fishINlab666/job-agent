@@ -195,9 +195,11 @@ CREATE TABLE IF NOT EXISTS observation_truth_evidence (
 );
 
 -- 投递记录：代投的副产品
--- 两阶段代投的两半都记在这张表里：
---   prepare 成功 → prefilled（表填好了，等人确认）
---   execute 之后 → submitted / duplicate / failed / closed
+-- 代投状态链全部记在同一行：
+--   防重/额度占位 → reserved
+--   prepare 成功  → prefilled（表填好了，等人确认）
+--   execute 开始  → submitting
+--   execute 之后  → submitted / duplicate / unknown / closed
 --   用户放弃    → abandoned
 --   没走到提交  → blocked（岗位关了、要登录、token 失效）
 -- 一次投递会先写 prefilled 再更新成终态，所以 confirm_token 上有唯一索引，
@@ -209,8 +211,9 @@ CREATE TABLE IF NOT EXISTS applications (
     source_key     TEXT,
     external_id    TEXT,            -- 源站岗位 id，jobs 行被重建也能追溯
     company        TEXT,
-    status         TEXT NOT NULL,   -- prefilled / submitted / duplicate /
-                                    -- failed / closed / blocked / abandoned
+    status         TEXT NOT NULL,   -- reserved / prefilled / submitting /
+                                    -- submitted / duplicate / unknown / failed /
+                                    -- closed / blocked / abandoned
     submitted_at   TEXT,
     filled_fields  TEXT,            -- JSON：实际填了什么（敏感值已打码），便于复投和排错
     skipped_fields TEXT,            -- JSON：没把握留空的字段（半自动降级用）

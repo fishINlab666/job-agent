@@ -915,6 +915,25 @@ class TestAmbiguityGuard:
 
         assert touched == ["filled"]
 
+    def test_ready_prepare_keeps_page_risks_as_visible_warnings(self):
+        """部分字段漂移不硬拦，但必须进入确认页专用 warnings。"""
+        page = fake_page(logged_in=True, labels_present=True)
+        page.evaluate.return_value = {}
+        sub = FeishuSubmitter(tenant="nio")
+        sub.label_drift = lambda _page: ["学校名称"]
+        sub._plan_fields = lambda _profile: []
+        sub._fill = lambda _page, _plans: None
+        sub.page_errors = lambda _page: {"邮箱": "格式不正确"}
+
+        plan = prep(page, sub=sub)
+
+        assert plan.status == "ready"
+        assert plan.blocker is None
+        assert plan.warnings == [
+            "这些字段名在页面上没找到，已跳过：学校名称",
+            "页面上还有这些校验提示：邮箱：格式不正确",
+        ]
+
     def test_checkup_reports_every_judgement_as_broken_on_a_blank_page(self):
         """空页面上每一条判据都该红。
 

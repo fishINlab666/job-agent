@@ -276,8 +276,27 @@ def _family_from_title_rules(
     return None
 
 
-def family_from_title(title: str) -> str | None:
-    """标题 → 归一岗位族。返回 None 表示判不出，由调用方用源站族兜底。"""
+_ROLE_HEAD_SOURCES = frozenset({"feishu:bytedance:campus"})
+_ORG_SEPARATORS = "-—－"
+
+
+def _role_head(title: str) -> str | None:
+    """取 ``岗位 - 部门`` 的岗位段；只认 issue #13 量过的三种分隔符。"""
+    index = max((title.rfind(separator) for separator in _ORG_SEPARATORS), default=-1)
+    if index <= 0 or index >= len(title) - 1:
+        return None
+    return title[:index].strip() or None
+
+
+def family_from_title(title: str, *, source_key: str | None = None) -> str | None:
+    """标题 → 归一岗位族。返回 None 表示判不出，由调用方用源站族兜底。
+
+    字节校招标题的最后一段是部门名；头段本身能判时，部门词不能覆盖岗位职能。
+    其他来源没有这条已验证的命名约定，仍按完整标题处理。
+    """
+    if source_key in _ROLE_HEAD_SOURCES and (head := _role_head(title)):
+        if family := _family_from_title_rules(head, TITLE_RULES):
+            return family
     return _family_from_title_rules(title, TITLE_RULES)
 
 

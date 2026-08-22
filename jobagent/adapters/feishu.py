@@ -404,7 +404,7 @@ class FeishuAdapter:
             # 判不出就是 None，**不兜底成 "other"**。那不是「其他族」，
             # 那是「没判出来」—— 混进 other 之后用户按族筛永远看不到这批，
             # 而 other 里真正的职能岗和没判出来的也分不开了。见 002 §4。
-            job_family=family_from_title(title),
+            job_family=family_from_title(title, source_key=self.source_key),
             raw_category=_raw_category(row),
             # 必须过归一：xiaopeng 上有「中国香港」，不归一就和「香港」分成两个城市。
             cities=[c for c in (normalize_city(n) for n in raw_names) if c],
