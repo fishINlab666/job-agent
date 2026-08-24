@@ -20,7 +20,8 @@ Workflow 只是固定运行容器，不包含源规则。远端结果只保留�
 |---|---|---|
 | 固定 Cloudflare 失败事实与新路线 | 已核实 | D1 readback：腾讯 845 success；四家飞书 HTTPStatusError；`wrangler.jsonc` 为 `crons: []` |
 | 建立隔离分支与干净基线 | 已核实 | `git switch -c feat/remote-feishu-runner origin/main && uv run --frozen pytest -q -p no:cacheprovider` → `1029 passed, 2 skipped` |
-| 实现本地可测的只读 Probe Module | 未开始 | 先运行 `uv run --frozen pytest tests/test_remote_probe.py -q -p no:cacheprovider` 观察 RED |
+| 实现本地可测的只读 Probe Module | 已完成（本地候选） | 首次 RED：缺少 `jobagent.remote_probe`；实现闭合报告与校验后，聚焦测试 `8 passed` |
+| 固定一次性、只读 Workflow | 已完成（本地候选） | 仅 `pull_request: opened`，`contents: read`；无 secret、schedule、D1、通知或投递命令 |
 | 发布 draft PR 并触发一次远端探针 | 未开始 | 只允许 PR opened 事件；无 secret、无 D1 写、无 schedule |
 | 四源结果 Gate | 未开始 | 四源全部 success、count>0、digest=64 hex 才进入方案 025；任一失败即停止 |
 

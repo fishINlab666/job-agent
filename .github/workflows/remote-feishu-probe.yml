@@ -1,0 +1,35 @@
+name: Remote Feishu Network Probe
+
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out probe candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: 0.11.29
+          python-version: "3.13"
+          enable-cache: false
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Run remote Feishu probe
+        run: >-
+          uv run --frozen python -m jobagent.remote_probe
+          --output "$RUNNER_TEMP/remote-feishu-probe.json"
+          --summary "$GITHUB_STEP_SUMMARY"
