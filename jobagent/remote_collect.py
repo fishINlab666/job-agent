@@ -323,13 +323,18 @@ def execute_remote_collection(
                 }
             )
         except Exception as exc:
+            error_kind = (
+                f"HTTP_{exc.response.status_code}"
+                if isinstance(exc, httpx.HTTPStatusError)
+                else type(exc).__name__
+            )
             results.append(
                 {
                     "source_key": snapshot.source_key,
                     "status": "failed",
                     "fetched_count": len(snapshot.payloads),
                     "snapshot_sha256": snapshot.snapshot_sha256,
-                    "error_kind": type(exc).__name__,
+                    "error_kind": error_kind,
                 }
             )
             break

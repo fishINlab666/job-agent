@@ -124,6 +124,40 @@ def test_http_upload_is_chunked_and_does_not_retry_failed_writes() -> None:
     client.close()
 
 
+def test_http_failure_summary_keeps_status_but_never_response_body() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            503,
+            json={"error": "private upstream detail must-not-leak"},
+            request=request,
+        )
+
+    client = RemoteIngestClient(
+        "https://collector.example.test",
+        "secret-" + "x" * 32,
+        transport=httpx.MockTransport(handler),
+    )
+
+    report = execute_remote_collection(
+        client=client,
+        adapter_builder=lambda spec: FakeAdapter(spec),
+        run_id="run-http-status",
+        mode="technical-trial",
+    )
+
+    assert len(calls) == 1
+    assert report["status"] == "failed"
+    assert report["results"][0]["error_kind"] == "HTTP_503"
+    serialized = json.dumps(report, ensure_ascii=False)
+    assert "private upstream detail" not in serialized
+    assert "must-not-leak" not in serialized
+    assert "secret-" not in serialized
+    client.close()
+
+
 def test_http_upload_chunks_by_encoded_bytes_below_worker_limit() -> None:
     calls: list[httpx.Request] = []
     collection_id = RemoteIngestClient._collection_id(

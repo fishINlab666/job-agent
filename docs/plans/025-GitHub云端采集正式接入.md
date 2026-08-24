@@ -25,8 +25,9 @@ Worker 只接收批准字段，重算分块和整份清单摘要，复用现有 
 | 正式上传协议与迁移 | 已完成（本地候选） | 独立上传/同步凭证、分块、整份重算；半份快照、重放漂移、越权与非工作日写入均 fail-closed |
 | 五源远端采集客户端 | 已完成（本地候选） | 五源先全部采完再产生首个写请求；失败报告只有来源和异常类型 |
 | 手工试运行 Workflow | 已完成（本地候选） | 当前只有 `workflow_dispatch`；同一时刻最多一个执行；旧一次性探针已移除 |
-| PR / CI / Worker 部署 | 未开始 | required check 通过；迁移与 Worker readback 一致 |
-| 技术试运行 | 未开始 | 独立 technical-trial 窗口五源 success；本机同步可读到变化 |
+| PR / CI / Worker 部署 | 已核实 | PR `#53` merge commit `a9db40279510b353c5ce059dce8d679558001ac5`；两轮 required check success；migration `0002` 与 Worker version `1fd21ca3-71f4-432a-a765-6480c59e6b76` 已部署 |
+| 技术试运行 | 进行中 | run `32760861954` 安全失败：五源读取完成；腾讯、蔚来、小鹏 committed；字节上传第 29 块后返回 HTTP 错误；商汤未尝试；schedule 仍关闭 |
+| HTTP 上传诊断 | 已核实（本地候选） | 只把非 2xx 状态压缩成 `HTTP_<status>`，响应正文、请求头、token 与岗位内容均不进入报告；`uv run --frozen pytest -q -p no:cacheprovider tests cloud/collector/tests` → `1108 passed, 2 skipped`；待新独立 run 分类线上错误 |
 | 正式定时启用 | 未开始 | 技术试运行通过后才保留 schedule；本机旧观察任务继续兜底 |
 
 ---
@@ -95,7 +96,9 @@ Worker 拒绝额外键、来源身份不一致、空 `external_id`、重复 ID�
 - 单岗位规范 JSON 最多 1,000,000 bytes；每块最多 40 个岗位、请求正文最多 1,500,000 bytes，
   Worker 的 HTTP 拒绝线为 1,600,000 bytes，低于 D1 2,000,000 bytes 单行限制。
 - session 元数据最多 4 KiB；commit body 必须是空 object。
-- 错误报告只保存异常类型和闭合状态，不返回原始响应或岗位正文。
+- 错误报告只保存异常类型和闭合状态。远端 HTTP 非 2xx 只允许记为 `HTTP_<status>`；不得返回
+  响应正文、请求头、token、URL 查询参数或岗位正文。该状态码用于技术试运行失败后的根因分类，
+  不改变无自动写重试、partial 不冒充 success 的规则。
 
 ---
 
