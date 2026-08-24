@@ -192,10 +192,6 @@ def _install_observation_unlocked(
 
     user_id = os.getuid() if uid is None else uid
     domain = f"gui/{user_id}"
-    if _is_loaded(launchctl, domain, CLOUD_LABEL):
-        raise RuntimeError(
-            "云端同步任务正在运行；旧本机采集与云端同步任务不能同时启用"
-        )
     launch_dir = home / "Library" / "LaunchAgents"
     log_dir = home / "Library" / "Logs" / "job-agent"
     launch_dir.mkdir(parents=True, exist_ok=True)
@@ -370,15 +366,6 @@ def _install_cloud_check_unlocked(
 
     user_id = os.getuid() if uid is None else uid
     domain = f"gui/{user_id}"
-    loaded_observers = [
-        _label(slot)
-        for slot in SCHEDULE_SLOTS
-        if _is_loaded(launchctl, domain, _label(slot))
-    ]
-    if loaded_observers:
-        raise RuntimeError(
-            "旧本机采集任务仍在运行；远端首轮验收后先停旧任务，再启用云端同步"
-        )
     launch_dir = home / "Library" / "LaunchAgents"
     log_dir = home / "Library" / "Logs" / "job-agent"
     launch_dir.mkdir(parents=True, exist_ok=True)

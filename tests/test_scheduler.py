@@ -154,7 +154,7 @@ def test_cloud_schedule_install_restores_previous_task_on_failure(tmp_path) -> N
     assert loaded == {scheduler.CLOUD_LABEL}
 
 
-def test_cloud_and_direct_observation_schedules_are_mutually_exclusive(tmp_path) -> None:
+def test_cloud_and_direct_observation_schedules_can_coexist(tmp_path) -> None:
     project_root = tmp_path / "repo"
     python = tmp_path / "venv/bin/python"
     config = tmp_path / "private/cloud.json"
@@ -166,39 +166,31 @@ def test_cloud_and_direct_observation_schedules_are_mutually_exclusive(tmp_path)
     config.write_text("{}", encoding="utf-8")
     config.chmod(0o600)
 
-    def with_old_observer(args: list[str], *, check: bool) -> int:
+    loaded = {scheduler._label(slot) for slot in scheduler.SCHEDULE_SLOTS}
+
+    def launchctl(args: list[str], *, check: bool) -> int:
         if args[0] == "print":
-            return int(not args[1].endswith("observe.0930"))
-        raise AssertionError("互斥检查后不得修改 launchd")
+            return 0 if args[1].split("/")[-1] in loaded else 1
+        if args[0] == "bootstrap":
+            loaded.add(plistlib.loads(Path(args[-1]).read_bytes())["Label"])
+        elif args[0] == "bootout":
+            loaded.discard(args[1].split("/")[-1])
+        return 0
 
-    with pytest.raises(RuntimeError, match="旧本机采集任务仍在运行"):
-        scheduler.install_cloud_check(
-            project_root=project_root,
-            python_executable=python,
-            db_path=tmp_path / "data/jobagent.db",
-            config_path=config,
-            home=tmp_path / "home",
-            launchctl=with_old_observer,
-            uid=501,
-        )
-
-    def with_cloud_check(args: list[str], *, check: bool) -> int:
-        if args[0] == "print":
-            return int(not args[1].endswith(scheduler.CLOUD_LABEL))
-        raise AssertionError("互斥检查后不得修改 launchd")
-
-    with pytest.raises(RuntimeError, match="不能同时启用"):
-        scheduler.install(
-            project_root=project_root,
-            python_executable=python,
-            db_path=tmp_path / "data/jobagent.db",
-            home=tmp_path / "home",
-            launchctl=with_cloud_check,
-            uid=501,
-        )
+    assert scheduler.install_cloud_check(
+        project_root=project_root,
+        python_executable=python,
+        db_path=tmp_path / "data/jobagent.db",
+        config_path=config,
+        home=tmp_path / "home",
+        launchctl=launchctl,
+        uid=501,
+    ) == scheduler.CLOUD_LABEL
+    assert scheduler.CLOUD_LABEL in loaded
+    assert all(scheduler._label(slot) in loaded for slot in scheduler.SCHEDULE_SLOTS)
 
 
-def test_concurrent_schedule_installs_cannot_both_win(tmp_path) -> None:
+def test_concurrent_schedule_installs_serialize_and_both_can_coexist(tmp_path) -> None:
     project_root = tmp_path / "repo"
     python = tmp_path / "venv/bin/python"
     config = tmp_path / "private/cloud.json"
@@ -267,13 +259,9 @@ def test_concurrent_schedule_installs_cannot_both_win(tmp_path) -> None:
         thread.join(timeout=5)
         assert not thread.is_alive()
 
-    observers_loaded = any(label.startswith(scheduler.LABEL_PREFIX) for label in loaded)
-    cloud_loaded = scheduler.CLOUD_LABEL in loaded
-    assert observers_loaded != cloud_loaded
-    assert sorted(outcomes) in (
-        ["cloud", "observation-blocked"],
-        ["cloud-blocked", "observation"],
-    )
+    assert any(label.startswith(scheduler.LABEL_PREFIX) for label in loaded)
+    assert scheduler.CLOUD_LABEL in loaded
+    assert sorted(outcomes) == ["cloud", "observation"]
 
 
 def test_install_writes_three_private_plists_and_bootstraps(tmp_path) -> None:

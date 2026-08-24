@@ -29,6 +29,25 @@ def test_observation_lock_rejects_an_overlapping_run(tmp_path) -> None:
                 pass
 
 
+def test_scheduled_observation_can_wait_for_cloud_lock(tmp_path, monkeypatch) -> None:
+    attempts = 0
+
+    def flaky_flock(_fd, _flags):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise BlockingIOError
+
+    monkeypatch.setattr(observation.fcntl, "flock", flaky_flock)
+    monkeypatch.setattr(observation.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(observation.time, "sleep", lambda _seconds: None)
+
+    with observation.exclusive_run(tmp_path / "jobagent.db", wait_seconds=120):
+        pass
+
+    assert attempts == 3
+
+
 def test_scheduled_slot_can_only_create_one_batch(tmp_path) -> None:
     conn = db.connect(tmp_path / "observation.db")
     db.init(conn)

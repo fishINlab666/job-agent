@@ -13,6 +13,7 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
+import time
 from typing import Callable, Iterable
 
 from . import db, ingest, network, official_truth, routing
@@ -34,17 +35,24 @@ class DuplicateObservationError(RuntimeError):
 
 
 @contextmanager
-def exclusive_run(db_path: Path):
-    """同一数据库同一时刻只允许一轮观察；不等待第二轮。"""
+def exclusive_run(db_path: Path, *, wait_seconds: float = 0):
+    """同一数据库同一时刻只允许一轮；定时观察可有界等待云同步让锁。"""
+    if wait_seconds < 0:
+        raise ValueError("wait_seconds must be non-negative")
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(f"{path.name}.observe.lock")
     handle = lock_path.open("a", encoding="utf-8")
     try:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise AlreadyRunningError("已有一轮观察正在运行") from exc
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise AlreadyRunningError("已有一轮观察正在运行") from exc
+                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
         yield
     finally:
         handle.close()

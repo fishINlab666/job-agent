@@ -78,6 +78,15 @@ def expired_windows(now_utc: datetime) -> tuple[Window, ...]:
     )
 
 
+def previous_workday_windows(now_utc: datetime) -> tuple[Window, ...]:
+    """返回上一个周一至周五的三个正式窗口，用于次日补记漏跑。"""
+    local = _require_aware(now_utc, "previous_workday_windows")
+    previous = local - timedelta(days=1)
+    while previous.weekday() >= 5:
+        previous -= timedelta(days=1)
+    return windows_for_day(previous)
+
+
 def technical_trial_window(now_utc: datetime) -> Window:
     """建立独立技术试运行窗口，绝不回填正式早/午/晚验收事实。"""
     if now_utc.tzinfo is None or now_utc.utcoffset() is None:
