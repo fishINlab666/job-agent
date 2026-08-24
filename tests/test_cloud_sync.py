@@ -134,21 +134,31 @@ def test_sync_replays_cloud_changes_once_and_updates_existing_job_state(tmp_path
     syncer = CloudSync(conn, api, client_id="local-mac")
 
     first = syncer.sync()
-    assert first == {"applied": 1, "cursor": 1, "affected_sources": 1}
+    assert first == {
+        "applied": 1,
+        "cursor": 1,
+        "affected_sources": 1,
+        "notifiable_changes": 0,
+        "bootstrap": True,
+    }
     row = conn.execute(
         "SELECT title, closed_at FROM jobs WHERE source_key='tencent_join' AND external_id='J1'"
     ).fetchone()
     assert tuple(row) == ("产品运营", None)
     assert api.acks == [1]
-    assert tuple(conn.execute(
-        "SELECT cursor, change_count, status FROM cloud_notifications"
-    ).fetchone()) == (1, 1, "pending")
+    assert conn.execute("SELECT COUNT(*) FROM cloud_notifications").fetchone()[0] == 0
 
     replay = syncer.sync()
-    assert replay == {"applied": 0, "cursor": 1, "affected_sources": 0}
+    assert replay == {
+        "applied": 0,
+        "cursor": 1,
+        "affected_sources": 0,
+        "notifiable_changes": 0,
+        "bootstrap": False,
+    }
     assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
     assert api.acks == [1, 1]
-    assert conn.execute("SELECT COUNT(*) FROM cloud_notifications").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM cloud_notifications").fetchone()[0] == 0
 
     changed = _payload("高级产品运营")
     api.pages[1] = {
@@ -161,6 +171,11 @@ def test_sync_replays_cloud_changes_once_and_updates_existing_job_state(tmp_path
     assert conn.execute(
         "SELECT COUNT(*) FROM events WHERE kind='job_updated'"
     ).fetchone()[0] == 1
+    assert tuple(
+        conn.execute(
+            "SELECT cursor, change_count, status FROM cloud_notifications"
+        ).fetchone()
+    ) == (2, 1, "pending")
 
     api.pages[2] = {
         "changes": [_change(3, "closed", changed)],
@@ -169,6 +184,72 @@ def test_sync_replays_cloud_changes_once_and_updates_existing_job_state(tmp_path
     }
     assert syncer.sync()["cursor"] == 3
     assert conn.execute("SELECT closed_at IS NOT NULL FROM jobs").fetchone()[0] == 1
+
+
+def test_empty_poll_does_not_consume_first_cloud_baseline(tmp_path) -> None:
+    conn = _conn(tmp_path)
+    api = FakeAPI()
+    syncer = CloudSync(conn, api, client_id="local-mac")
+
+    empty = syncer.sync()
+    assert empty == {
+        "applied": 0,
+        "cursor": 0,
+        "affected_sources": 0,
+        "notifiable_changes": 0,
+        "bootstrap": False,
+    }
+
+    api.pages[0] = {
+        "changes": [_change(1, "opened", _payload())],
+        "next_cursor": 1,
+        "has_more": False,
+    }
+    baseline = syncer.sync()
+
+    assert baseline["bootstrap"] is True
+    assert baseline["notifiable_changes"] == 0
+    assert conn.execute("SELECT COUNT(*) FROM cloud_notifications").fetchone()[0] == 0
+
+
+def test_interrupted_first_pagination_retry_stays_a_silent_baseline(tmp_path) -> None:
+    conn = _conn(tmp_path)
+    api = FakeAPI()
+    api.pages[0] = {
+        "changes": [_change(1, "opened", _payload())],
+        "next_cursor": 1,
+        "has_more": True,
+    }
+    second = _payload("产品经理")
+    second["external_id"] = "J2"
+    second["apply_url"] = "https://join.qq.com/J2"
+    api.pages[1] = {
+        "changes": [_change(2, "opened", second)],
+        "next_cursor": 2,
+        "has_more": False,
+    }
+    original_changes = api.changes
+    interrupted = True
+
+    def flaky_changes(after: int) -> dict:
+        if interrupted and after == 1:
+            raise httpx.ReadTimeout("interrupted baseline")
+        return original_changes(after)
+
+    api.changes = flaky_changes  # type: ignore[method-assign]
+    syncer = CloudSync(conn, api, client_id="local-mac")
+    with pytest.raises(httpx.ReadTimeout, match="interrupted baseline"):
+        syncer.sync()
+    assert conn.execute("SELECT COUNT(*) FROM cloud_job_cache").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM cloud_sync_state").fetchone()[0] == 0
+
+    interrupted = False
+    result = syncer.sync()
+
+    assert result["bootstrap"] is True
+    assert result["cursor"] == 2
+    assert result["notifiable_changes"] == 0
+    assert conn.execute("SELECT COUNT(*) FROM cloud_notifications").fetchone()[0] == 0
 
 
 def test_initial_paginated_sync_never_publishes_a_partial_source_snapshot(
@@ -195,7 +276,13 @@ def test_initial_paginated_sync_never_publishes_a_partial_source_snapshot(
 
     result = CloudSync(conn, api, client_id="local-mac").sync()
 
-    assert result == {"applied": 2, "cursor": 2, "affected_sources": 1}
+    assert result == {
+        "applied": 2,
+        "cursor": 2,
+        "affected_sources": 1,
+        "notifiable_changes": 0,
+        "bootstrap": True,
+    }
     assert conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE source_key='tencent_join' AND closed_at IS NULL"
     ).fetchone()[0] == 2
@@ -280,24 +367,25 @@ def test_explicit_cloud_closed_events_bypass_the_untrusted_fetch_guard(
     ).fetchone()[0] == 0
 
 
-def test_check_only_requests_catch_up_when_active_window_has_a_gap(tmp_path) -> None:
+def test_check_never_asks_cloudflare_to_fetch_recruitment_portals(tmp_path) -> None:
     conn = _conn(tmp_path)
     api = FakeAPI()
     syncer = CloudSync(conn, api, client_id="local-mac")
 
     first = syncer.check()
-    assert first["catch_up_requested"] is True
-    assert api.catch_up_calls == 1
+    assert first["catch_up_requested"] is False
+    assert first["catch_up_result"] is None
+    assert api.catch_up_calls == 0
 
     api.status_payload["windows"] = [
         {"window_key": "morning", "status": "complete", "sources": []}
     ]
     second = syncer.check()
     assert second["catch_up_requested"] is False
-    assert api.catch_up_calls == 1
+    assert api.catch_up_calls == 0
 
 
-def test_check_requests_catch_up_for_a_just_ended_window(tmp_path) -> None:
+def test_check_does_not_revive_direct_collection_for_a_just_ended_window(tmp_path) -> None:
     conn = _conn(tmp_path)
     api = FakeAPI()
     api.status_payload = {
@@ -309,8 +397,9 @@ def test_check_requests_catch_up_for_a_just_ended_window(tmp_path) -> None:
 
     result = CloudSync(conn, api, client_id="local-mac").check()
 
-    assert result["catch_up_requested"] is True
-    assert api.catch_up_calls == 1
+    assert result["catch_up_requested"] is False
+    assert result["catch_up_result"] is None
+    assert api.catch_up_calls == 0
 
 
 def test_cloud_tables_only_store_public_jobs_and_cursor(tmp_path) -> None:

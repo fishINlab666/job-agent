@@ -12,7 +12,7 @@ import json
 import pytest
 from typer.testing import CliRunner
 
-from jobagent import cli, cloud_sync, db, match
+from jobagent import cli, cloud_sync, db, match, observation
 
 runner = CliRunner()
 
@@ -81,6 +81,16 @@ def test_cloud_check_exits_nonzero_when_notification_is_unresolved(monkeypatch) 
     assert result.exit_code == 1
     assert "岗位已同步，但系统通知未确认" in result.output
     assert "云端检查完成" not in result.output
+
+
+def test_cloud_check_shares_the_observation_database_lock(tmp_path) -> None:
+    database = tmp_path / "shared.db"
+
+    with observation.exclusive_run(database):
+        result = runner.invoke(cli.app, ["cloud-check", "--db", str(database)])
+
+    assert result.exit_code == 1
+    assert "已有一轮观察正在运行" in result.output
 
 
 def test_cloud_schedule_install_passes_private_config_without_reading_token(

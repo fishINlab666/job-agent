@@ -22,9 +22,9 @@ Worker 只接收批准字段，重算分块和整份清单摘要，复用现有 
 | 步骤 | 状态 | 完成判据 |
 |---|---|---|
 | 四家飞书远端网络可达性 | 已完成 | run `32753445274`：4/4 success |
-| 正式上传协议与迁移 | 未开始 | 本地 RED→GREEN；半份快照、重放、漂移、越权全部 fail-closed |
-| 五源远端采集客户端 | 未开始 | 五源先全部采完再产生首个写请求；报告不含岗位正文或凭证 |
-| 定时 Workflow | 未开始 | 工作日北京时间 09:30、14:30、20:30；同一时刻最多一个执行 |
+| 正式上传协议与迁移 | 已完成（本地候选） | 独立上传/同步凭证、分块、整份重算；半份快照、重放漂移、越权与非工作日写入均 fail-closed |
+| 五源远端采集客户端 | 已完成（本地候选） | 五源先全部采完再产生首个写请求；失败报告只有来源和异常类型 |
+| 手工试运行 Workflow | 已完成（本地候选） | 当前只有 `workflow_dispatch`；同一时刻最多一个执行；旧一次性探针已移除 |
 | PR / CI / Worker 部署 | 未开始 | required check 通过；迁移与 Worker readback 一致 |
 | 技术试运行 | 未开始 | 独立 technical-trial 窗口五源 success；本机同步可读到变化 |
 | 正式定时启用 | 未开始 | 技术试运行通过后才保留 schedule；本机旧观察任务继续兜底 |
@@ -34,7 +34,7 @@ Worker 只接收批准字段，重算分块和整份清单摘要，复用现有 
 ## 一、产品闭环
 
 ```text
-GitHub 工作日定时启动
+GitHub 手工技术试运行；验收后才启用工作日定时
   → 五家公司全部读取并在内存校验
   → 任一家失败：零云端写入，任务红灯，本机兜底不受影响
   → 五家全过：逐来源建立上传批次并分块发送
@@ -76,18 +76,24 @@ Worker 拒绝额外键、来源身份不一致、空 `external_id`、重复 ID�
 
 ### 3. 分块事务
 
-1. `POST /v1/ingest/sessions`：固定来源、模式、期望岗位数、整份 SHA-256 和请求 ID。
-2. `PUT /v1/ingest/sessions/{session_id}/chunks/{index}`：每块最多 100 个岗位，固定块摘要。
-3. `POST /v1/ingest/sessions/{session_id}/commit`：Worker 要求块号从 0 连续、合计数量精确、
-   staged 身份唯一，并重算整份摘要；随后复用 `finalize_snapshot()` 发布。
+1. `POST /v1/ingest/sessions`：固定来源、模式、期望岗位数、规范 JSON 总字节、整份 SHA-256 和请求 ID。
+2. `PUT /v1/ingest/sessions/{session_id}/chunks/{index}`：每块最多 40 个岗位，固定块摘要；
+   连同 marker/readback 后仍不超过 Free D1 的 50 条 batch 语句。
+3. 同一 GitHub run 先固定一个 `collection_id`；Worker 第一次收到时选择窗口，后续五源只能复用
+   该服务端窗口，不能在午间跨界时悄悄拆成两个 partial 窗口。
+4. `POST /v1/ingest/sessions/{session_id}/commit`：Worker 先冻结分块集合，再要求块号从 0 连续、
+   合计数量/字节精确、staged 身份唯一，并重算整份摘要；来源发布、session committed、窗口/collection 状态与租约释放
+   必须在同一个 D1 batch 内提交，任一语句失败则整体回滚。
 
 同一块相同摘要可只读确认；同一块不同摘要、过期租约或来源/窗口漂移必须 409。网络响应不明时
 客户端不自动重发写请求；下一次独立调度通过 D1 的已成功来源和摘要判定是否已完成。
 
 ### 4. 体积限制
 
-- 每来源 1–20,000 个岗位；五源合计不超过 30,000。
-- 每块最多 100 个岗位、编码后最多 2 MiB。
+- 每来源 1–20,000 个岗位；五源/同一窗口合计不超过 30,000 个岗位、75,000,000 bytes，
+  客户端和 Worker 分别校验；失败/过期 session 不继续占用补跑容量。
+- 单岗位规范 JSON 最多 1,000,000 bytes；每块最多 40 个岗位、请求正文最多 1,500,000 bytes，
+  Worker 的 HTTP 拒绝线为 1,600,000 bytes，低于 D1 2,000,000 bytes 单行限制。
 - session 元数据最多 4 KiB；commit body 必须是空 object。
 - 错误报告只保存异常类型和闭合状态，不返回原始响应或岗位正文。
 
@@ -95,15 +101,23 @@ Worker 拒绝额外键、来源身份不一致、空 `external_id`、重复 ID�
 
 ## 三、时间与兜底
 
-GitHub cron 使用 UTC `30 1,6,12 * * 1-5`，对应北京时间工作日 09:30、14:30、20:30。
-这三个时间处在现有早/午/晚宽窗口内部，不依赖招聘门户恰好在某一分钟更新；每轮是完整快照，
-晚发布的岗位会被后续轮次发现。
+技术试运行通过后，正式 GitHub cron 使用 UTC `30 1,2,6,7,12,13 * * 1-5`。北京时间工作日
+09:30、14:30、20:30 是三次主运行；10:30、15:30、21:30 是独立兜底，仅用于前一轮失败或
+延迟的情况。六个时间都处在现有早/午/晚宽窗口内部，不依赖招聘门户恰好在某一分钟更新；
+同一窗口已成功的来源只读确认原结果，不重复发布或覆盖。
 
 GitHub 调度可能延迟，因此 Worker 以收到首个 session 的服务端时间选择“当前窗口或刚结束一小时
 内的上一窗口”，而不是相信客户端时间。周末没有正式窗口，直接拒绝正式写入。
 
-本机兜底保持：原有 LaunchAgent 继续独立观察。`cloud-check` 只读取云端状态、同步变化和通知，
-不再请求 Cloudflare 自己抓门户；因此不会把已知 405 路径重新带回主线。
+本机兜底保持：原有 LaunchAgent 继续独立观察；`cloud-check` 可以并存，只读取云端状态、同步变化
+和通知，不再请求 Cloudflare 自己抓门户。两类进程争用同一数据库时使用同一文件锁：云同步不等待，
+固定时段观察最多等待 120 秒，让三工作日证据不因短暂冲突丢槽。云同步按本机实际新增/变化/关闭数
+通知；只有完整同步并确认正游标才完成首次基线，空轮询或首轮分页中断均不消费基线；首次真实云基线
+和本机已有岗位保持静默，不误报为新岗位。
+
+每个 `technical-trial` collection 使用独立服务端窗口，并要求回执的 collection、岗位数和整份摘要
+逐字等于本次 GitHub 快照；旧 Cloudflare 试跑结果不能为新上传链路代签。正式窗口在下一工作日会
+补记前一工作日已开始但缺失的午/晚窗口为 `missed`，不会永远停在“未开始”。
 
 ---
 
@@ -123,7 +137,7 @@ GitHub 调度可能延迟，因此 Worker 以收到首个 session 的服务端�
 **文件：** `cloud/collector/migrations/0002_remote_ingest.sql`、
 `cloud/collector/src/repository.py`、`cloud/collector/src/main.py` 和 cloud tests。
 
-- session 固定 window/source/run/owner/generation/count/digest/expiry/status。
+- collection 固定整轮服务端 window；session 固定 collection/source/run/owner/generation/count/digest/expiry/status。
 - chunk 固定 index/digest/row_count；相同重放只确认，不同内容拒绝。
 - commit 复用现有 source head、关闭守卫和 `finalize_snapshot()`；失败不推进 success/head/changes。
 - 上传路由使用独立 auth，现有 sync token 无法调用。
@@ -141,18 +155,22 @@ GitHub 调度可能延迟，因此 Worker 以收到首个 session 的服务端�
 
 **文件：** `.github/workflows/cloud-collection.yml` 与静态契约测试。
 
-- `schedule` + 手工 technical-trial；`permissions: contents: read`。
+- 首个 PR 只含手工 technical-trial；`permissions: contents: read`。真实三路 readback 通过后，
+  再由一个小的独立候选加入 `schedule`，避免代码一进入主线就提前运行。
 - 固定 action commit、`uv sync --frozen`、并发组不取消正在执行的采集。
 - secret 只注入采集步骤；PR 工作流拿不到正式上传 token。
 
 ### Task 5：发布与试运行
 
-1. 全量测试、diff check、secret scan；创建 draft PR。
-2. CI 通过后 merge commit；应用 D1 migration，部署 Worker。
+1. 全量测试、diff check、secret scan；required CI 必须显式执行根目录测试和
+   `cloud/collector/tests`；创建 draft PR。
+2. CI 通过后 merge commit；先运行 `cloud/collector/build_shared.py` 并做隔离 import smoke，
+   再应用 D1 migration、部署 Worker。
 3. 生成独立上传 token，不回显地写入 Worker secret 与 GitHub secret；设置公开 Worker URL variable。
 4. 手工运行一次 technical-trial；五源全部 success 后，从 D1 和本机 cloud sync 双路径 readback。
 5. 技术试运行失败：暂停 schedule、保留本机任务、只读诊断；不得把部分结果称成功。
-6. 成功：正式 schedule 生效；三个工作日验收从首个完整正式工作日重新计数。
+6. 成功：另建最小 schedule 候选，CI/合并后正式 schedule 才生效；三个工作日验收从首个完整
+   正式工作日重新计数。
 
 ---
 

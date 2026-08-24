@@ -5,7 +5,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 from uuid import uuid4
 
-from jobagent.collection import job_fingerprint, snapshot_digest, to_public_payload
+from jobagent.collection import (
+    job_fingerprint,
+    snapshot_digest,
+    to_public_payload,
+    validate_snapshot,
+)
 from jobagent.targets import OBSERVATION_SOURCES, build_observation_adapter
 
 if __package__:
@@ -64,15 +69,7 @@ class Collector:
             try:
                 adapter = self.adapter_builder(spec)
                 raw_jobs = await adapter.fetch_async()
-                if not raw_jobs and not getattr(adapter, "empty_is_authoritative", False):
-                    raise RuntimeError("source returned an untrusted empty snapshot")
-                if int(getattr(adapter, "skipped_no_id", 0)) != 0:
-                    raise RuntimeError("source snapshot dropped one or more rows without id")
-                external_ids = [str(job.external_id).strip() for job in raw_jobs]
-                if any(not external_id for external_id in external_ids):
-                    raise RuntimeError("source returned an empty external_id")
-                if len(external_ids) != len(set(external_ids)):
-                    raise RuntimeError("source returned duplicate external_id values")
+                validate_snapshot(adapter, raw_jobs)
                 payloads = [
                     to_public_payload(source_key, str(spec["company"]), job)
                     for job in raw_jobs

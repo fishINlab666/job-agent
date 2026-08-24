@@ -73,9 +73,6 @@ class CloudAPI:
     def status(self) -> dict:
         return self._json("GET", "/v1/status/today")
 
-    def catch_up(self) -> dict:
-        return self._json("POST", "/v1/catch-up", json={})
-
     def changes(self, after: int) -> dict:
         return self._json("GET", "/v1/changes", params={"after": after})
 
@@ -215,6 +212,9 @@ class CloudSync:
 
     def sync(self) -> dict:
         cursor = self._cursor()
+        # 只有成功提交了正游标，才算云端基线建立完成。首轮分页中断时 cache
+        # 可能已有部分行，但 cursor 仍为 0；重试仍必须静默重建完整基线。
+        initial_sync = cursor == 0
         total = 0
         affected_total: set[str] = set()
         while True:
@@ -241,9 +241,14 @@ class CloudSync:
 
         # 一页只是变化传输分片，不是某个来源的完整岗位快照。必须等全部页落入
         # cache 后再让既有 ingest 看一次完整来源，否则首轮同步会误关掉后续页岗位。
+        notifiable_changes = 0
         for source_key in SOURCE_BY_KEY:
             if source_key in affected_total:
-                ingest.sync(self.conn, _CacheAdapter(self.conn, source_key))
+                stats = ingest.sync(self.conn, _CacheAdapter(self.conn, source_key))
+                if not initial_sync and not stats["bootstrap"]:
+                    notifiable_changes += sum(
+                        int(stats[key]) for key in ("opened", "updated", "closed")
+                    )
         self.conn.execute(
             """INSERT INTO cloud_sync_state(client_id, cursor, last_synced_at)
                VALUES(?,?,?)
@@ -251,12 +256,12 @@ class CloudSync:
                  cursor=excluded.cursor, last_synced_at=excluded.last_synced_at""",
             (self.client_id, cursor, db.now()),
         )
-        if total:
+        if notifiable_changes:
             self.conn.execute(
                 """INSERT OR IGNORE INTO cloud_notifications(
                        cursor, change_count, status, created_at
                    ) VALUES(?,?,'pending',?)""",
-                (cursor, total, db.now()),
+                (cursor, notifiable_changes, db.now()),
             )
         self.conn.commit()
         acknowledged = self.api.ack(cursor)
@@ -266,29 +271,18 @@ class CloudSync:
             "applied": total,
             "cursor": cursor,
             "affected_sources": len(affected_total),
+            "notifiable_changes": notifiable_changes,
+            "bootstrap": initial_sync and bool(total),
         }
 
     def check(self) -> dict:
         status = self.api.status()
-        active = status.get("active_window")
-        candidates = status.get("catch_up_windows")
-        if not isinstance(candidates, list):
-            candidates = [active] if active else []
-        windows = {
-            item.get("window_key"): item
-            for item in status.get("windows", [])
-            if isinstance(item, dict)
-        }
-        catch_up_requested = any(
-            isinstance(key, str)
-            and windows.get(key, {}).get("status") != "complete"
-            for key in candidates
-        )
-        catch_up_result = self.api.catch_up() if catch_up_requested else None
         synced = self.sync()
         return {
             "status": status,
-            "catch_up_requested": catch_up_requested,
-            "catch_up_result": catch_up_result,
+            # 招聘门户拒绝 Cloudflare 机房请求。补采由 GitHub 远端主任务和
+            # 本机独立观察承担；cloud-check 只读云端事实，绝不重启旧 405 路径。
+            "catch_up_requested": False,
+            "catch_up_result": None,
             "sync": synced,
         }

@@ -1,9 +1,13 @@
+import pytest
+
 from jobagent.adapters.base import RawJob
 from jobagent.collection import (
     close_guard_tripped,
     job_fingerprint,
+    payload_fingerprint,
     snapshot_digest,
     to_public_payload,
+    validate_snapshot,
 )
 
 
@@ -53,6 +57,43 @@ def test_fingerprint_ignores_description_and_city_order() -> None:
     second = _job(description="new", cities=["北京", "上海"])
 
     assert job_fingerprint(first) == job_fingerprint(second)
+
+
+def test_public_payload_fingerprint_matches_raw_job() -> None:
+    job = _job()
+    payload = to_public_payload("source", "公司", job)
+
+    assert payload_fingerprint(payload) == job_fingerprint(job)
+
+
+class _SnapshotAdapter:
+    skipped_no_id = 0
+
+
+def test_complete_snapshot_validation_rejects_incomplete_identity() -> None:
+    adapter = _SnapshotAdapter()
+    good = [_job(), RawJob(external_id="J2", title="产品", raw_json={})]
+    validate_snapshot(adapter, good)
+
+    for invalid in (
+        [],
+        [RawJob(external_id="", title="产品", raw_json={})],
+        [good[0], good[0]],
+    ):
+        with pytest.raises(ValueError):
+            validate_snapshot(adapter, invalid)
+
+    adapter.skipped_no_id = 1
+    with pytest.raises(ValueError):
+        validate_snapshot(adapter, good)
+
+
+def test_payload_fingerprint_rejects_extra_or_wrong_identity_fields() -> None:
+    payload = to_public_payload("source", "公司", _job())
+    with pytest.raises(ValueError):
+        payload_fingerprint({**payload, "unexpected": "field"})
+    with pytest.raises(ValueError):
+        payload_fingerprint({**payload, "external_id": ""})
 
 
 def test_snapshot_digest_covers_full_public_payload_in_stable_order() -> None:

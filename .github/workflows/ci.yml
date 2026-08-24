@@ -46,4 +46,4 @@ jobs:
         run: uv sync --frozen
 
       - name: Run test suite
-        run: uv run --frozen pytest -q -p no:cacheprovider
+        run: uv run --frozen pytest -q -p no:cacheprovider tests cloud/collector/tests

@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import pytest
-import yaml
 
 from jobagent.adapters.base import RawJob
 from jobagent.remote_probe import main, probe_feishu_sources
@@ -157,34 +156,3 @@ def test_main_writes_report_before_returning_failure(tmp_path: Path) -> None:
     assert "RuntimeError" in summary_text
     assert "private-looking detail" not in summary_text
     assert "SHOULD_NOT_LEAK" not in summary_text
-
-
-def test_remote_probe_workflow_is_one_shot_and_read_only() -> None:
-    path = Path(".github/workflows/remote-feishu-probe.yml")
-    text = path.read_text(encoding="utf-8")
-    workflow = yaml.load(text, Loader=yaml.BaseLoader)
-
-    assert set(workflow["on"]) == {"pull_request"}
-    assert workflow["on"]["pull_request"] == {"types": ["opened"]}
-    assert workflow["permissions"] == {"contents": "read"}
-    assert set(workflow["jobs"]) == {"probe"}
-    job = workflow["jobs"]["probe"]
-    assert job["if"] == "github.event.pull_request.head.repo.full_name == github.repository"
-    assert job["runs-on"] == "ubuntu-24.04"
-    assert job["timeout-minutes"] == "20"
-    assert "secrets." not in text
-    assert "schedule:" not in text
-    assert "workflow_dispatch" not in text
-    run_scripts = "\n".join(
-        step["run"] for step in job["steps"] if "run" in step
-    ).lower()
-    assert "cloudflare" not in run_scripts
-    assert "d1" not in run_scripts
-    assert "notify" not in run_scripts
-    assert "submit" not in run_scripts
-    assert "uv run --frozen python -m jobagent.remote_probe" in text
-    uses = [step["uses"] for step in job["steps"] if "uses" in step]
-    assert uses == [
-        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-        "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",
-    ]

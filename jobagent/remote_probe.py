@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from .collection import snapshot_digest, to_public_payload
+from .collection import snapshot_digest, to_public_payload, validate_snapshot
 from .targets import OBSERVATION_SOURCES, build_observation_adapter
 
 
@@ -35,15 +35,10 @@ def _feishu_specs(
 
 
 def _validate_jobs(adapter: Any, jobs: list[Any]) -> None:
-    if not jobs:
-        raise UntrustedSnapshotError("远端探针不接受空清单")
-    if int(getattr(adapter, "skipped_no_id", 0)) != 0:
-        raise UntrustedSnapshotError("来源清单跳过了缺少 external_id 的行")
-    external_ids = [str(job.external_id).strip() for job in jobs]
-    if any(not external_id for external_id in external_ids):
-        raise UntrustedSnapshotError("来源返回空 external_id")
-    if len(external_ids) != len(set(external_ids)):
-        raise UntrustedSnapshotError("来源返回重复 external_id")
+    try:
+        validate_snapshot(adapter, jobs)
+    except ValueError as exc:
+        raise UntrustedSnapshotError(str(exc)) from None
 
 
 def probe_feishu_sources(

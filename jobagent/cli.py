@@ -160,17 +160,19 @@ def _run_cloud_sync(
     db_path: Path | None,
     check: bool,
 ) -> dict:
-    config, api = _load_cloud_api(config_path)
-    conn = db.connect(db_path)
-    db.init(conn)
-    try:
-        service = cloud_sync.CloudSync(conn, api, client_id=config.client_id)
-        result = service.check() if check else {"sync": service.sync()}
-        result["notification"] = notifications.deliver_pending_cloud(conn)
-        return result
-    finally:
-        conn.close()
-        _close_cloud_api(api)
+    database_path = db_path or db.DB_PATH
+    with observation.exclusive_run(database_path):
+        config, api = _load_cloud_api(config_path)
+        conn = db.connect(database_path)
+        db.init(conn)
+        try:
+            service = cloud_sync.CloudSync(conn, api, client_id=config.client_id)
+            result = service.check() if check else {"sync": service.sync()}
+            result["notification"] = notifications.deliver_pending_cloud(conn)
+            return result
+        finally:
+            conn.close()
+            _close_cloud_api(api)
 
 
 @app.command(name="cloud-sync")
@@ -205,7 +207,7 @@ def cloud_check(
     db_path: Path | None = typer.Option(None, "--db", help="岗位数据库路径"),
     config_path: Path | None = typer.Option(None, "--config", help="本机私有云配置"),
 ) -> None:
-    """联网兜底：有窗口缺口才敲门补采，随后同步新变化。"""
+    """联网兜底：只读云端状态并同步新变化，不触发远端采集。"""
     try:
         result = _run_cloud_sync(
             config_path=config_path, db_path=db_path, check=True
@@ -538,7 +540,10 @@ def observe(
     candidate_report = None
     notification_result = None
     try:
-        with observation.exclusive_run(db_path or db.DB_PATH):
+        with observation.exclusive_run(
+            db_path or db.DB_PATH,
+            wait_seconds=120 if trigger == "scheduled" else 0,
+        ):
             conn = db.connect(db_path)
             db.init(conn)
             try:
