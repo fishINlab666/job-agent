@@ -39,6 +39,120 @@ def test_payload_uses_direct_python_arguments_and_fixed_slot(tmp_path) -> None:
     assert payload["RunAtLoad"] is False
 
 
+def test_cloud_payload_checks_every_fifteen_minutes_without_embedding_token(
+    tmp_path,
+) -> None:
+    payload = scheduler.build_cloud_payload(
+        project_root=tmp_path / "repo",
+        python_executable=tmp_path / "venv/bin/python",
+        db_path=tmp_path / "data/jobagent.db",
+        config_path=tmp_path / "private/cloud.json",
+        log_dir=tmp_path / "logs",
+    )
+
+    assert payload["Label"] == "com.fishinlab.job-agent.cloud-check"
+    assert payload["StartInterval"] == 15 * 60
+    assert payload["RunAtLoad"] is True
+    assert payload["ProgramArguments"] == [
+        str(tmp_path / "venv/bin/python"),
+        "-m",
+        "jobagent.cli",
+        "cloud-check",
+        "--db",
+        str(tmp_path / "data/jobagent.db"),
+        "--config",
+        str(tmp_path / "private/cloud.json"),
+    ]
+    serialized = plistlib.dumps(payload).decode("utf-8")
+    assert "token" not in serialized.lower()
+
+
+def test_cloud_schedule_install_is_private_and_loaded(tmp_path) -> None:
+    project_root = tmp_path / "repo"
+    python = tmp_path / "venv/bin/python"
+    config = tmp_path / "private/cloud.json"
+    project_root.mkdir()
+    python.parent.mkdir(parents=True)
+    python.write_text("python", encoding="utf-8")
+    python.chmod(0o755)
+    config.parent.mkdir()
+    config.write_text('{"token":"not-in-plist"}', encoding="utf-8")
+    config.chmod(0o600)
+    loaded: set[str] = set()
+
+    def fake_launchctl(args: list[str], *, check: bool) -> int:
+        if args[0] == "print":
+            return 0 if args[1].split("/")[-1] in loaded else 1
+        if args[0] == "bootstrap":
+            loaded.add(plistlib.loads(Path(args[-1]).read_bytes())["Label"])
+        elif args[0] == "bootout":
+            loaded.discard(args[1].split("/")[-1])
+        return 0
+
+    label = scheduler.install_cloud_check(
+        project_root=project_root,
+        python_executable=python,
+        db_path=tmp_path / "data/jobagent.db",
+        config_path=config,
+        home=tmp_path / "home",
+        launchctl=fake_launchctl,
+        uid=501,
+    )
+
+    assert label == "com.fishinlab.job-agent.cloud-check"
+    path = tmp_path / f"home/Library/LaunchAgents/{label}.plist"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert label in loaded
+    assert b"not-in-plist" not in path.read_bytes()
+
+
+def test_cloud_schedule_install_restores_previous_task_on_failure(tmp_path) -> None:
+    project_root = tmp_path / "repo"
+    python = tmp_path / "venv/bin/python"
+    config = tmp_path / "private/cloud.json"
+    project_root.mkdir()
+    python.parent.mkdir(parents=True)
+    python.write_text("python", encoding="utf-8")
+    python.chmod(0o755)
+    config.parent.mkdir()
+    config.write_text("{}", encoding="utf-8")
+    config.chmod(0o600)
+    launch_dir = tmp_path / "home/Library/LaunchAgents"
+    launch_dir.mkdir(parents=True)
+    path = launch_dir / "com.fishinlab.job-agent.cloud-check.plist"
+    old = plistlib.dumps({"Label": scheduler.CLOUD_LABEL, "OldVersion": True})
+    path.write_bytes(old)
+    loaded = {scheduler.CLOUD_LABEL}
+    bootstrap_calls = 0
+
+    def failing_launchctl(args: list[str], *, check: bool) -> int:
+        nonlocal bootstrap_calls
+        if args[0] == "print":
+            return 0 if args[1].split("/")[-1] in loaded else 1
+        if args[0] == "bootout":
+            loaded.discard(args[1].split("/")[-1])
+            return 0
+        bootstrap_calls += 1
+        if bootstrap_calls == 1:
+            raise RuntimeError("new bootstrap failed")
+        loaded.add(scheduler.CLOUD_LABEL)
+        return 0
+
+    with pytest.raises(RuntimeError, match="new bootstrap failed"):
+        scheduler.install_cloud_check(
+            project_root=project_root,
+            python_executable=python,
+            db_path=tmp_path / "data/jobagent.db",
+            config_path=config,
+            home=tmp_path / "home",
+            launchctl=failing_launchctl,
+            uid=501,
+        )
+
+    assert path.read_bytes() == old
+    assert loaded == {scheduler.CLOUD_LABEL}
+
+
 def test_install_writes_three_private_plists_and_bootstraps(tmp_path) -> None:
     project_root = tmp_path / "repo"
     python = tmp_path / "venv/bin/python"

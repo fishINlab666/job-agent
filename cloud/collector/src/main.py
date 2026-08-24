@@ -53,7 +53,10 @@ async def route_request(
 
     if request.method == "GET" and path == "/v1/status/today":
         workday = current.astimezone(SHANGHAI).date().isoformat()
-        return await repo.status_for_day(workday), 200
+        payload = await repo.status_for_day(workday)
+        window = active_window(current)
+        payload["active_window"] = window.key if window else None
+        return payload, 200
 
     if request.method == "POST" and path == "/v1/catch-up":
         try:

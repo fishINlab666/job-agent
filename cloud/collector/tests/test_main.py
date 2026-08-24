@@ -99,7 +99,11 @@ def test_status_is_read_only() -> None:
             repository=repo,
         )
         assert status == 200
-        assert payload == {"workday": "2026-08-24", "windows": []}
+        assert payload == {
+            "workday": "2026-08-24",
+            "active_window": "morning",
+            "windows": [],
+        }
         assert database.conn.total_changes == before
 
     asyncio.run(scenario())
