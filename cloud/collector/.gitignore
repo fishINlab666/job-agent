@@ -1,0 +1,4 @@
+src/jobagent/
+src/vendor/
+.wrangler/
+.dev.vars
