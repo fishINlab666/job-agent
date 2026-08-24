@@ -21,7 +21,7 @@ from pathlib import Path
 
 from . import db
 from .adapters.base import Adapter, RawJob
-from .normalize import fingerprint
+from .collection import job_fingerprint
 
 # 消失比例超过这个值就不执行关闭，判定为上游异常
 CLOSE_GUARD_RATIO = 0.4
@@ -51,16 +51,7 @@ def _cities(value: str | list[str] | None) -> list[str]:
 
 def _fp(job: RawJob) -> str:
     """只覆盖「变了就该通知」的字段，description 刻意不含。"""
-    return fingerprint(
-        {
-            "title": job.title,
-            "family": job.job_family,
-            "cities": _cities(job.cities),
-            "recruit_type": job.recruit_type,
-            "department": job.department,
-            "apply_url": job.apply_url,
-        }
-    )
+    return job_fingerprint(job)
 
 
 class RefreshUnsupported(RuntimeError):
