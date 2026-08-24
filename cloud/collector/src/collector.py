@@ -36,13 +36,13 @@ class Collector:
         window_id = await self.repository.get_or_create_window(window, now)
         owner = uuid4().hex
         lease_now = datetime.now(timezone.utc)
-        acquired = await self.repository.acquire_window(
+        lease_generation = await self.repository.acquire_window(
             window_id,
             owner,
             lease_now.isoformat(),
             (lease_now + timedelta(minutes=25)).isoformat(),
         )
-        if not acquired:
+        if lease_generation is None:
             return await self.repository.window_summary(window_id)
         expected = {str(spec["source_key"]) for spec in OBSERVATION_SOURCES}
         successful = await self.repository.successful_sources(window_id)
@@ -52,12 +52,13 @@ class Collector:
             if source_key in successful:
                 continue
             renewal_now = datetime.now(timezone.utc)
-            if not await self.repository.acquire_window(
+            renewed_generation = await self.repository.acquire_window(
                 window_id,
                 owner,
                 renewal_now.isoformat(),
                 (renewal_now + timedelta(minutes=25)).isoformat(),
-            ):
+            )
+            if renewed_generation != lease_generation:
                 return await self.repository.window_summary(window_id)
             run_id = await self.repository.start_run(window_id, source_key, _utc_now())
             try:
@@ -65,7 +66,11 @@ class Collector:
                 raw_jobs = await adapter.fetch_async()
                 if not raw_jobs and not getattr(adapter, "empty_is_authoritative", False):
                     raise RuntimeError("source returned an untrusted empty snapshot")
-                external_ids = [job.external_id for job in raw_jobs]
+                if int(getattr(adapter, "skipped_no_id", 0)) != 0:
+                    raise RuntimeError("source snapshot dropped one or more rows without id")
+                external_ids = [str(job.external_id).strip() for job in raw_jobs]
+                if any(not external_id for external_id in external_ids):
+                    raise RuntimeError("source returned an empty external_id")
                 if len(external_ids) != len(set(external_ids)):
                     raise RuntimeError("source returned duplicate external_id values")
                 payloads = [
@@ -88,6 +93,9 @@ class Collector:
                     snapshot_digest(payloads),
                     len(payloads),
                     _utc_now(),
+                    lease_owner=owner,
+                    lease_generation=lease_generation,
+                    fence_now=renewal_now.isoformat(),
                 )
             except Exception as exc:
                 await self.repository.mark_failed(
@@ -97,5 +105,11 @@ class Collector:
                     _utc_now(),
                 )
 
-        await self.repository.finish_window(window_id, expected, _utc_now(), owner)
+        await self.repository.finish_window(
+            window_id,
+            expected,
+            _utc_now(),
+            owner,
+            lease_generation,
+        )
         return await self.repository.window_summary(window_id)

@@ -9,6 +9,19 @@ from .adapters.base import RawJob
 from .normalize import fingerprint
 
 
+CLOSE_GUARD_RATIO = 0.4
+CLOSE_GUARD_MIN_COUNT = 5
+
+
+def close_guard_tripped(*, live_before: int, disappeared: int) -> bool:
+    """两套持久化共用同一批量关闭守卫，宁可暂缓关闭也不误关。"""
+    return (
+        disappeared >= CLOSE_GUARD_MIN_COUNT
+        and live_before > 0
+        and (disappeared / live_before) > CLOSE_GUARD_RATIO
+    )
+
+
 def _sorted_cities(value: str | list[str] | None) -> list[str]:
     if isinstance(value, str):
         value = json.loads(value or "[]")

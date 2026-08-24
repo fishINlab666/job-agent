@@ -114,6 +114,35 @@ def test_async_fetch_matches_sync_public_jobs(monkeypatch):
     assert [asdict(job) for job in async_jobs] == [asdict(job) for job in sync_jobs]
 
 
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_page_safety_cap_never_returns_a_truncated_snapshot(
+    monkeypatch, async_mode
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.read().decode().split('"pageIndex":')[1].split(",")[0])
+        return httpx.Response(
+            200,
+            json=_body([_position(str(page))], count=52),
+        )
+
+    adapter = TencentJoinAdapter(page_size=1)
+    if async_mode:
+        monkeypatch.setattr(
+            "jobagent.adapters.tencent_join.httpx.AsyncClient",
+            _mock_async_client(handler),
+        )
+        run = lambda: asyncio.run(adapter.fetch_async())
+    else:
+        monkeypatch.setattr(
+            "jobagent.adapters.tencent_join.httpx.Client",
+            _mock_client(handler),
+        )
+        run = adapter.fetch
+
+    with pytest.raises(RuntimeError, match="拒绝返回半截数据"):
+        run()
+
+
 class TestRecruitType:
     """recruit_type 和 grad_year：认不出的标签/projectId 写 None，不兜底。
 

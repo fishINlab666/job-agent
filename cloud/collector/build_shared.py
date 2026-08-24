@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SHARED_FILES = (
+OUTPUT_FILES = (
     "jobagent/__init__.py",
     "jobagent/adapters/__init__.py",
     "jobagent/adapters/base.py",
@@ -18,6 +18,11 @@ SHARED_FILES = (
     "jobagent/normalize.py",
     "jobagent/targets.py",
 )
+GENERATED_FILES = {
+    "jobagent/adapters/__init__.py": (
+        b'"""Worker-only adapter package; registry side effects are forbidden."""\n'
+    ),
+}
 
 
 def build(destination: Path | None = None) -> list[dict[str, str]]:
@@ -27,11 +32,14 @@ def build(destination: Path | None = None) -> list[dict[str, str]]:
     destination.mkdir(parents=True)
 
     manifest = []
-    for relative in SHARED_FILES:
-        source = REPO_ROOT / relative
-        if source.is_symlink() or not source.is_file():
-            raise RuntimeError(f"共用源码必须是普通文件: {relative}")
-        data = source.read_bytes()
+    for relative in OUTPUT_FILES:
+        if relative in GENERATED_FILES:
+            data = GENERATED_FILES[relative]
+        else:
+            source = REPO_ROOT / relative
+            if source.is_symlink() or not source.is_file():
+                raise RuntimeError(f"共用源码必须是普通文件: {relative}")
+            data = source.read_bytes()
         target = destination.parent / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)

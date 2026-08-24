@@ -164,6 +164,17 @@ CREATE TABLE IF NOT EXISTS cloud_sync_state (
     last_synced_at TEXT
 );
 
+-- 每个云端游标最多尝试一次合并通知。dispatching 表示系统调用结果未知，
+-- 为避免重复打扰不会自动重发。
+CREATE TABLE IF NOT EXISTS cloud_notifications (
+    cursor       INTEGER PRIMARY KEY CHECK (cursor >= 0),
+    change_count INTEGER NOT NULL CHECK (change_count > 0),
+    status       TEXT NOT NULL CHECK (status IN ('pending', 'dispatching', 'sent', 'failed')),
+    created_at   TEXT NOT NULL,
+    attempted_at TEXT,
+    error        TEXT
+);
+
 -- 本机通知也是观察闭环的一部分。skipped 表示按策略不打扰，不等于发送失败。
 CREATE TABLE IF NOT EXISTS observation_notifications (
     observation_id INTEGER PRIMARY KEY REFERENCES observation_batches(id),

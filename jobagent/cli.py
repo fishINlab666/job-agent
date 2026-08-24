@@ -165,7 +165,9 @@ def _run_cloud_sync(
     db.init(conn)
     try:
         service = cloud_sync.CloudSync(conn, api, client_id=config.client_id)
-        return service.check() if check else {"sync": service.sync()}
+        result = service.check() if check else {"sync": service.sync()}
+        result["notification"] = notifications.deliver_pending_cloud(conn)
+        return result
     finally:
         conn.close()
         _close_cloud_api(api)
@@ -178,11 +180,19 @@ def cloud_sync_command(
 ) -> None:
     """增量同步云端公开岗位；相同游标重复执行结果不变。"""
     try:
-        result = _run_cloud_sync(
+        outcome = _run_cloud_sync(
             config_path=config_path, db_path=db_path, check=False
-        )["sync"]
+        )
+        result = outcome["sync"]
     except (OSError, ValueError, RuntimeError, httpx.HTTPError) as exc:
         console.print(f"[red]云端同步失败[/red]：{exc}")
+        raise typer.Exit(1)
+    notification = outcome.get("notification")
+    if notification and notification["status"] in {"failed", "unresolved"}:
+        console.print(
+            f"[red]岗位已同步，但系统通知未确认[/red]：游标 "
+            f"{notification['cursor']} · {notification['error']}"
+        )
         raise typer.Exit(1)
     console.print(
         f"[green]云端同步完成[/green] · {result['applied']} 条变化 · "
@@ -203,12 +213,50 @@ def cloud_check(
     except (OSError, ValueError, RuntimeError, httpx.HTTPError) as exc:
         console.print(f"[red]云端检查失败[/red]：{exc}")
         raise typer.Exit(1)
+    notification = result.get("notification")
+    if notification and notification["status"] in {"failed", "unresolved"}:
+        console.print(
+            f"[red]岗位已同步，但系统通知未确认[/red]：游标 "
+            f"{notification['cursor']} · {notification['error']}"
+        )
+        raise typer.Exit(1)
     action = "已请求云端补采" if result["catch_up_requested"] else "无需补采"
     synced = result["sync"]
     console.print(
         f"[green]云端检查完成[/green] · {action} · "
         f"同步 {synced['applied']} 条 · 游标 {synced['cursor']}"
     )
+
+
+@app.command(name="cloud-notification-retry")
+def cloud_notification_retry(
+    cursor: int = typer.Option(..., "--cursor", min=0, help="失败通知的云端游标"),
+    confirmed_not_received: bool = typer.Option(
+        False,
+        "--confirm-not-received",
+        help="确认该通知确实没有显示后再重试",
+    ),
+    db_path: Path | None = typer.Option(None, "--db", help="岗位数据库路径"),
+) -> None:
+    """人工确认未收到后，重试一条不确定或失败的本机通知。"""
+    conn = db.connect(db_path)
+    db.init(conn)
+    try:
+        notifications.requeue_cloud_notification(
+            conn,
+            cursor,
+            confirmed_not_received=confirmed_not_received,
+        )
+        result = notifications.deliver_pending_cloud(conn)
+    except (OSError, ValueError, RuntimeError) as exc:
+        console.print(f"[red]云通知重试失败[/red]：{exc}")
+        raise typer.Exit(1)
+    finally:
+        conn.close()
+    if result["status"] != "sent":
+        console.print(f"[red]云通知仍未确认[/red]：{result['error']}")
+        raise typer.Exit(1)
+    console.print(f"[green]云通知已发送[/green] · 游标 {cursor}")
 
 
 # ---------- unsure 分组与整列降级检测 ----------

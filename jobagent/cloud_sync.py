@@ -90,6 +90,7 @@ class CloudAPI:
 
 class _CacheAdapter:
     empty_is_authoritative = True
+    complete_snapshot_is_authoritative = True
 
     def __init__(self, conn, source_key: str) -> None:
         spec = SOURCE_BY_KEY[source_key]
@@ -102,12 +103,15 @@ class _CacheAdapter:
 
     def fetch(self) -> list[RawJob]:
         rows = self.conn.execute(
-            """SELECT payload_json FROM cloud_job_cache
-               WHERE source_key=? AND is_open=1 ORDER BY external_id""",
+            """SELECT external_id, payload_json, is_open FROM cloud_job_cache
+               WHERE source_key=? ORDER BY external_id""",
             (self.source_key,),
         ).fetchall()
+        known_ids = {str(row["external_id"]) for row in rows}
         jobs = []
         for row in rows:
+            if not row["is_open"]:
+                continue
             payload = json.loads(row["payload_json"])
             jobs.append(
                 RawJob(
@@ -125,6 +129,33 @@ class _CacheAdapter:
                     apply_url=payload.get("apply_url"),
                     apply_system=payload.get("apply_system"),
                     description=payload.get("description"),
+                )
+            )
+        # 云端从部署时建立新基线，历史本机岗位可能早于这条基线。没有收到
+        # explicit closed 事件前，不得仅凭“云端 cache 里没见过”就把它关闭。
+        for row in self.conn.execute(
+            """SELECT * FROM jobs
+               WHERE source_key=? AND closed_at IS NULL ORDER BY external_id""",
+            (self.source_key,),
+        ).fetchall():
+            if str(row["external_id"]) in known_ids:
+                continue
+            jobs.append(
+                RawJob(
+                    external_id=str(row["external_id"]),
+                    title=str(row["title"]),
+                    raw_json={},
+                    job_family=row["job_family"],
+                    raw_category=row["raw_category"],
+                    cities=json.loads(row["cities"] or "[]"),
+                    raw_location=row["raw_location"],
+                    country=row["country"],
+                    department=row["department"],
+                    recruit_type=row["recruit_type"],
+                    grad_year=row["grad_year"],
+                    apply_url=row["apply_url"],
+                    apply_system=row["apply_system"],
+                    description=row["description"],
                 )
             )
         return jobs
@@ -202,22 +233,32 @@ class CloudSync:
                 raise ValueError("云端分页声明未结束但游标没有推进")
 
             affected = self._apply_changes(changes)
-            for source_key in SOURCE_BY_KEY:
-                if source_key in affected:
-                    ingest.sync(self.conn, _CacheAdapter(self.conn, source_key))
             cursor = next_cursor
-            self.conn.execute(
-                """INSERT INTO cloud_sync_state(client_id, cursor, last_synced_at)
-                   VALUES(?,?,?)
-                   ON CONFLICT(client_id) DO UPDATE SET
-                     cursor=excluded.cursor, last_synced_at=excluded.last_synced_at""",
-                (self.client_id, cursor, db.now()),
-            )
-            self.conn.commit()
             total += len(changes)
             affected_total.update(affected)
             if not bool(page.get("has_more")):
                 break
+
+        # 一页只是变化传输分片，不是某个来源的完整岗位快照。必须等全部页落入
+        # cache 后再让既有 ingest 看一次完整来源，否则首轮同步会误关掉后续页岗位。
+        for source_key in SOURCE_BY_KEY:
+            if source_key in affected_total:
+                ingest.sync(self.conn, _CacheAdapter(self.conn, source_key))
+        self.conn.execute(
+            """INSERT INTO cloud_sync_state(client_id, cursor, last_synced_at)
+               VALUES(?,?,?)
+               ON CONFLICT(client_id) DO UPDATE SET
+                 cursor=excluded.cursor, last_synced_at=excluded.last_synced_at""",
+            (self.client_id, cursor, db.now()),
+        )
+        if total:
+            self.conn.execute(
+                """INSERT OR IGNORE INTO cloud_notifications(
+                       cursor, change_count, status, created_at
+                   ) VALUES(?,?,'pending',?)""",
+                (cursor, total, db.now()),
+            )
+        self.conn.commit()
         acknowledged = self.api.ack(cursor)
         if acknowledged < cursor:
             raise RuntimeError("云端确认游标落后于本机")
@@ -230,13 +271,18 @@ class CloudSync:
     def check(self) -> dict:
         status = self.api.status()
         active = status.get("active_window")
+        candidates = status.get("catch_up_windows")
+        if not isinstance(candidates, list):
+            candidates = [active] if active else []
         windows = {
             item.get("window_key"): item
             for item in status.get("windows", [])
             if isinstance(item, dict)
         }
-        catch_up_requested = bool(
-            active and windows.get(active, {}).get("status") != "complete"
+        catch_up_requested = any(
+            isinstance(key, str)
+            and windows.get(key, {}).get("status") != "complete"
+            for key in candidates
         )
         catch_up_result = self.api.catch_up() if catch_up_requested else None
         synced = self.sync()

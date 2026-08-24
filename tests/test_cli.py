@@ -61,6 +61,28 @@ def test_cloud_commands_show_status_and_sync_without_printing_token(tmp_path, mo
     assert config.token not in check.output
 
 
+def test_cloud_check_exits_nonzero_when_notification_is_unresolved(monkeypatch) -> None:
+    monkeypatch.setattr(
+        cli,
+        "_run_cloud_sync",
+        lambda **_kwargs: {
+            "catch_up_requested": False,
+            "sync": {"applied": 1, "cursor": 7},
+            "notification": {
+                "status": "unresolved",
+                "cursor": 7,
+                "error": "通知结果未知，未自动重发",
+            },
+        },
+    )
+
+    result = runner.invoke(cli.app, ["cloud-check"])
+
+    assert result.exit_code == 1
+    assert "岗位已同步，但系统通知未确认" in result.output
+    assert "云端检查完成" not in result.output
+
+
 def test_cloud_schedule_install_passes_private_config_without_reading_token(
     tmp_path, monkeypatch
 ) -> None:

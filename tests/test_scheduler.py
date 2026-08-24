@@ -3,6 +3,7 @@ from __future__ import annotations
 import plistlib
 from pathlib import Path
 import stat
+import threading
 
 import pytest
 
@@ -151,6 +152,128 @@ def test_cloud_schedule_install_restores_previous_task_on_failure(tmp_path) -> N
 
     assert path.read_bytes() == old
     assert loaded == {scheduler.CLOUD_LABEL}
+
+
+def test_cloud_and_direct_observation_schedules_are_mutually_exclusive(tmp_path) -> None:
+    project_root = tmp_path / "repo"
+    python = tmp_path / "venv/bin/python"
+    config = tmp_path / "private/cloud.json"
+    project_root.mkdir()
+    python.parent.mkdir(parents=True)
+    python.write_text("python", encoding="utf-8")
+    python.chmod(0o755)
+    config.parent.mkdir()
+    config.write_text("{}", encoding="utf-8")
+    config.chmod(0o600)
+
+    def with_old_observer(args: list[str], *, check: bool) -> int:
+        if args[0] == "print":
+            return int(not args[1].endswith("observe.0930"))
+        raise AssertionError("互斥检查后不得修改 launchd")
+
+    with pytest.raises(RuntimeError, match="旧本机采集任务仍在运行"):
+        scheduler.install_cloud_check(
+            project_root=project_root,
+            python_executable=python,
+            db_path=tmp_path / "data/jobagent.db",
+            config_path=config,
+            home=tmp_path / "home",
+            launchctl=with_old_observer,
+            uid=501,
+        )
+
+    def with_cloud_check(args: list[str], *, check: bool) -> int:
+        if args[0] == "print":
+            return int(not args[1].endswith(scheduler.CLOUD_LABEL))
+        raise AssertionError("互斥检查后不得修改 launchd")
+
+    with pytest.raises(RuntimeError, match="不能同时启用"):
+        scheduler.install(
+            project_root=project_root,
+            python_executable=python,
+            db_path=tmp_path / "data/jobagent.db",
+            home=tmp_path / "home",
+            launchctl=with_cloud_check,
+            uid=501,
+        )
+
+
+def test_concurrent_schedule_installs_cannot_both_win(tmp_path) -> None:
+    project_root = tmp_path / "repo"
+    python = tmp_path / "venv/bin/python"
+    config = tmp_path / "private/cloud.json"
+    home = tmp_path / "home"
+    project_root.mkdir()
+    python.parent.mkdir(parents=True)
+    python.write_text("python", encoding="utf-8")
+    python.chmod(0o755)
+    config.parent.mkdir()
+    config.write_text("{}", encoding="utf-8")
+    config.chmod(0o600)
+    loaded: set[str] = set()
+    state_lock = threading.Lock()
+    start = threading.Barrier(3)
+    outcomes: list[str] = []
+
+    def fake_launchctl(args: list[str], *, check: bool) -> int:
+        with state_lock:
+            if args[0] == "print":
+                return 0 if args[1].split("/")[-1] in loaded else 1
+            if args[0] == "bootstrap":
+                loaded.add(plistlib.loads(Path(args[-1]).read_bytes())["Label"])
+            elif args[0] == "bootout":
+                loaded.discard(args[1].split("/")[-1])
+            return 0
+
+    def install_observers() -> None:
+        start.wait()
+        try:
+            scheduler.install(
+                project_root=project_root,
+                python_executable=python,
+                db_path=tmp_path / "data/jobagent.db",
+                home=home,
+                launchctl=fake_launchctl,
+                uid=501,
+            )
+            outcomes.append("observation")
+        except RuntimeError:
+            outcomes.append("observation-blocked")
+
+    def install_cloud() -> None:
+        start.wait()
+        try:
+            scheduler.install_cloud_check(
+                project_root=project_root,
+                python_executable=python,
+                db_path=tmp_path / "data/jobagent.db",
+                config_path=config,
+                home=home,
+                launchctl=fake_launchctl,
+                uid=501,
+            )
+            outcomes.append("cloud")
+        except RuntimeError:
+            outcomes.append("cloud-blocked")
+
+    threads = [
+        threading.Thread(target=install_observers),
+        threading.Thread(target=install_cloud),
+    ]
+    for thread in threads:
+        thread.start()
+    start.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    observers_loaded = any(label.startswith(scheduler.LABEL_PREFIX) for label in loaded)
+    cloud_loaded = scheduler.CLOUD_LABEL in loaded
+    assert observers_loaded != cloud_loaded
+    assert sorted(outcomes) in (
+        ["cloud", "observation-blocked"],
+        ["cloud-blocked", "observation"],
+    )
 
 
 def test_install_writes_three_private_plists_and_bootstraps(tmp_path) -> None:

@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 import httpx
 
-from jobagent import db
+from jobagent import db, ingest
+from jobagent.adapters.base import RawJob
 from jobagent.cloud_sync import CloudConfig, CloudSync
 from jobagent.cloud_sync import CloudAPI
 
@@ -37,6 +38,7 @@ class FakeAPI:
         self.status_payload = {
             "workday": "2026-08-24",
             "active_window": "morning",
+            "catch_up_windows": ["morning"],
             "windows": [],
         }
         self.pages: dict[int, dict] = {}
@@ -59,6 +61,49 @@ class FakeAPI:
     def ack(self, cursor: int) -> int:
         self.acks.append(cursor)
         return cursor
+
+
+class _ExistingJobs:
+    source_key = "tencent_join"
+    company = "腾讯"
+    system = "tencent_join"
+    entry_url = "https://join.qq.com"
+    tenant = None
+    empty_is_authoritative = True
+
+    def fetch(self) -> list[RawJob]:
+        return [
+            RawJob(
+                external_id=external_id,
+                title=title,
+                raw_json={},
+                job_family="operations",
+                cities=["深圳"],
+                country="中国",
+                department="平台",
+                recruit_type="campus",
+                grad_year="27",
+                apply_url=f"https://join.qq.com/{external_id}",
+                apply_system="tencent_join",
+                description="公开岗位描述",
+            )
+            for external_id, title in (("J1", "产品运营"), ("J2", "产品经理"))
+        ]
+
+
+class _ManyExistingJobs(_ExistingJobs):
+    def fetch(self) -> list[RawJob]:
+        return [
+            RawJob(
+                external_id=f"J{index}",
+                title=f"岗位 {index}",
+                raw_json={},
+                job_family="operations",
+                cities=["深圳"],
+                apply_url=f"https://join.qq.com/J{index}",
+            )
+            for index in range(10)
+        ]
 
 
 def _conn(tmp_path: Path) -> sqlite3.Connection:
@@ -95,11 +140,15 @@ def test_sync_replays_cloud_changes_once_and_updates_existing_job_state(tmp_path
     ).fetchone()
     assert tuple(row) == ("产品运营", None)
     assert api.acks == [1]
+    assert tuple(conn.execute(
+        "SELECT cursor, change_count, status FROM cloud_notifications"
+    ).fetchone()) == (1, 1, "pending")
 
     replay = syncer.sync()
     assert replay == {"applied": 0, "cursor": 1, "affected_sources": 0}
     assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
     assert api.acks == [1, 1]
+    assert conn.execute("SELECT COUNT(*) FROM cloud_notifications").fetchone()[0] == 1
 
     changed = _payload("高级产品运营")
     api.pages[1] = {
@@ -122,6 +171,115 @@ def test_sync_replays_cloud_changes_once_and_updates_existing_job_state(tmp_path
     assert conn.execute("SELECT closed_at IS NOT NULL FROM jobs").fetchone()[0] == 1
 
 
+def test_initial_paginated_sync_never_publishes_a_partial_source_snapshot(
+    tmp_path,
+) -> None:
+    conn = _conn(tmp_path)
+    ingest.sync(conn, _ExistingJobs())
+    conn.execute("DELETE FROM events")
+    conn.commit()
+    api = FakeAPI()
+    api.pages[0] = {
+        "changes": [_change(1, "opened", _payload("产品运营"))],
+        "next_cursor": 1,
+        "has_more": True,
+    }
+    second = _payload("产品经理")
+    second["external_id"] = "J2"
+    second["apply_url"] = "https://join.qq.com/J2"
+    api.pages[1] = {
+        "changes": [_change(2, "opened", second)],
+        "next_cursor": 2,
+        "has_more": False,
+    }
+
+    result = CloudSync(conn, api, client_id="local-mac").sync()
+
+    assert result == {"applied": 2, "cursor": 2, "affected_sources": 1}
+    assert conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE source_key='tencent_join' AND closed_at IS NULL"
+    ).fetchone()[0] == 2
+    assert conn.execute(
+        "SELECT COUNT(*) FROM events WHERE kind IN ('job_closed','job_reopened')"
+    ).fetchone()[0] == 0
+
+
+def test_initial_cloud_baseline_does_not_close_preexisting_local_only_jobs(
+    tmp_path,
+) -> None:
+    conn = _conn(tmp_path)
+    ingest.sync(conn, _ManyExistingJobs())
+    conn.execute("DELETE FROM events")
+    conn.commit()
+    api = FakeAPI()
+    first, second = _payload("岗位 0"), _payload("岗位 1")
+    first["external_id"], second["external_id"] = "J0", "J1"
+    first["apply_url"] = "https://join.qq.com/J0"
+    second["apply_url"] = "https://join.qq.com/J1"
+    api.pages[0] = {
+        "changes": [
+            _change(1, "opened", first),
+            _change(2, "opened", second),
+        ],
+        "next_cursor": 2,
+        "has_more": False,
+    }
+
+    result = CloudSync(conn, api, client_id="local-mac").sync()
+
+    assert result["cursor"] == 2
+    assert conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE source_key='tencent_join' AND closed_at IS NOT NULL"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM events WHERE kind='source_degraded'"
+    ).fetchone()[0] == 0
+
+
+def test_explicit_cloud_closed_events_bypass_the_untrusted_fetch_guard(
+    tmp_path,
+) -> None:
+    conn = _conn(tmp_path)
+    ingest.sync(conn, _ManyExistingJobs())
+    api = FakeAPI()
+    opened = []
+    for cursor in range(1, 11):
+        payload = _payload(f"岗位 {cursor - 1}")
+        payload["external_id"] = f"J{cursor - 1}"
+        payload["apply_url"] = f"https://join.qq.com/J{cursor - 1}"
+        opened.append(_change(cursor, "opened", payload))
+    api.pages[0] = {
+        "changes": opened,
+        "next_cursor": 10,
+        "has_more": False,
+    }
+    syncer = CloudSync(conn, api, client_id="local-mac")
+    assert syncer.sync()["cursor"] == 10
+    conn.execute("DELETE FROM events")
+    conn.commit()
+
+    closed = []
+    for cursor in range(11, 19):
+        index = cursor - 9
+        payload = _payload(f"岗位 {index}")
+        payload["external_id"] = f"J{index}"
+        payload["apply_url"] = f"https://join.qq.com/J{index}"
+        closed.append(_change(cursor, "closed", payload))
+    api.pages[10] = {
+        "changes": closed,
+        "next_cursor": 18,
+        "has_more": False,
+    }
+
+    assert syncer.sync()["cursor"] == 18
+    assert conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE source_key='tencent_join' AND closed_at IS NOT NULL"
+    ).fetchone()[0] == 8
+    assert conn.execute(
+        "SELECT COUNT(*) FROM events WHERE kind='source_degraded'"
+    ).fetchone()[0] == 0
+
+
 def test_check_only_requests_catch_up_when_active_window_has_a_gap(tmp_path) -> None:
     conn = _conn(tmp_path)
     api = FakeAPI()
@@ -139,6 +297,22 @@ def test_check_only_requests_catch_up_when_active_window_has_a_gap(tmp_path) -> 
     assert api.catch_up_calls == 1
 
 
+def test_check_requests_catch_up_for_a_just_ended_window(tmp_path) -> None:
+    conn = _conn(tmp_path)
+    api = FakeAPI()
+    api.status_payload = {
+        "workday": "2026-08-24",
+        "active_window": None,
+        "catch_up_windows": ["evening"],
+        "windows": [{"window_key": "evening", "status": "partial"}],
+    }
+
+    result = CloudSync(conn, api, client_id="local-mac").check()
+
+    assert result["catch_up_requested"] is True
+    assert api.catch_up_calls == 1
+
+
 def test_cloud_tables_only_store_public_jobs_and_cursor(tmp_path) -> None:
     conn = _conn(tmp_path)
     tables = {
@@ -147,7 +321,7 @@ def test_cloud_tables_only_store_public_jobs_and_cursor(tmp_path) -> None:
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'cloud_%'"
         )
     }
-    assert tables == {"cloud_job_cache", "cloud_sync_state"}
+    assert tables == {"cloud_job_cache", "cloud_sync_state", "cloud_notifications"}
     columns = {
         row[1]
         for table in tables

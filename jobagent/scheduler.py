@@ -5,10 +5,12 @@
 """
 from __future__ import annotations
 
+import fcntl
 import os
 import plistlib
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,6 +24,31 @@ CLOUD_CHECK_INTERVAL_SECONDS = 15 * 60
 
 class SchedulerRollbackError(RuntimeError):
     pass
+
+
+@contextmanager
+def _scheduler_lock(home: Path):
+    """串行化新旧调度的检查、安装、验证与回滚。"""
+    lock_dir = Path(home) / "Library" / "Application Support" / "job-agent"
+    if lock_dir.is_symlink():
+        raise ValueError(f"拒绝使用符号链接锁目录：{lock_dir}")
+    lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not lock_dir.is_dir():
+        raise ValueError(f"调度锁目录不是普通目录：{lock_dir}")
+    lock_dir.chmod(0o700)
+    lock_path = lock_dir / "scheduler.lock"
+    descriptor = os.open(
+        lock_path,
+        os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def _label(slot: str) -> str:
@@ -144,7 +171,7 @@ def _atomic_write(path: Path, content: bytes, mode: int) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def install(
+def _install_observation_unlocked(
     *,
     project_root: Path,
     python_executable: Path,
@@ -165,6 +192,10 @@ def install(
 
     user_id = os.getuid() if uid is None else uid
     domain = f"gui/{user_id}"
+    if _is_loaded(launchctl, domain, CLOUD_LABEL):
+        raise RuntimeError(
+            "云端同步任务正在运行；旧本机采集与云端同步任务不能同时启用"
+        )
     launch_dir = home / "Library" / "LaunchAgents"
     log_dir = home / "Library" / "Logs" / "job-agent"
     launch_dir.mkdir(parents=True, exist_ok=True)
@@ -254,6 +285,26 @@ def install(
     return list(SCHEDULE_SLOTS)
 
 
+def install(
+    *,
+    project_root: Path,
+    python_executable: Path,
+    db_path: Path,
+    home: Path,
+    launchctl: Callable[..., Any] = _system_launchctl,
+    uid: int | None = None,
+) -> list[str]:
+    with _scheduler_lock(home):
+        return _install_observation_unlocked(
+            project_root=project_root,
+            python_executable=python_executable,
+            db_path=db_path,
+            home=home,
+            launchctl=launchctl,
+            uid=uid,
+        )
+
+
 def uninstall(
     *,
     home: Path,
@@ -295,7 +346,7 @@ def _validate_cloud_install_inputs(
         raise ValueError(f"云配置权限过宽（应为 0600）：{config_path}")
 
 
-def install_cloud_check(
+def _install_cloud_check_unlocked(
     *,
     project_root: Path,
     python_executable: Path,
@@ -319,6 +370,15 @@ def install_cloud_check(
 
     user_id = os.getuid() if uid is None else uid
     domain = f"gui/{user_id}"
+    loaded_observers = [
+        _label(slot)
+        for slot in SCHEDULE_SLOTS
+        if _is_loaded(launchctl, domain, _label(slot))
+    ]
+    if loaded_observers:
+        raise RuntimeError(
+            "旧本机采集任务仍在运行；远端首轮验收后先停旧任务，再启用云端同步"
+        )
     launch_dir = home / "Library" / "LaunchAgents"
     log_dir = home / "Library" / "Logs" / "job-agent"
     launch_dir.mkdir(parents=True, exist_ok=True)
@@ -380,6 +440,28 @@ def install_cloud_check(
             ) from original
         raise
     return CLOUD_LABEL
+
+
+def install_cloud_check(
+    *,
+    project_root: Path,
+    python_executable: Path,
+    db_path: Path,
+    config_path: Path,
+    home: Path,
+    launchctl: Callable[..., Any] = _system_launchctl,
+    uid: int | None = None,
+) -> str:
+    with _scheduler_lock(home):
+        return _install_cloud_check_unlocked(
+            project_root=project_root,
+            python_executable=python_executable,
+            db_path=db_path,
+            config_path=config_path,
+            home=home,
+            launchctl=launchctl,
+            uid=uid,
+        )
 
 
 def uninstall_cloud_check(

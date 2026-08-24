@@ -1,5 +1,10 @@
 from jobagent.adapters.base import RawJob
-from jobagent.collection import job_fingerprint, snapshot_digest, to_public_payload
+from jobagent.collection import (
+    close_guard_tripped,
+    job_fingerprint,
+    snapshot_digest,
+    to_public_payload,
+)
 
 
 def _job(*, description: str = "old", cities: list[str] | None = None) -> RawJob:
@@ -58,3 +63,9 @@ def test_snapshot_digest_covers_full_public_payload_in_stable_order() -> None:
     assert snapshot_digest([first, other]) == snapshot_digest([other, first])
     assert snapshot_digest([first]) != snapshot_digest([changed])
     assert len(snapshot_digest([first])) == 64
+
+
+def test_close_guard_is_shared_by_local_and_cloud_collectors() -> None:
+    assert close_guard_tripped(live_before=10, disappeared=8) is True
+    assert close_guard_tripped(live_before=10, disappeared=4) is False
+    assert close_guard_tripped(live_before=4, disappeared=3) is False

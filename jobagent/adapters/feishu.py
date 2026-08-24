@@ -368,6 +368,13 @@ class FeishuAdapter:
             jobs.append(job)
         return jobs
 
+    def _ensure_complete(self, rows: list[dict], total: int | None) -> None:
+        if total is None or len(rows) != total:
+            raise RuntimeError(
+                f"{self.source_key}: 分页安全上限触发，count={total!r} "
+                f"只拿到 {len(rows)} 条，拒绝返回半截数据"
+            )
+
     def fetch(self) -> list[RawJob]:
         self._begin_fetch()
         rows: list[dict] = []
@@ -391,6 +398,7 @@ class FeishuAdapter:
                 if len(rows) >= total or offset > MAX_OFFSET:
                     break
 
+        self._ensure_complete(rows, total)
         return self._jobs_from_rows(rows)
 
     async def fetch_async(self) -> list[RawJob]:
@@ -419,6 +427,7 @@ class FeishuAdapter:
                 if len(rows) >= total or offset > MAX_OFFSET:
                     break
 
+        self._ensure_complete(rows, total)
         return self._jobs_from_rows(rows)
 
     def _to_raw_job(self, row: dict) -> RawJob | None:

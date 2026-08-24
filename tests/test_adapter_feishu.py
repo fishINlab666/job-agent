@@ -112,6 +112,33 @@ def test_async_fetch_matches_sync_public_jobs(monkeypatch):
     assert async_adapter.empty_is_authoritative is False
 
 
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_offset_safety_cap_never_returns_a_truncated_snapshot(
+    monkeypatch, async_mode
+):
+    monkeypatch.setattr("jobagent.adapters.feishu.MAX_OFFSET", 0)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_body([_post("1")], count=2))
+
+    adapter = FeishuAdapter("nio", company="蔚来", portal="campus", page_size=1)
+    if async_mode:
+        monkeypatch.setattr(
+            "jobagent.adapters.feishu.httpx.AsyncClient",
+            _mock_async_client(handler),
+        )
+        run = lambda: asyncio.run(adapter.fetch_async())
+    else:
+        monkeypatch.setattr(
+            "jobagent.adapters.feishu.httpx.Client",
+            _mock_client(handler),
+        )
+        run = adapter.fetch
+
+    with pytest.raises(RuntimeError, match="拒绝返回半截数据"):
+        run()
+
+
 def test_async_authoritative_empty_matches_sync(monkeypatch):
     adapter = FeishuAdapter("luckin")
     monkeypatch.setattr(

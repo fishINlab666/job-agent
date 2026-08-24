@@ -151,6 +151,13 @@ class TencentJoinAdapter:
             raise RuntimeError("searchPosition 返回 0 条，疑似接口变更，拒绝当成空结果")
         return [self._to_raw_job(row) for row in rows]
 
+    def _ensure_complete(self, rows: list[dict], total: int | None) -> None:
+        if total is None or len(rows) != total:
+            raise RuntimeError(
+                f"tencent_join: 分页安全上限触发，count={total!r} "
+                f"只拿到 {len(rows)} 条，拒绝返回半截数据"
+            )
+
     def fetch(self) -> list[RawJob]:
         rows: list[dict] = []
         with httpx.Client(timeout=self.timeout, headers=self._headers()) as client:
@@ -176,6 +183,7 @@ class TencentJoinAdapter:
                     break
                 page += 1
 
+        self._ensure_complete(rows, total)
         return self._jobs_from_rows(rows)
 
     async def fetch_async(self) -> list[RawJob]:
@@ -205,6 +213,7 @@ class TencentJoinAdapter:
                     break
                 page += 1
 
+        self._ensure_complete(rows, total)
         return self._jobs_from_rows(rows)
 
     def _to_raw_job(self, row: dict) -> RawJob:

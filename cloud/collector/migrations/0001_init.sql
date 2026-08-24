@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS collection_windows (
     completed_at TEXT,
     lease_owner TEXT,
     lease_expires_at TEXT,
+    lease_generation INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     UNIQUE(workday, window_key)
 );
@@ -38,6 +39,13 @@ CREATE TABLE IF NOT EXISTS staged_jobs (
     fingerprint TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     PRIMARY KEY(run_id, source_key, external_id)
+);
+
+CREATE TABLE IF NOT EXISTS source_heads (
+    source_key TEXT PRIMARY KEY,
+    window_id INTEGER NOT NULL REFERENCES collection_windows(id),
+    window_opens_at TEXT NOT NULL,
+    run_id INTEGER NOT NULL REFERENCES source_runs(id)
 );
 
 CREATE TABLE IF NOT EXISTS cloud_jobs (
@@ -69,7 +77,14 @@ CREATE TABLE IF NOT EXISTS sync_clients (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS catch_up_gate (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_requested_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_source_runs_window_status
     ON source_runs(window_id, status, source_key);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_source_runs_one_success
+    ON source_runs(window_id, source_key) WHERE status='success';
 CREATE INDEX IF NOT EXISTS idx_job_changes_cursor ON job_changes(cursor);
 CREATE INDEX IF NOT EXISTS idx_cloud_jobs_open ON cloud_jobs(source_key, closed_at);

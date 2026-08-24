@@ -5,7 +5,12 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from jobagent.collection import snapshot_digest
+from jobagent.collection import (
+    CLOSE_GUARD_MIN_COUNT,
+    CLOSE_GUARD_RATIO,
+    close_guard_tripped,
+    snapshot_digest,
+)
 
 if __package__:
     from .windowing import Window
@@ -35,6 +40,16 @@ def _to_python(value: Any) -> Any:
 def _rows(result: Any) -> list[dict]:
     values = _to_python(getattr(result, "results", None)) or []
     return [dict(_to_python(row)) for row in values]
+
+
+def _changes(result: Any) -> int:
+    meta = _to_python(getattr(result, "meta", None))
+    value = (
+        meta.get("changes", 0)
+        if isinstance(meta, dict)
+        else getattr(meta, "changes", 0)
+    )
+    return int(_to_python(value) or 0)
 
 
 class D1Repository:
@@ -71,18 +86,24 @@ class D1Repository:
         owner: str,
         now: str,
         expires_at: str,
-    ) -> bool:
+    ) -> int | None:
         result = await self.database.prepare(
             """UPDATE collection_windows SET
-                   status='running', lease_owner=?, lease_expires_at=?
+                   status='running',
+                   lease_generation=CASE
+                     WHEN lease_owner=? THEN lease_generation
+                     ELSE lease_generation + 1
+                   END,
+                   lease_owner=?, lease_expires_at=?
                WHERE id=? AND status<>'complete'
                  AND (
                    lease_owner IS NULL OR lease_expires_at IS NULL
                    OR lease_expires_at<=? OR lease_owner=?
                  )
-               RETURNING id"""
-        ).bind(owner, expires_at, window_id, now, owner).run()
-        return len(_rows(result)) == 1
+               RETURNING lease_generation"""
+        ).bind(owner, owner, expires_at, window_id, now, owner).run()
+        rows = _rows(result)
+        return int(rows[0]["lease_generation"]) if len(rows) == 1 else None
 
     async def start_run(self, window_id: int, source_key: str, now: str) -> int:
         result = await self.database.prepare(
@@ -147,7 +168,7 @@ class D1Repository:
 
     async def _change_counts(
         self, run_id: int, source_key: str
-    ) -> ApplyResult:
+    ) -> tuple[ApplyResult, int]:
         statements = [
             self.database.prepare(
                 """SELECT COUNT(*) AS n FROM staged_jobs s
@@ -171,10 +192,14 @@ class D1Repository:
                            AND s.external_id=c.external_id
                      )"""
             ).bind(source_key, run_id),
+            self.database.prepare(
+                """SELECT COUNT(*) AS n FROM cloud_jobs
+                   WHERE source_key=? AND closed_at IS NULL"""
+            ).bind(source_key),
         ]
         results = await self.database.batch(statements)
         counts = [int(_rows(result)[0]["n"]) for result in results]
-        return ApplyResult(*counts)
+        return ApplyResult(*counts[:3]), counts[3]
 
     async def finalize_snapshot(
         self,
@@ -184,6 +209,10 @@ class D1Repository:
         expected_digest: str,
         expected_count: int,
         now: str,
+        *,
+        lease_owner: str,
+        lease_generation: int,
+        fence_now: str,
     ) -> ApplyResult:
         payloads = await self._staged_payloads(run_id, source_key)
         if len(payloads) != expected_count:
@@ -195,9 +224,65 @@ class D1Repository:
             raise ValueError(
                 f"staged snapshot digest {actual_digest} != expected {expected_digest}"
             )
-        counts = await self._change_counts(run_id, source_key)
-
+        owns_source_head = """EXISTS(
+            SELECT 1 FROM source_heads h
+            WHERE h.source_key=? AND h.run_id=? AND h.window_id=?
+        )"""
         statements = [
+            self.database.prepare(
+                """INSERT INTO source_heads(
+                       source_key, window_id, window_opens_at, run_id
+                   )
+                   SELECT ?, w.id, w.opens_at, r.id
+                   FROM collection_windows w
+                   JOIN source_runs r ON r.window_id=w.id
+                   WHERE w.id=? AND r.id=? AND r.source_key=?
+                     AND r.status='running'
+                     AND w.lease_owner=? AND w.lease_generation=?
+                     AND w.lease_expires_at>?
+                     AND NOT (
+                       (SELECT COUNT(*) FROM cloud_jobs c
+                        WHERE c.source_key=? AND c.closed_at IS NULL
+                          AND NOT EXISTS(
+                            SELECT 1 FROM staged_jobs s
+                            WHERE s.run_id=? AND s.source_key=c.source_key
+                              AND s.external_id=c.external_id
+                          )) >= ?
+                       AND (SELECT COUNT(*) FROM cloud_jobs c
+                            WHERE c.source_key=? AND c.closed_at IS NULL) > 0
+                       AND CAST((SELECT COUNT(*) FROM cloud_jobs c
+                                 WHERE c.source_key=? AND c.closed_at IS NULL
+                                   AND NOT EXISTS(
+                                     SELECT 1 FROM staged_jobs s
+                                     WHERE s.run_id=? AND s.source_key=c.source_key
+                                       AND s.external_id=c.external_id
+                                   )) AS REAL)
+                           / (SELECT COUNT(*) FROM cloud_jobs c
+                              WHERE c.source_key=? AND c.closed_at IS NULL) > ?
+                     )
+                   ON CONFLICT(source_key) DO UPDATE SET
+                     window_id=excluded.window_id,
+                     window_opens_at=excluded.window_opens_at,
+                     run_id=excluded.run_id
+                   WHERE source_heads.window_opens_at<=excluded.window_opens_at
+                   RETURNING run_id"""
+            ).bind(
+                source_key,
+                window_id,
+                run_id,
+                source_key,
+                lease_owner,
+                lease_generation,
+                fence_now,
+                source_key,
+                run_id,
+                CLOSE_GUARD_MIN_COUNT,
+                source_key,
+                source_key,
+                run_id,
+                source_key,
+                CLOSE_GUARD_RATIO,
+            ),
             self.database.prepare(
                 """INSERT OR IGNORE INTO job_changes(
                        run_id, source_key, external_id, kind, payload_json, occurred_at
@@ -206,8 +291,12 @@ class D1Repository:
                    FROM staged_jobs s
                    LEFT JOIN cloud_jobs c
                      ON c.source_key=s.source_key AND c.external_id=s.external_id
-                   WHERE s.run_id=? AND s.source_key=? AND c.external_id IS NULL"""
-            ).bind(run_id, now, run_id, source_key),
+                   WHERE s.run_id=? AND s.source_key=? AND c.external_id IS NULL
+                     AND """ + owns_source_head
+            ).bind(
+                run_id, now, run_id, source_key,
+                source_key, run_id, window_id,
+            ),
             self.database.prepare(
                 """INSERT OR IGNORE INTO job_changes(
                        run_id, source_key, external_id, kind, payload_json, occurred_at
@@ -217,8 +306,12 @@ class D1Repository:
                    JOIN cloud_jobs c
                      ON c.source_key=s.source_key AND c.external_id=s.external_id
                    WHERE s.run_id=? AND s.source_key=?
-                     AND (c.fingerprint<>s.fingerprint OR c.closed_at IS NOT NULL)"""
-            ).bind(run_id, now, run_id, source_key),
+                     AND (c.fingerprint<>s.fingerprint OR c.closed_at IS NOT NULL)
+                     AND """ + owns_source_head
+            ).bind(
+                run_id, now, run_id, source_key,
+                source_key, run_id, window_id,
+            ),
             self.database.prepare(
                 """INSERT OR IGNORE INTO job_changes(
                        run_id, source_key, external_id, kind, payload_json, occurred_at
@@ -230,8 +323,11 @@ class D1Repository:
                          SELECT 1 FROM staged_jobs s
                          WHERE s.run_id=? AND s.source_key=c.source_key
                            AND s.external_id=c.external_id
-                     )"""
-            ).bind(run_id, now, source_key, run_id),
+                     ) AND """ + owns_source_head
+            ).bind(
+                run_id, now, source_key, run_id,
+                source_key, run_id, window_id,
+            ),
             self.database.prepare(
                 """INSERT INTO cloud_jobs(
                        source_key, external_id, company, fingerprint, payload_json,
@@ -240,14 +336,18 @@ class D1Repository:
                    SELECT source_key, external_id,
                           json_extract(payload_json, '$.company'),
                           fingerprint, payload_json, ?, ?, NULL
-                   FROM staged_jobs WHERE run_id=? AND source_key=? AND 1
+                   FROM staged_jobs WHERE run_id=? AND source_key=?
+                     AND """ + owns_source_head + """
                    ON CONFLICT(source_key, external_id) DO UPDATE SET
                        company=excluded.company,
                        fingerprint=excluded.fingerprint,
                        payload_json=excluded.payload_json,
                        last_seen_at=excluded.last_seen_at,
                        closed_at=NULL"""
-            ).bind(now, now, run_id, source_key),
+            ).bind(
+                now, now, run_id, source_key,
+                source_key, run_id, window_id,
+            ),
             self.database.prepare(
                 """UPDATE cloud_jobs SET closed_at=?, last_seen_at=?
                    WHERE source_key=? AND closed_at IS NULL
@@ -255,13 +355,18 @@ class D1Repository:
                          SELECT 1 FROM staged_jobs s
                          WHERE s.run_id=? AND s.source_key=cloud_jobs.source_key
                            AND s.external_id=cloud_jobs.external_id
-                     )"""
-            ).bind(now, now, source_key, run_id),
+                     ) AND """ + owns_source_head
+            ).bind(
+                now, now, source_key, run_id,
+                source_key, run_id, window_id,
+            ),
             self.database.prepare(
                 """UPDATE source_runs SET
                        status='success', completed_at=?, fetched_count=?,
                        snapshot_sha256=?, error_kind=NULL, error_message=NULL
-                   WHERE id=? AND window_id=? AND source_key=? AND status='running'"""
+                   WHERE id=? AND window_id=? AND source_key=? AND status='running'
+                     AND """ + owns_source_head + """
+                   RETURNING id"""
             ).bind(
                 now,
                 expected_count,
@@ -269,13 +374,36 @@ class D1Repository:
                 run_id,
                 window_id,
                 source_key,
+                source_key,
+                run_id,
+                window_id,
             ),
             self.database.prepare(
-                "DELETE FROM staged_jobs WHERE run_id=? AND source_key=?"
-            ).bind(run_id, source_key),
+                """DELETE FROM staged_jobs WHERE run_id=? AND source_key=?
+                   AND """ + owns_source_head
+            ).bind(
+                run_id, source_key,
+                source_key, run_id, window_id,
+            ),
         ]
-        await self.database.batch(statements)
-        return counts
+        results = await self.database.batch(statements)
+        if _rows(results[0]) != [{"run_id": run_id}] or _rows(results[-2]) != [
+            {"id": run_id}
+        ]:
+            counts, live_before = await self._change_counts(run_id, source_key)
+            if close_guard_tripped(
+                live_before=live_before, disappeared=counts.closed
+            ):
+                raise RuntimeError(
+                    f"关闭守卫触发：{counts.closed}/{live_before} 个岗位消失，"
+                    "拒绝发布云端关闭事实"
+                )
+            raise RuntimeError("source publication lease is stale")
+        return ApplyResult(
+            opened=_changes(results[1]),
+            updated=_changes(results[2]),
+            closed=_changes(results[3]),
+        )
 
     async def mark_failed(
         self,
@@ -305,12 +433,41 @@ class D1Repository:
         ).bind(window_id).run()
         return {str(row["source_key"]) for row in _rows(result)}
 
+    async def mark_missed(
+        self,
+        window: Window,
+        expected_sources: set[str],
+        now: str,
+    ) -> str:
+        window_id = await self.get_or_create_window(window, now)
+        successful = await self.successful_sources(window_id)
+        if successful == expected_sources:
+            return "complete"
+        result = await self.database.prepare(
+            """UPDATE collection_windows SET
+                   status='missed', completed_at=?,
+                   last_error='collection grace elapsed before all sources succeeded',
+                   lease_owner=NULL, lease_expires_at=NULL
+               WHERE id=? AND status<>'complete'
+                 AND (
+                   lease_owner IS NULL OR lease_expires_at IS NULL
+                   OR lease_expires_at<=?
+                 )
+               RETURNING status"""
+        ).bind(now, window_id, now).run()
+        rows = _rows(result)
+        if rows:
+            return str(rows[0]["status"])
+        summary = await self.window_summary(window_id)
+        return str(summary["status"])
+
     async def finish_window(
         self,
         window_id: int,
         expected_sources: set[str],
         now: str,
         owner: str | None = None,
+        lease_generation: int | None = None,
     ) -> str:
         successful = await self.successful_sources(window_id)
         status = "complete" if successful == expected_sources else "partial"
@@ -319,7 +476,9 @@ class D1Repository:
             """UPDATE collection_windows SET
                    status=?, completed_at=?, last_error=?,
                    lease_owner=NULL, lease_expires_at=NULL
-               WHERE id=? AND (? IS NULL OR lease_owner=?)
+               WHERE id=?
+                 AND (? IS NULL OR lease_owner=?)
+                 AND (? IS NULL OR lease_generation=?)
                RETURNING status"""
         ).bind(
             status,
@@ -328,6 +487,8 @@ class D1Repository:
             window_id,
             owner,
             owner,
+            lease_generation,
+            lease_generation,
         ).run()
         if len(_rows(result)) != 1:
             raise RuntimeError("window lease changed before final readback")
@@ -371,6 +532,16 @@ class D1Repository:
         ).bind(workday).run()
         windows = [await self.window_summary(int(row["id"])) for row in _rows(result)]
         return {"workday": workday, "windows": windows}
+
+    async def claim_catch_up(self, now: str, allowed_after: str) -> bool:
+        result = await self.database.prepare(
+            """INSERT INTO catch_up_gate(id, last_requested_at) VALUES(1, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 last_requested_at=excluded.last_requested_at
+               WHERE catch_up_gate.last_requested_at<=?
+               RETURNING id"""
+        ).bind(now, allowed_after).run()
+        return _rows(result) == [{"id": 1}]
 
     async def changes_after(self, after: int, *, limit: int = 200) -> dict:
         if after < 0 or not 1 <= limit <= 500:

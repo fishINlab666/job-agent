@@ -92,3 +92,30 @@ def test_partial_window_retries_only_failed_source() -> None:
         assert len(calls) == 5
 
     asyncio.run(scenario())
+
+
+def test_invalid_or_dropped_source_identity_cannot_publish_success() -> None:
+    async def scenario() -> None:
+        for invalid_kind in ("empty-id", "skipped-id"):
+            database = FakeD1(MIGRATION)
+
+            class InvalidAdapter(FakeAdapter):
+                async def fetch_async(self) -> list[RawJob]:
+                    if invalid_kind == "skipped-id":
+                        self.skipped_no_id = 1
+                        return await super().fetch_async()
+                    return [RawJob(external_id="", title="坏岗位", raw_json={})]
+
+            def build(spec):
+                return InvalidAdapter(spec["source_key"], spec["company"])
+
+            result = await Collector(
+                D1Repository(database), adapter_builder=build
+            ).run_window(_window(), trigger="cron")
+            assert result["status"] == "partial"
+            assert all(item["status"] == "failed" for item in result["sources"])
+            assert database.conn.execute(
+                "SELECT COUNT(*) FROM cloud_jobs"
+            ).fetchone()[0] == 0
+
+    asyncio.run(scenario())

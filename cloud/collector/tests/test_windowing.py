@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from cloud.collector.src.windowing import active_window
+from cloud.collector.src.windowing import active_window, catch_up_windows, expired_windows
 
 
 @pytest.mark.parametrize(
@@ -38,3 +38,21 @@ def test_naive_datetime_is_rejected() -> None:
 
 def test_utc_datetime_is_accepted() -> None:
     assert active_window(datetime(2026, 8, 24, 1, tzinfo=timezone.utc)).key == "morning"
+
+
+def test_just_ended_window_remains_available_for_one_hour() -> None:
+    windows = catch_up_windows(datetime.fromisoformat("2026-08-24T04:30:00+00:00"))
+    assert [window.key for window in windows] == ["morning", "afternoon"]
+
+    after_evening = catch_up_windows(
+        datetime.fromisoformat("2026-08-24T14:30:00+00:00")
+    )
+    assert [window.key for window in after_evening] == ["evening"]
+
+
+def test_window_becomes_missed_only_after_catch_up_grace() -> None:
+    before = expired_windows(datetime.fromisoformat("2026-08-24T04:59:59+00:00"))
+    assert before == ()
+
+    after = expired_windows(datetime.fromisoformat("2026-08-24T05:00:00+00:00"))
+    assert [window.key for window in after] == ["morning"]

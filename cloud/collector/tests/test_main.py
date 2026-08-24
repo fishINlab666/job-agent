@@ -31,6 +31,8 @@ class FakeRequest:
         self.headers = FakeHeaders()
         if token is not None:
             self.headers["authorization"] = f"Bearer {token}"
+        if method == "POST":
+            self.headers["content-type"] = "application/json"
         self._body = {} if body is None else body
 
     async def json(self):
@@ -102,6 +104,7 @@ def test_status_is_read_only() -> None:
         assert payload == {
             "workday": "2026-08-24",
             "active_window": "morning",
+            "catch_up_windows": ["morning"],
             "windows": [],
         }
         assert database.conn.total_changes == before
@@ -165,5 +168,66 @@ def test_technical_trial_is_explicit_and_does_not_backfill_a_real_window(monkeyp
         )
         assert status == 200
         assert payload == {"window_key": "technical-trial", "trigger": "technical-trial"}
+
+    asyncio.run(scenario())
+
+
+def test_catch_up_can_recover_the_just_ended_evening_window(monkeypatch) -> None:
+    class FakeCollector:
+        def __init__(self, repository) -> None:
+            self.repository = repository
+
+        async def run_window(self, window, *, trigger):
+            return {"window_key": window.key, "trigger": trigger}
+
+    async def scenario() -> None:
+        database = FakeD1(MIGRATION)
+        monkeypatch.setattr("cloud.collector.src.main.Collector", FakeCollector)
+        payload, status = await route_request(
+            FakeRequest("POST", "/v1/catch-up", token="correct-token", body={}),
+            FakeEnv(database),
+            now=datetime(2026, 8, 24, 14, 30, tzinfo=timezone.utc),
+        )
+        assert status == 200
+        assert payload == {
+            "windows": [{"window_key": "evening", "trigger": "catch-up"}]
+        }
+
+    asyncio.run(scenario())
+
+
+def test_catch_up_is_rate_limited_and_requires_json(monkeypatch) -> None:
+    class FakeCollector:
+        def __init__(self, repository) -> None:
+            self.repository = repository
+
+        async def run_window(self, window, *, trigger):
+            return {"window_key": window.key}
+
+    async def scenario() -> None:
+        database = FakeD1(MIGRATION)
+        env = FakeEnv(database)
+        monkeypatch.setattr("cloud.collector.src.main.Collector", FakeCollector)
+        first = FakeRequest("POST", "/v1/catch-up", token="correct-token", body={})
+        _payload, first_status = await route_request(
+            first, env, now=datetime(2026, 8, 24, 1, tzinfo=timezone.utc)
+        )
+        assert first_status == 200
+
+        _payload, second_status = await route_request(
+            FakeRequest("POST", "/v1/catch-up", token="correct-token", body={}),
+            env,
+            now=datetime(2026, 8, 24, 1, 1, tzinfo=timezone.utc),
+        )
+        assert second_status == 429
+
+        wrong_type = FakeRequest(
+            "POST", "/v1/catch-up", token="correct-token", body={}
+        )
+        wrong_type.headers["content-type"] = "text/plain"
+        _payload, wrong_status = await route_request(
+            wrong_type, env, now=datetime(2026, 8, 24, 1, 10, tzinfo=timezone.utc)
+        )
+        assert wrong_status == 415
 
     asyncio.run(scenario())
