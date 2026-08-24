@@ -308,9 +308,68 @@ class FeishuAdapter:
         """
         return f"{self.base}/{self.portal or 'index'}/position/{post_id}/detail"
 
-    def fetch(self) -> list[RawJob]:
+    def _begin_fetch(self) -> None:
         self.empty_is_authoritative = False
         self.skipped_no_id = 0
+
+    def _decode_page(
+        self,
+        resp: httpx.Response,
+        *,
+        total: int | None,
+        offset: int,
+        fetched: int,
+    ) -> tuple[int, list[dict], bool]:
+        # 假租户返回 400 + 非 JSON。raise_for_status 先把它变成异常，
+        # 不然下面 .json() 抛的是 JSONDecodeError，看不出是「这个租户不存在」。
+        resp.raise_for_status()
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{self.source_key}: 响应不是 JSON（HTTP {resp.status_code}），"
+                f"疑似租户不存在或接口变更"
+            ) from exc
+
+        code = body.get("code")
+        if code == PORTAL_NOT_FOUND:
+            raise RuntimeError(
+                f"{self.source_key}: 门户 {self.portal!r} 在 {self.base} 上不存在"
+                f"（code={code}）。这是配置错，不是「当下没岗位」——"
+                f"要么门户改名了，要么这家压根没这个门户。"
+                f"用 docs/kb/company-portals.md 里的命令重新确认门户路径。"
+            )
+        if code != 0:
+            raise RuntimeError(
+                f"{self.source_key}: 接口返回 code={code!r} "
+                f"msg={body.get('msg')!r}"
+            )
+
+        data = body.get("data") or {}
+        page_total = total if total is not None else int(data.get("count") or 0)
+        if page_total == 0:
+            return page_total, [], True
+
+        batch = data.get("job_post_list") or []
+        if not batch:
+            raise RuntimeError(
+                f"{self.source_key}: offset={offset} 返回空批次，"
+                f"但 count={page_total} 只拿到 {fetched} 条，拒绝返回半截数据"
+            )
+        return page_total, batch, False
+
+    def _jobs_from_rows(self, rows: list[dict]) -> list[RawJob]:
+        jobs = []
+        for row in rows:
+            job = self._to_raw_job(row)
+            if job is None:
+                self.skipped_no_id += 1
+                continue
+            jobs.append(job)
+        return jobs
+
+    def fetch(self) -> list[RawJob]:
+        self._begin_fetch()
         rows: list[dict] = []
         total: int | None = None
         offset = 0
@@ -321,65 +380,46 @@ class FeishuAdapter:
                     f"{self.base}/api/v1/search/job/posts",
                     json={"keyword": "", "limit": self.page_size, "offset": offset},
                 )
-                # 假租户返回 400 + 非 JSON。raise_for_status 先把它变成异常，
-                # 不然下面 .json() 抛的是 JSONDecodeError，看不出是「这个租户不存在」。
-                resp.raise_for_status()
-                try:
-                    body = resp.json()
-                except ValueError as exc:
-                    raise RuntimeError(
-                        f"{self.source_key}: 响应不是 JSON（HTTP {resp.status_code}），"
-                        f"疑似租户不存在或接口变更"
-                    ) from exc
-
-                code = body.get("code")
-                if code == PORTAL_NOT_FOUND:
-                    # 单独一条分支只为了把错误消息说清楚：这不是「上游挂了」，
-                    # 是「这个租户没有这个门户」，处理动作是改配置不是重试。
-                    # 注意它落在 code != 0 的抛出路径上，**不置**
-                    # empty_is_authoritative —— 详见 PORTAL_NOT_FOUND 的注释。
-                    raise RuntimeError(
-                        f"{self.source_key}: 门户 {self.portal!r} 在 {self.base} 上不存在"
-                        f"（code={code}）。这是配置错，不是「当下没岗位」——"
-                        f"要么门户改名了，要么这家压根没这个门户。"
-                        f"用 docs/kb/company-portals.md 里的命令重新确认门户路径。"
-                    )
-                if code != 0:
-                    raise RuntimeError(
-                        f"{self.source_key}: 接口返回 code={code!r} "
-                        f"msg={body.get('msg')!r}"
-                    )
-
-                data = body.get("data") or {}
-                if total is None:
-                    total = int(data.get("count") or 0)
-                    if total == 0:
-                        # 真租户 + 当下没岗位。这是事实，不是故障 —— 立标记，
-                        # ingest 那侧凭它决定不抛。
-                        self.empty_is_authoritative = True
-                        return []
-
-                batch = data.get("job_post_list") or []
-                if not batch:
-                    # count 说还有，却给了空批次 = 半残返回。宁可整轮失败，
-                    # 也不能静默截断：截断后 diff 会把没拿到的那批判成已关闭。
-                    raise RuntimeError(
-                        f"{self.source_key}: offset={offset} 返回空批次，"
-                        f"但 count={total} 只拿到 {len(rows)} 条，拒绝返回半截数据"
-                    )
+                total, batch, authoritative_empty = self._decode_page(
+                    resp, total=total, offset=offset, fetched=len(rows)
+                )
+                if authoritative_empty:
+                    self.empty_is_authoritative = True
+                    return []
                 rows.extend(batch)
                 offset += self.page_size
                 if len(rows) >= total or offset > MAX_OFFSET:
                     break
 
-        jobs = []
-        for row in rows:
-            job = self._to_raw_job(row)
-            if job is None:
-                self.skipped_no_id += 1
-                continue
-            jobs.append(job)
-        return jobs
+        return self._jobs_from_rows(rows)
+
+    async def fetch_async(self) -> list[RawJob]:
+        """Cloudflare Worker 使用的异步网络入口，语义与 fetch() 相同。"""
+        self._begin_fetch()
+        rows: list[dict] = []
+        total: int | None = None
+        offset = 0
+
+        async with httpx.AsyncClient(
+            timeout=self.timeout, headers=self._headers()
+        ) as client:
+            while True:
+                resp = await client.post(
+                    f"{self.base}/api/v1/search/job/posts",
+                    json={"keyword": "", "limit": self.page_size, "offset": offset},
+                )
+                total, batch, authoritative_empty = self._decode_page(
+                    resp, total=total, offset=offset, fetched=len(rows)
+                )
+                if authoritative_empty:
+                    self.empty_is_authoritative = True
+                    return []
+                rows.extend(batch)
+                offset += self.page_size
+                if len(rows) >= total or offset > MAX_OFFSET:
+                    break
+
+        return self._jobs_from_rows(rows)
 
     def _to_raw_job(self, row: dict) -> RawJob | None:
         # 没 id 就跳过并计数。**不许 fallback 到 title** —— title 会重复，
