@@ -6,12 +6,14 @@ import sys
 from datetime import date
 from pathlib import Path
 
+import httpx
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from . import (
     ats,
+    cloud_sync,
     db,
     ingest,
     match,
@@ -31,6 +33,8 @@ console = Console()
 _run_observation = observation.run
 _install_observation_schedule = scheduler.install
 _uninstall_observation_schedule = scheduler.uninstall
+_install_cloud_check_schedule = scheduler.install_cloud_check
+_uninstall_cloud_check_schedule = scheduler.uninstall_cloud_check
 _observation_progress = observation.progress
 _capture_official_candidates = official_truth.capture_candidates
 _deliver_observation_notification = notifications.deliver_observation
@@ -114,6 +118,145 @@ def _fmt_cities(cities: list[str]) -> str:
     这里不写行号：这个函数本身就把下面的行号推移过一次。
     """
     return "、".join(cities) if cities else "未写"
+
+
+def _load_cloud_api(config_path: Path | None):
+    config = cloud_sync.CloudConfig.load(config_path)
+    return config, cloud_sync.CloudAPI(config)
+
+
+def _close_cloud_api(api) -> None:
+    close = getattr(api, "close", None)
+    if close is not None:
+        close()
+
+
+@app.command(name="cloud-status")
+def cloud_status(
+    config_path: Path | None = typer.Option(None, "--config", help="本机私有云配置"),
+) -> None:
+    """查看云端今天三个弹性窗口，不修改本机或云端状态。"""
+    try:
+        _config, api = _load_cloud_api(config_path)
+        try:
+            payload = api.status()
+        finally:
+            _close_cloud_api(api)
+    except (OSError, ValueError, RuntimeError, httpx.HTTPError) as exc:
+        console.print(f"[red]云端状态读取失败[/red]：{exc}")
+        raise typer.Exit(1)
+    windows = {item["window_key"]: item for item in payload.get("windows", [])}
+    table = Table(title=f"云端观察 · {payload.get('workday', '未知日期')}")
+    table.add_column("窗口")
+    table.add_column("状态")
+    for key, label in (("morning", "早"), ("afternoon", "午"), ("evening", "晚")):
+        table.add_row(f"{label}（{key}）", windows.get(key, {}).get("status", "未开始"))
+    console.print(table)
+
+
+def _run_cloud_sync(
+    *,
+    config_path: Path | None,
+    db_path: Path | None,
+    check: bool,
+) -> dict:
+    config, api = _load_cloud_api(config_path)
+    conn = db.connect(db_path)
+    db.init(conn)
+    try:
+        service = cloud_sync.CloudSync(conn, api, client_id=config.client_id)
+        result = service.check() if check else {"sync": service.sync()}
+        result["notification"] = notifications.deliver_pending_cloud(conn)
+        return result
+    finally:
+        conn.close()
+        _close_cloud_api(api)
+
+
+@app.command(name="cloud-sync")
+def cloud_sync_command(
+    db_path: Path | None = typer.Option(None, "--db", help="岗位数据库路径"),
+    config_path: Path | None = typer.Option(None, "--config", help="本机私有云配置"),
+) -> None:
+    """增量同步云端公开岗位；相同游标重复执行结果不变。"""
+    try:
+        outcome = _run_cloud_sync(
+            config_path=config_path, db_path=db_path, check=False
+        )
+        result = outcome["sync"]
+    except (OSError, ValueError, RuntimeError, httpx.HTTPError) as exc:
+        console.print(f"[red]云端同步失败[/red]：{exc}")
+        raise typer.Exit(1)
+    notification = outcome.get("notification")
+    if notification and notification["status"] in {"failed", "unresolved"}:
+        console.print(
+            f"[red]岗位已同步，但系统通知未确认[/red]：游标 "
+            f"{notification['cursor']} · {notification['error']}"
+        )
+        raise typer.Exit(1)
+    console.print(
+        f"[green]云端同步完成[/green] · {result['applied']} 条变化 · "
+        f"游标 {result['cursor']}"
+    )
+
+
+@app.command(name="cloud-check")
+def cloud_check(
+    db_path: Path | None = typer.Option(None, "--db", help="岗位数据库路径"),
+    config_path: Path | None = typer.Option(None, "--config", help="本机私有云配置"),
+) -> None:
+    """联网兜底：有窗口缺口才敲门补采，随后同步新变化。"""
+    try:
+        result = _run_cloud_sync(
+            config_path=config_path, db_path=db_path, check=True
+        )
+    except (OSError, ValueError, RuntimeError, httpx.HTTPError) as exc:
+        console.print(f"[red]云端检查失败[/red]：{exc}")
+        raise typer.Exit(1)
+    notification = result.get("notification")
+    if notification and notification["status"] in {"failed", "unresolved"}:
+        console.print(
+            f"[red]岗位已同步，但系统通知未确认[/red]：游标 "
+            f"{notification['cursor']} · {notification['error']}"
+        )
+        raise typer.Exit(1)
+    action = "已请求云端补采" if result["catch_up_requested"] else "无需补采"
+    synced = result["sync"]
+    console.print(
+        f"[green]云端检查完成[/green] · {action} · "
+        f"同步 {synced['applied']} 条 · 游标 {synced['cursor']}"
+    )
+
+
+@app.command(name="cloud-notification-retry")
+def cloud_notification_retry(
+    cursor: int = typer.Option(..., "--cursor", min=0, help="失败通知的云端游标"),
+    confirmed_not_received: bool = typer.Option(
+        False,
+        "--confirm-not-received",
+        help="确认该通知确实没有显示后再重试",
+    ),
+    db_path: Path | None = typer.Option(None, "--db", help="岗位数据库路径"),
+) -> None:
+    """人工确认未收到后，重试一条不确定或失败的本机通知。"""
+    conn = db.connect(db_path)
+    db.init(conn)
+    try:
+        notifications.requeue_cloud_notification(
+            conn,
+            cursor,
+            confirmed_not_received=confirmed_not_received,
+        )
+        result = notifications.deliver_pending_cloud(conn)
+    except (OSError, ValueError, RuntimeError) as exc:
+        console.print(f"[red]云通知重试失败[/red]：{exc}")
+        raise typer.Exit(1)
+    finally:
+        conn.close()
+    if result["status"] != "sent":
+        console.print(f"[red]云通知仍未确认[/red]：{result['error']}")
+        raise typer.Exit(1)
+    console.print(f"[green]云通知已发送[/green] · 游标 {cursor}")
 
 
 # ---------- unsure 分组与整列降级检测 ----------
@@ -633,6 +776,36 @@ def schedule_uninstall(
     """停止自动观察；历史记录和数据库不删除。"""
     _uninstall_observation_schedule(home=home.resolve())
     console.print("[green]自动观察已停止[/green]，历史记录已保留。")
+
+
+@app.command(name="cloud-schedule-install")
+def cloud_schedule_install(
+    project_root: Path = typer.Option(db.ROOT, "--project-root"),
+    python_executable: Path = typer.Option(Path(sys.executable), "--python"),
+    db_path: Path = typer.Option(db.DB_PATH, "--db"),
+    config_path: Path = typer.Option(
+        cloud_sync.DEFAULT_CONFIG_PATH, "--config", help="本机私有云配置"
+    ),
+    home: Path = typer.Option(Path.home(), "--home", hidden=True),
+) -> None:
+    """每 15 分钟检查云端；缺口才补采，并同步公开岗位变化。"""
+    _install_cloud_check_schedule(
+        project_root=project_root.resolve(),
+        python_executable=python_executable.absolute(),
+        db_path=db_path.resolve(),
+        config_path=config_path.absolute(),
+        home=home.resolve(),
+    )
+    console.print("[green]云端兜底检查已安装[/green] · 每 15 分钟")
+
+
+@app.command(name="cloud-schedule-uninstall")
+def cloud_schedule_uninstall(
+    home: Path = typer.Option(Path.home(), "--home", hidden=True),
+) -> None:
+    """停止云端兜底检查；本机配置、数据库和历史记录保留。"""
+    _uninstall_cloud_check_schedule(home=home.resolve())
+    console.print("[green]云端兜底检查已停止[/green]，本机数据已保留。")
 
 
 @app.command()

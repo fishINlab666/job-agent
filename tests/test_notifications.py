@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 from jobagent import db, notifications
 from jobagent.targets import OBSERVATION_SOURCES
 
@@ -207,4 +209,108 @@ def test_notification_failure_is_persisted_and_returned(tmp_path) -> None:
     ).fetchone()
     assert row["status"] == "failed"
     assert "CalledProcessError" in row["error"]
+    conn.close()
+
+
+def test_cloud_changes_send_one_merged_notification_per_cursor(tmp_path) -> None:
+    conn = db.connect(tmp_path / "cloud.db")
+    db.init(conn)
+    conn.execute(
+        """INSERT INTO cloud_notifications(cursor, change_count, status, created_at)
+           VALUES(7, 3, 'pending', '2026-08-24T10:00:00+08:00')"""
+    )
+    conn.commit()
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    first = notifications.deliver_pending_cloud(
+        conn, runner=runner, attempted_at="2026-08-24T10:01:00+08:00"
+    )
+    second = notifications.deliver_pending_cloud(conn, runner=runner)
+
+    assert first == {"status": "sent", "cursor": 7, "error": None}
+    assert second == {"status": "skipped", "cursor": None, "error": None}
+    assert len(calls) == 1
+    assert calls[0][0][-1] == "已同步 3 条公开岗位变化，请打开 Job Agent 查看。"
+    assert calls[0][1]["shell"] is False
+    assert conn.execute(
+        "SELECT status FROM cloud_notifications WHERE cursor=7"
+    ).fetchone()[0] == "sent"
+    conn.close()
+
+
+def test_uncertain_cloud_notification_is_not_automatically_retried(tmp_path) -> None:
+    conn = db.connect(tmp_path / "cloud.db")
+    db.init(conn)
+    conn.execute(
+        """INSERT INTO cloud_notifications(cursor, change_count, status, created_at)
+           VALUES(8, 1, 'pending', '2026-08-24T10:00:00+08:00')"""
+    )
+    conn.commit()
+    calls = 0
+
+    def runner(argv, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise subprocess.TimeoutExpired(argv, 10)
+
+    first = notifications.deliver_pending_cloud(conn, runner=runner)
+    second = notifications.deliver_pending_cloud(conn, runner=runner)
+
+    assert first["status"] == "failed"
+    assert second["status"] == "unresolved"
+    assert calls == 1
+    conn.close()
+
+
+def test_cloud_notification_only_requeues_after_explicit_confirmation(tmp_path) -> None:
+    conn = db.connect(tmp_path / "cloud.db")
+    db.init(conn)
+    conn.execute(
+        """INSERT INTO cloud_notifications(
+               cursor, change_count, status, created_at, attempted_at, error)
+           VALUES(9, 1, 'failed', 't0', 't1', 'denied')"""
+    )
+    conn.commit()
+
+    with pytest.raises(ValueError, match="明确确认"):
+        notifications.requeue_cloud_notification(
+            conn, 9, confirmed_not_received=False
+        )
+    notifications.requeue_cloud_notification(
+        conn, 9, confirmed_not_received=True
+    )
+
+    assert tuple(conn.execute(
+        "SELECT status, attempted_at, error FROM cloud_notifications WHERE cursor=9"
+    ).fetchone()) == ("pending", None, None)
+    conn.close()
+
+
+def test_older_failed_cloud_notification_blocks_newer_pending_one(tmp_path) -> None:
+    conn = db.connect(tmp_path / "cloud.db")
+    db.init(conn)
+    conn.executemany(
+        """INSERT INTO cloud_notifications(
+               cursor, change_count, status, created_at, error)
+           VALUES(?,?,?,?,?)""",
+        [
+            (8, 1, "failed", "t0", "denied"),
+            (9, 2, "pending", "t1", None),
+        ],
+    )
+    conn.commit()
+
+    def should_not_run(*_args, **_kwargs):
+        raise AssertionError("不得越过更早的失败通知")
+
+    result = notifications.deliver_pending_cloud(conn, runner=should_not_run)
+
+    assert result == {"status": "unresolved", "cursor": 8, "error": "denied"}
+    assert conn.execute(
+        "SELECT status FROM cloud_notifications WHERE cursor=9"
+    ).fetchone()[0] == "pending"
     conn.close()

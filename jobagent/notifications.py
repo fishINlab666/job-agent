@@ -131,3 +131,89 @@ def deliver_observation(
     )
     conn.commit()
     return {"policy": policy, "status": status, "error": error}
+
+
+def deliver_pending_cloud(
+    conn,
+    *,
+    runner: Runner = subprocess.run,
+    attempted_at: str | None = None,
+) -> dict:
+    """发送最早的一条云端合并通知；同一游标绝不自动重发。"""
+    row = conn.execute(
+        """SELECT cursor, change_count, status, error FROM cloud_notifications
+           WHERE status IN ('pending', 'dispatching', 'failed')
+           ORDER BY cursor LIMIT 1"""
+    ).fetchone()
+    if row is None:
+        return {"status": "skipped", "cursor": None, "error": None}
+    if row["status"] != "pending":
+        return {
+            "status": "unresolved",
+            "cursor": int(row["cursor"]),
+            "error": row["error"] or "通知结果未知，未自动重发",
+        }
+
+    attempted = attempted_at or db.now()
+    claimed = conn.execute(
+        """UPDATE cloud_notifications SET status='dispatching', attempted_at=?
+           WHERE cursor=? AND status='pending'""",
+        (attempted, row["cursor"]),
+    ).rowcount
+    conn.commit()
+    if claimed != 1:
+        return {"status": "skipped", "cursor": None, "error": None}
+
+    argv = [
+        "/usr/bin/osascript",
+        "-e",
+        "on run argv",
+        "-e",
+        "display notification (item 2 of argv) with title (item 1 of argv)",
+        "-e",
+        "end run",
+        "Job Agent 云端岗位更新",
+        f"已同步 {int(row['change_count'])} 条公开岗位变化，请打开 Job Agent 查看。",
+    ]
+    status = "sent"
+    error = None
+    try:
+        runner(
+            argv,
+            check=True,
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        status = "failed"
+        error = f"{type(exc).__name__}: {exc}"
+
+    conn.execute(
+        """UPDATE cloud_notifications SET status=?, error=?
+           WHERE cursor=? AND status='dispatching'""",
+        (status, error, row["cursor"]),
+    )
+    conn.commit()
+    return {"status": status, "cursor": int(row["cursor"]), "error": error}
+
+
+def requeue_cloud_notification(
+    conn,
+    cursor: int,
+    *,
+    confirmed_not_received: bool,
+) -> None:
+    """仅在用户明确确认未收到后，允许重试一条失败或未知通知。"""
+    if not confirmed_not_received:
+        raise ValueError("必须明确确认没有收到该通知")
+    changed = conn.execute(
+        """UPDATE cloud_notifications
+           SET status='pending', attempted_at=NULL, error=NULL
+           WHERE cursor=? AND status IN ('dispatching', 'failed')""",
+        (cursor,),
+    ).rowcount
+    conn.commit()
+    if changed != 1:
+        raise ValueError("没有找到可重试的失败或未知云通知")

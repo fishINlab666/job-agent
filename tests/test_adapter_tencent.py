@@ -6,6 +6,9 @@
 """
 from __future__ import annotations
 
+import asyncio
+from dataclasses import asdict
+
 import httpx
 import pytest
 
@@ -15,6 +18,7 @@ from jobagent.adapters.tencent_join import TencentJoinAdapter
 # 必须在打补丁之前把真类抓住。工厂里直接写 httpx.Client 会调到被 patch 的
 # 那个符号，也就是它自己 —— RecursionError，而不是一个看得懂的失败。
 _REAL_CLIENT = httpx.Client
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
 
 
 def _mock_client(handler):
@@ -27,6 +31,14 @@ def _mock_client(handler):
     def factory(*_args, **kwargs):
         kwargs.pop("transport", None)
         return _REAL_CLIENT(transport=httpx.MockTransport(handler), **kwargs)
+
+    return factory
+
+
+def _mock_async_client(handler):
+    def factory(*_args, **kwargs):
+        kwargs.pop("transport", None)
+        return _REAL_ASYNC_CLIENT(transport=httpx.MockTransport(handler), **kwargs)
 
     return factory
 
@@ -81,6 +93,54 @@ def _fetch(monkeypatch, handler) -> tuple:
     ad = TencentJoinAdapter()
     monkeypatch.setattr("jobagent.adapters.tencent_join.httpx.Client", _mock_client(handler))
     return ad, ad.fetch()
+
+
+def test_async_fetch_matches_sync_public_jobs(monkeypatch):
+    pages = [_body([_position("1"), _position("2", title="产品经理")])]
+    sync_adapter = TencentJoinAdapter()
+    monkeypatch.setattr(
+        "jobagent.adapters.tencent_join.httpx.Client",
+        _mock_client(_serve(pages)),
+    )
+    sync_jobs = sync_adapter.fetch()
+
+    async_adapter = TencentJoinAdapter()
+    monkeypatch.setattr(
+        "jobagent.adapters.tencent_join.httpx.AsyncClient",
+        _mock_async_client(_serve(pages)),
+    )
+    async_jobs = asyncio.run(async_adapter.fetch_async())
+
+    assert [asdict(job) for job in async_jobs] == [asdict(job) for job in sync_jobs]
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_page_safety_cap_never_returns_a_truncated_snapshot(
+    monkeypatch, async_mode
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.read().decode().split('"pageIndex":')[1].split(",")[0])
+        return httpx.Response(
+            200,
+            json=_body([_position(str(page))], count=52),
+        )
+
+    adapter = TencentJoinAdapter(page_size=1)
+    if async_mode:
+        monkeypatch.setattr(
+            "jobagent.adapters.tencent_join.httpx.AsyncClient",
+            _mock_async_client(handler),
+        )
+        run = lambda: asyncio.run(adapter.fetch_async())
+    else:
+        monkeypatch.setattr(
+            "jobagent.adapters.tencent_join.httpx.Client",
+            _mock_client(handler),
+        )
+        run = adapter.fetch
+
+    with pytest.raises(RuntimeError, match="拒绝返回半截数据"):
+        run()
 
 
 class TestRecruitType:

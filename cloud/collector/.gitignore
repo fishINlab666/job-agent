@@ -1,0 +1,6 @@
+src/jobagent/
+src/vendor/
+.venv-workers/
+python_modules/
+.wrangler/
+.dev.vars

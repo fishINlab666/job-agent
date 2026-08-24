@@ -3,6 +3,7 @@ from __future__ import annotations
 import plistlib
 from pathlib import Path
 import stat
+import threading
 
 import pytest
 
@@ -37,6 +38,242 @@ def test_payload_uses_direct_python_arguments_and_fixed_slot(tmp_path) -> None:
     }
     assert "Program" not in payload
     assert payload["RunAtLoad"] is False
+
+
+def test_cloud_payload_checks_every_fifteen_minutes_without_embedding_token(
+    tmp_path,
+) -> None:
+    payload = scheduler.build_cloud_payload(
+        project_root=tmp_path / "repo",
+        python_executable=tmp_path / "venv/bin/python",
+        db_path=tmp_path / "data/jobagent.db",
+        config_path=tmp_path / "private/cloud.json",
+        log_dir=tmp_path / "logs",
+    )
+
+    assert payload["Label"] == "com.fishinlab.job-agent.cloud-check"
+    assert payload["StartInterval"] == 15 * 60
+    assert payload["RunAtLoad"] is True
+    assert payload["ProgramArguments"] == [
+        str(tmp_path / "venv/bin/python"),
+        "-m",
+        "jobagent.cli",
+        "cloud-check",
+        "--db",
+        str(tmp_path / "data/jobagent.db"),
+        "--config",
+        str(tmp_path / "private/cloud.json"),
+    ]
+    serialized = plistlib.dumps(payload).decode("utf-8")
+    assert "token" not in serialized.lower()
+
+
+def test_cloud_schedule_install_is_private_and_loaded(tmp_path) -> None:
+    project_root = tmp_path / "repo"
+    python = tmp_path / "venv/bin/python"
+    config = tmp_path / "private/cloud.json"
+    project_root.mkdir()
+    python.parent.mkdir(parents=True)
+    python.write_text("python", encoding="utf-8")
+    python.chmod(0o755)
+    config.parent.mkdir()
+    config.write_text('{"token":"not-in-plist"}', encoding="utf-8")
+    config.chmod(0o600)
+    loaded: set[str] = set()
+
+    def fake_launchctl(args: list[str], *, check: bool) -> int:
+        if args[0] == "print":
+            return 0 if args[1].split("/")[-1] in loaded else 1
+        if args[0] == "bootstrap":
+            loaded.add(plistlib.loads(Path(args[-1]).read_bytes())["Label"])
+        elif args[0] == "bootout":
+            loaded.discard(args[1].split("/")[-1])
+        return 0
+
+    label = scheduler.install_cloud_check(
+        project_root=project_root,
+        python_executable=python,
+        db_path=tmp_path / "data/jobagent.db",
+        config_path=config,
+        home=tmp_path / "home",
+        launchctl=fake_launchctl,
+        uid=501,
+    )
+
+    assert label == "com.fishinlab.job-agent.cloud-check"
+    path = tmp_path / f"home/Library/LaunchAgents/{label}.plist"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert label in loaded
+    assert b"not-in-plist" not in path.read_bytes()
+
+
+def test_cloud_schedule_install_restores_previous_task_on_failure(tmp_path) -> None:
+    project_root = tmp_path / "repo"
+    python = tmp_path / "venv/bin/python"
+    config = tmp_path / "private/cloud.json"
+    project_root.mkdir()
+    python.parent.mkdir(parents=True)
+    python.write_text("python", encoding="utf-8")
+    python.chmod(0o755)
+    config.parent.mkdir()
+    config.write_text("{}", encoding="utf-8")
+    config.chmod(0o600)
+    launch_dir = tmp_path / "home/Library/LaunchAgents"
+    launch_dir.mkdir(parents=True)
+    path = launch_dir / "com.fishinlab.job-agent.cloud-check.plist"
+    old = plistlib.dumps({"Label": scheduler.CLOUD_LABEL, "OldVersion": True})
+    path.write_bytes(old)
+    loaded = {scheduler.CLOUD_LABEL}
+    bootstrap_calls = 0
+
+    def failing_launchctl(args: list[str], *, check: bool) -> int:
+        nonlocal bootstrap_calls
+        if args[0] == "print":
+            return 0 if args[1].split("/")[-1] in loaded else 1
+        if args[0] == "bootout":
+            loaded.discard(args[1].split("/")[-1])
+            return 0
+        bootstrap_calls += 1
+        if bootstrap_calls == 1:
+            raise RuntimeError("new bootstrap failed")
+        loaded.add(scheduler.CLOUD_LABEL)
+        return 0
+
+    with pytest.raises(RuntimeError, match="new bootstrap failed"):
+        scheduler.install_cloud_check(
+            project_root=project_root,
+            python_executable=python,
+            db_path=tmp_path / "data/jobagent.db",
+            config_path=config,
+            home=tmp_path / "home",
+            launchctl=failing_launchctl,
+            uid=501,
+        )
+
+    assert path.read_bytes() == old
+    assert loaded == {scheduler.CLOUD_LABEL}
+
+
+def test_cloud_and_direct_observation_schedules_are_mutually_exclusive(tmp_path) -> None:
+    project_root = tmp_path / "repo"
+    python = tmp_path / "venv/bin/python"
+    config = tmp_path / "private/cloud.json"
+    project_root.mkdir()
+    python.parent.mkdir(parents=True)
+    python.write_text("python", encoding="utf-8")
+    python.chmod(0o755)
+    config.parent.mkdir()
+    config.write_text("{}", encoding="utf-8")
+    config.chmod(0o600)
+
+    def with_old_observer(args: list[str], *, check: bool) -> int:
+        if args[0] == "print":
+            return int(not args[1].endswith("observe.0930"))
+        raise AssertionError("互斥检查后不得修改 launchd")
+
+    with pytest.raises(RuntimeError, match="旧本机采集任务仍在运行"):
+        scheduler.install_cloud_check(
+            project_root=project_root,
+            python_executable=python,
+            db_path=tmp_path / "data/jobagent.db",
+            config_path=config,
+            home=tmp_path / "home",
+            launchctl=with_old_observer,
+            uid=501,
+        )
+
+    def with_cloud_check(args: list[str], *, check: bool) -> int:
+        if args[0] == "print":
+            return int(not args[1].endswith(scheduler.CLOUD_LABEL))
+        raise AssertionError("互斥检查后不得修改 launchd")
+
+    with pytest.raises(RuntimeError, match="不能同时启用"):
+        scheduler.install(
+            project_root=project_root,
+            python_executable=python,
+            db_path=tmp_path / "data/jobagent.db",
+            home=tmp_path / "home",
+            launchctl=with_cloud_check,
+            uid=501,
+        )
+
+
+def test_concurrent_schedule_installs_cannot_both_win(tmp_path) -> None:
+    project_root = tmp_path / "repo"
+    python = tmp_path / "venv/bin/python"
+    config = tmp_path / "private/cloud.json"
+    home = tmp_path / "home"
+    project_root.mkdir()
+    python.parent.mkdir(parents=True)
+    python.write_text("python", encoding="utf-8")
+    python.chmod(0o755)
+    config.parent.mkdir()
+    config.write_text("{}", encoding="utf-8")
+    config.chmod(0o600)
+    loaded: set[str] = set()
+    state_lock = threading.Lock()
+    start = threading.Barrier(3)
+    outcomes: list[str] = []
+
+    def fake_launchctl(args: list[str], *, check: bool) -> int:
+        with state_lock:
+            if args[0] == "print":
+                return 0 if args[1].split("/")[-1] in loaded else 1
+            if args[0] == "bootstrap":
+                loaded.add(plistlib.loads(Path(args[-1]).read_bytes())["Label"])
+            elif args[0] == "bootout":
+                loaded.discard(args[1].split("/")[-1])
+            return 0
+
+    def install_observers() -> None:
+        start.wait()
+        try:
+            scheduler.install(
+                project_root=project_root,
+                python_executable=python,
+                db_path=tmp_path / "data/jobagent.db",
+                home=home,
+                launchctl=fake_launchctl,
+                uid=501,
+            )
+            outcomes.append("observation")
+        except RuntimeError:
+            outcomes.append("observation-blocked")
+
+    def install_cloud() -> None:
+        start.wait()
+        try:
+            scheduler.install_cloud_check(
+                project_root=project_root,
+                python_executable=python,
+                db_path=tmp_path / "data/jobagent.db",
+                config_path=config,
+                home=home,
+                launchctl=fake_launchctl,
+                uid=501,
+            )
+            outcomes.append("cloud")
+        except RuntimeError:
+            outcomes.append("cloud-blocked")
+
+    threads = [
+        threading.Thread(target=install_observers),
+        threading.Thread(target=install_cloud),
+    ]
+    for thread in threads:
+        thread.start()
+    start.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    observers_loaded = any(label.startswith(scheduler.LABEL_PREFIX) for label in loaded)
+    cloud_loaded = scheduler.CLOUD_LABEL in loaded
+    assert observers_loaded != cloud_loaded
+    assert sorted(outcomes) in (
+        ["cloud", "observation-blocked"],
+        ["cloud-blocked", "observation"],
+    )
 
 
 def test_install_writes_three_private_plists_and_bootstraps(tmp_path) -> None:

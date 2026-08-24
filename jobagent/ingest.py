@@ -21,15 +21,11 @@ from pathlib import Path
 
 from . import db
 from .adapters.base import Adapter, RawJob
-from .normalize import fingerprint
-
-# 消失比例超过这个值就不执行关闭，判定为上游异常
-CLOSE_GUARD_RATIO = 0.4
-# 但消失数量低于这个绝对值时不启用比例守卫。
-# 原因：小源（某家 AI 公司可能只有 3 个校招岗）关掉 2 个是正常的季节性行为，
-# 比例却高达 67%，会被守卫误挡，导致岗位永远关不掉。
-# 比例守卫防的是「上游半残返回导致的批量假关闭」，那类故障必然伴随较大的绝对量。
-CLOSE_GUARD_MIN_COUNT = 5
+from .collection import (
+    CLOSE_GUARD_RATIO,
+    close_guard_tripped,
+    job_fingerprint,
+)
 # 单轮新增超过这个数，额外发一条「批次启动」事件
 BATCH_THRESHOLD = 15
 
@@ -51,16 +47,7 @@ def _cities(value: str | list[str] | None) -> list[str]:
 
 def _fp(job: RawJob) -> str:
     """只覆盖「变了就该通知」的字段，description 刻意不含。"""
-    return fingerprint(
-        {
-            "title": job.title,
-            "family": job.job_family,
-            "cities": _cities(job.cities),
-            "recruit_type": job.recruit_type,
-            "department": job.department,
-            "apply_url": job.apply_url,
-        }
-    )
+    return job_fingerprint(job)
 
 
 class RefreshUnsupported(RuntimeError):
@@ -363,9 +350,10 @@ def sync(conn, adapter: Adapter, *, dry_run: bool = False) -> dict:
         live_before = {k: v for k, v in existing.items() if v["closed_at"] is None}
         disappeared = [k for k in live_before if k not in seen_ids]
         guard = (
-            len(disappeared) >= CLOSE_GUARD_MIN_COUNT
-            and bool(live_before)
-            and (len(disappeared) / len(live_before)) > CLOSE_GUARD_RATIO
+            not getattr(adapter, "complete_snapshot_is_authoritative", False)
+            and close_guard_tripped(
+                live_before=len(live_before), disappeared=len(disappeared)
+            )
         )
         stats["guard_tripped"] = guard
 

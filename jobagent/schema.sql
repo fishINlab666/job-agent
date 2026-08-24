@@ -145,6 +145,36 @@ CREATE TABLE IF NOT EXISTS observation_sources (
 CREATE INDEX IF NOT EXISTS idx_observation_truth
     ON observation_sources(truth_status, observation_id);
 
+-- 云端公开岗位同步缓存。本机只用它重建各源完整快照并继续复用既有 ingest；
+-- 不存画像、简历、登录态或投递记录。
+CREATE TABLE IF NOT EXISTS cloud_job_cache (
+    source_key   TEXT NOT NULL,
+    external_id  TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    is_open      INTEGER NOT NULL CHECK (is_open IN (0, 1)),
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY(source_key, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cloud_job_cache_open
+    ON cloud_job_cache(source_key, is_open);
+
+CREATE TABLE IF NOT EXISTS cloud_sync_state (
+    client_id      TEXT PRIMARY KEY,
+    cursor         INTEGER NOT NULL DEFAULT 0 CHECK (cursor >= 0),
+    last_synced_at TEXT
+);
+
+-- 每个云端游标最多尝试一次合并通知。dispatching 表示系统调用结果未知，
+-- 为避免重复打扰不会自动重发。
+CREATE TABLE IF NOT EXISTS cloud_notifications (
+    cursor       INTEGER PRIMARY KEY CHECK (cursor >= 0),
+    change_count INTEGER NOT NULL CHECK (change_count > 0),
+    status       TEXT NOT NULL CHECK (status IN ('pending', 'dispatching', 'sent', 'failed')),
+    created_at   TEXT NOT NULL,
+    attempted_at TEXT,
+    error        TEXT
+);
+
 -- 本机通知也是观察闭环的一部分。skipped 表示按策略不打扰，不等于发送失败。
 CREATE TABLE IF NOT EXISTS observation_notifications (
     observation_id INTEGER PRIMARY KEY REFERENCES observation_batches(id),

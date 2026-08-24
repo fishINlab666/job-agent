@@ -12,9 +12,118 @@ import json
 import pytest
 from typer.testing import CliRunner
 
-from jobagent import cli, db, match
+from jobagent import cli, cloud_sync, db, match
 
 runner = CliRunner()
+
+
+class _FakeCloudAPI:
+    def __init__(self, _config) -> None:
+        self.catch_up_calls = 0
+
+    def status(self):
+        return {
+            "workday": "2026-08-24",
+            "active_window": "morning",
+            "windows": [
+                {"window_key": "morning", "status": "complete", "sources": []}
+            ],
+        }
+
+    def changes(self, after):
+        return {"changes": [], "next_cursor": after, "has_more": False}
+
+    def ack(self, cursor):
+        return cursor
+
+    def catch_up(self):
+        self.catch_up_calls += 1
+        return {"status": "complete"}
+
+
+def test_cloud_commands_show_status_and_sync_without_printing_token(tmp_path, monkeypatch) -> None:
+    config = cloud_sync.CloudConfig(
+        "https://collector.example.test", "secret-" + "x" * 32, "local-mac"
+    )
+    monkeypatch.setattr(cli.cloud_sync.CloudConfig, "load", lambda _path: config)
+    monkeypatch.setattr(cli.cloud_sync, "CloudAPI", _FakeCloudAPI)
+    database = tmp_path / "cloud.db"
+
+    status = runner.invoke(cli.app, ["cloud-status"])
+    assert status.exit_code == 0, status.output
+    assert "morning" in status.output
+    assert config.token not in status.output
+
+    check = runner.invoke(cli.app, ["cloud-check", "--db", str(database)])
+    assert check.exit_code == 0, check.output
+    assert "游标 0" in check.output
+    assert "无需补采" in check.output
+    assert config.token not in check.output
+
+
+def test_cloud_check_exits_nonzero_when_notification_is_unresolved(monkeypatch) -> None:
+    monkeypatch.setattr(
+        cli,
+        "_run_cloud_sync",
+        lambda **_kwargs: {
+            "catch_up_requested": False,
+            "sync": {"applied": 1, "cursor": 7},
+            "notification": {
+                "status": "unresolved",
+                "cursor": 7,
+                "error": "通知结果未知，未自动重发",
+            },
+        },
+    )
+
+    result = runner.invoke(cli.app, ["cloud-check"])
+
+    assert result.exit_code == 1
+    assert "岗位已同步，但系统通知未确认" in result.output
+    assert "云端检查完成" not in result.output
+
+
+def test_cloud_schedule_install_passes_private_config_without_reading_token(
+    tmp_path, monkeypatch
+) -> None:
+    captured = {}
+    monkeypatch.setattr(
+        cli,
+        "_install_cloud_check_schedule",
+        lambda **kwargs: captured.update(kwargs),
+    )
+    project_root = tmp_path / "repo"
+    python = tmp_path / "venv/bin/python"
+    database = tmp_path / "data/jobagent.db"
+    config = tmp_path / "private/cloud.json"
+    home = tmp_path / "home"
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "cloud-schedule-install",
+            "--project-root",
+            str(project_root),
+            "--python",
+            str(python),
+            "--db",
+            str(database),
+            "--config",
+            str(config),
+            "--home",
+            str(home),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured == {
+        "project_root": project_root.resolve(),
+        "python_executable": python.absolute(),
+        "db_path": database.resolve(),
+        "config_path": config.absolute(),
+        "home": home.resolve(),
+    }
+    assert "每 15 分钟" in result.output
 
 
 @pytest.fixture

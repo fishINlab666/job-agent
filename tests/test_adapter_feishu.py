@@ -6,6 +6,9 @@
 """
 from __future__ import annotations
 
+import asyncio
+from dataclasses import asdict
+
 import httpx
 import pytest
 
@@ -16,6 +19,7 @@ from jobagent.normalize import family_from_title
 # 必须在打补丁之前把真类抓住。工厂里直接写 httpx.Client 会调到被 patch 的
 # 那个符号，也就是它自己 —— RecursionError，而不是一个看得懂的失败。
 _REAL_CLIENT = httpx.Client
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
 
 
 def _mock_client(handler):
@@ -28,6 +32,14 @@ def _mock_client(handler):
     def factory(*_args, **kwargs):
         kwargs.pop("transport", None)
         return _REAL_CLIENT(transport=httpx.MockTransport(handler), **kwargs)
+
+    return factory
+
+
+def _mock_async_client(handler):
+    def factory(*_args, **kwargs):
+        kwargs.pop("transport", None)
+        return _REAL_ASYNC_CLIENT(transport=httpx.MockTransport(handler), **kwargs)
 
     return factory
 
@@ -78,6 +90,64 @@ def _fetch(monkeypatch, handler, tenant: str = "nio", **kw) -> tuple:
     ad = FeishuAdapter(tenant, **kw)
     monkeypatch.setattr("jobagent.adapters.feishu.httpx.Client", _mock_client(handler))
     return ad, ad.fetch()
+
+
+def test_async_fetch_matches_sync_public_jobs(monkeypatch):
+    pages = [_body([_post("1"), _post("2", title="产品经理")])]
+    sync_adapter = FeishuAdapter("nio", company="蔚来", portal="campus")
+    monkeypatch.setattr(
+        "jobagent.adapters.feishu.httpx.Client",
+        _mock_client(_serve(pages)),
+    )
+    sync_jobs = sync_adapter.fetch()
+
+    async_adapter = FeishuAdapter("nio", company="蔚来", portal="campus")
+    monkeypatch.setattr(
+        "jobagent.adapters.feishu.httpx.AsyncClient",
+        _mock_async_client(_serve(pages)),
+    )
+    async_jobs = asyncio.run(async_adapter.fetch_async())
+
+    assert [asdict(job) for job in async_jobs] == [asdict(job) for job in sync_jobs]
+    assert async_adapter.empty_is_authoritative is False
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_offset_safety_cap_never_returns_a_truncated_snapshot(
+    monkeypatch, async_mode
+):
+    monkeypatch.setattr("jobagent.adapters.feishu.MAX_OFFSET", 0)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_body([_post("1")], count=2))
+
+    adapter = FeishuAdapter("nio", company="蔚来", portal="campus", page_size=1)
+    if async_mode:
+        monkeypatch.setattr(
+            "jobagent.adapters.feishu.httpx.AsyncClient",
+            _mock_async_client(handler),
+        )
+        run = lambda: asyncio.run(adapter.fetch_async())
+    else:
+        monkeypatch.setattr(
+            "jobagent.adapters.feishu.httpx.Client",
+            _mock_client(handler),
+        )
+        run = adapter.fetch
+
+    with pytest.raises(RuntimeError, match="拒绝返回半截数据"):
+        run()
+
+
+def test_async_authoritative_empty_matches_sync(monkeypatch):
+    adapter = FeishuAdapter("luckin")
+    monkeypatch.setattr(
+        "jobagent.adapters.feishu.httpx.AsyncClient",
+        _mock_async_client(_serve([_body([], count=0)])),
+    )
+
+    assert asyncio.run(adapter.fetch_async()) == []
+    assert adapter.empty_is_authoritative is True
 
 
 class TestFamilyNotBackfilled:

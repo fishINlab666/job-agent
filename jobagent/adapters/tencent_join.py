@@ -122,6 +122,42 @@ class TencentJoinAdapter:
             "Content-Type": "application/json",
         }
 
+    def _decode_page(
+        self,
+        resp: httpx.Response,
+        *,
+        total: int | None,
+        page: int,
+        fetched: int,
+    ) -> tuple[int, list[dict], bool]:
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("status") != 0:
+            raise RuntimeError(f"searchPosition 返回异常: {body.get('message')!r}")
+        data = body.get("data") or {}
+        page_total = total if total is not None else int(data.get("count") or 0)
+        batch = data.get("positionList") or []
+        if fetched >= page_total:
+            return page_total, [], True
+        if not batch:
+            raise RuntimeError(
+                f"tencent_join: page={page} 返回空批次，"
+                f"但 count={page_total} 只拿到 {fetched} 条，拒绝返回半截数据"
+            )
+        return page_total, batch, False
+
+    def _jobs_from_rows(self, rows: list[dict]) -> list[RawJob]:
+        if not rows:
+            raise RuntimeError("searchPosition 返回 0 条，疑似接口变更，拒绝当成空结果")
+        return [self._to_raw_job(row) for row in rows]
+
+    def _ensure_complete(self, rows: list[dict], total: int | None) -> None:
+        if total is None or len(rows) != total:
+            raise RuntimeError(
+                f"tencent_join: 分页安全上限触发，count={total!r} "
+                f"只拿到 {len(rows)} 条，拒绝返回半截数据"
+            )
+
     def fetch(self) -> list[RawJob]:
         rows: list[dict] = []
         with httpx.Client(timeout=self.timeout, headers=self._headers()) as client:
@@ -136,32 +172,49 @@ class TencentJoinAdapter:
                         "keyword": "",
                     },
                 )
-                resp.raise_for_status()
-                body = resp.json()
-                if body.get("status") != 0:
-                    raise RuntimeError(f"searchPosition 返回异常: {body.get('message')!r}")
-                data = body.get("data") or {}
-                batch = data.get("positionList") or []
-                if total is None:
-                    total = int(data.get("count") or 0)
-                # 先检查是否拿够，拿够了就不管 batch 是否为空
-                if len(rows) >= total:
+                total, batch, complete = self._decode_page(
+                    resp, total=total, page=page, fetched=len(rows)
+                )
+                if complete:
                     break
-                # 还没拿够但遇到空批次 = 截断，必须抛异常
-                if not batch:
-                    raise RuntimeError(
-                        f"tencent_join: page={page} 返回空批次，"
-                        f"但 count={total} 只拿到 {len(rows)} 条，拒绝返回半截数据"
-                    )
                 rows.extend(batch)
                 # 防止无限循环
                 if page > 50:
                     break
                 page += 1
 
-        if not rows:
-            raise RuntimeError("searchPosition 返回 0 条，疑似接口变更，拒绝当成空结果")
-        return [self._to_raw_job(r) for r in rows]
+        self._ensure_complete(rows, total)
+        return self._jobs_from_rows(rows)
+
+    async def fetch_async(self) -> list[RawJob]:
+        """Cloudflare Worker 使用的异步网络入口，语义与 fetch() 相同。"""
+        rows: list[dict] = []
+        async with httpx.AsyncClient(
+            timeout=self.timeout, headers=self._headers()
+        ) as client:
+            page, total = 1, None
+            while True:
+                resp = await client.post(
+                    API,
+                    json={
+                        "projectId": 2,
+                        "pageIndex": page,
+                        "pageSize": self.page_size,
+                        "keyword": "",
+                    },
+                )
+                total, batch, complete = self._decode_page(
+                    resp, total=total, page=page, fetched=len(rows)
+                )
+                if complete:
+                    break
+                rows.extend(batch)
+                if page > 50:
+                    break
+                page += 1
+
+        self._ensure_complete(rows, total)
+        return self._jobs_from_rows(rows)
 
     def _to_raw_job(self, row: dict) -> RawJob:
         title = (row.get("positionTitle") or "").strip()
