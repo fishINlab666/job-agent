@@ -27,7 +27,8 @@ Worker 只接收批准字段，重算分块和整份清单摘要，复用现有 
 | 手工试运行 Workflow | 已完成（本地候选） | 当前只有 `workflow_dispatch`；同一时刻最多一个执行；旧一次性探针已移除 |
 | PR / CI / Worker 部署 | 已核实 | PR `#53` merge commit `a9db40279510b353c5ce059dce8d679558001ac5`；两轮 required check success；migration `0002` 与 Worker version `1fd21ca3-71f4-432a-a765-6480c59e6b76` 已部署 |
 | 技术试运行 | 进行中 | run `32760861954` 安全失败：五源读取完成；腾讯、蔚来、小鹏 committed；字节上传第 29 块后返回 HTTP 错误；商汤未尝试；schedule 仍关闭 |
-| HTTP 上传诊断 | 已核实（本地候选） | 只把非 2xx 状态压缩成 `HTTP_<status>`，响应正文、请求头、token 与岗位内容均不进入报告；`uv run --frozen pytest -q -p no:cacheprovider tests cloud/collector/tests` → `1108 passed, 2 skipped`；待新独立 run 分类线上错误 |
+| HTTP 上传诊断 | 已核实 | run `32761658864` 在字节第 11 块再次得到 `HTTP_503`；两次失败块号不同，排除固定坏岗位；响应正文、请求头、token 与岗位内容均未进入报告 |
+| Free Worker 降压验证 | 已核实（本地候选） | 官方 Free Worker 每请求 CPU 上限 10ms；当前 40 岗位块需解析、校验、摘要与约 42 条 D1 语句，推断为资源超限；客户端固定块已降为 10，服务端安全上限仍为 40；`uv run --frozen pytest -q -p no:cacheprovider tests cloud/collector/tests` → `1109 passed, 2 skipped`；待第三次独立 trial 验证，不续写旧 session |
 | 正式定时启用 | 未开始 | 技术试运行通过后才保留 schedule；本机旧观察任务继续兜底 |
 
 ---
@@ -93,7 +94,8 @@ Worker 拒绝额外键、来源身份不一致、空 `external_id`、重复 ID�
 
 - 每来源 1–20,000 个岗位；五源/同一窗口合计不超过 30,000 个岗位、75,000,000 bytes，
   客户端和 Worker 分别校验；失败/过期 session 不继续占用补跑容量。
-- 单岗位规范 JSON 最多 1,000,000 bytes；每块最多 40 个岗位、请求正文最多 1,500,000 bytes，
+- 单岗位规范 JSON 最多 1,000,000 bytes；Worker 继续拒绝超过 40 个岗位或 1,500,000 bytes 的块，
+  客户端在 Free Worker 上固定每块最多 10 个岗位，降低 Python 解析、摘要和 D1 batch 的单请求 CPU；
   Worker 的 HTTP 拒绝线为 1,600,000 bytes，低于 D1 2,000,000 bytes 单行限制。
 - session 元数据最多 4 KiB；commit body 必须是空 object。
 - 错误报告只保存异常类型和闭合状态。远端 HTTP 非 2xx 只允许记为 `HTTP_<status>`；不得返回

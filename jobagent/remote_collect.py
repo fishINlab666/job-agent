@@ -14,7 +14,7 @@ from .collection import snapshot_digest, to_public_payload, validate_snapshot
 from .targets import OBSERVATION_SOURCES, build_observation_adapter
 
 
-CHUNK_SIZE = 40
+CHUNK_SIZE = 10
 MAX_CHUNK_BODY_BYTES = 1_500_000
 MAX_JOB_JSON_BYTES = 1_000_000
 MAX_TOTAL_PAYLOAD_BYTES = 75_000_000

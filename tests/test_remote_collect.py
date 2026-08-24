@@ -215,6 +215,59 @@ def test_http_upload_chunks_by_encoded_bytes_below_worker_limit() -> None:
     client.close()
 
 
+def test_free_worker_upload_limits_each_chunk_to_ten_jobs() -> None:
+    chunk_sizes: list[int] = []
+    run_id = "run-free-worker"
+    collection_id = RemoteIngestClient._collection_id(run_id, "technical-trial")
+    base = collect_snapshots(adapter_builder=lambda spec: FakeAdapter(spec))[0]
+    payloads = tuple(
+        {**base.payloads[0], "external_id": f"J{index}"} for index in range(25)
+    )
+    snapshot = Snapshot(
+        source_key=base.source_key,
+        company=base.company,
+        payloads=payloads,
+        snapshot_sha256=snapshot_digest(payloads),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/ingest/sessions":
+            return httpx.Response(
+                201,
+                json={
+                    "status": "pending",
+                    "window_id": 1,
+                    "window_key": "technical-trial",
+                },
+            )
+        if "/chunks/" in request.url.path:
+            chunk_sizes.append(len(json.loads(request.content)["jobs"]))
+            return httpx.Response(200, json={"status": "stored"})
+        return httpx.Response(
+            200,
+            json={
+                "status": "committed",
+                "collection_id": collection_id,
+                "fetched_count": len(snapshot.payloads),
+                "snapshot_sha256": snapshot.snapshot_sha256,
+                "window_id": 1,
+                "window_key": "technical-trial",
+            },
+        )
+
+    client = RemoteIngestClient(
+        "https://collector.example.test",
+        "secret-" + "x" * 32,
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = client.upload(snapshot, run_id=run_id, mode="technical-trial")
+
+    assert result["status"] == "committed"
+    assert chunk_sizes == [10, 10, 5]
+    client.close()
+
+
 def test_technical_trial_rejects_a_committed_receipt_from_an_old_snapshot() -> None:
     snapshot = collect_snapshots(
         adapter_builder=lambda spec: FakeAdapter(spec)
