@@ -9,7 +9,7 @@ Workflow 只是固定运行容器，不包含源规则。远端结果只保留�
 
 **Tech Stack:** Python 3.13、httpx、pytest、GitHub Actions、uv。
 
-> 编号 `024` · 日期 `2026-08` · 状态：进行中
+> 编号 `024` · 日期 `2026-08` · 状态：已完成
 > 涉及文件：`jobagent/remote_probe.py`、`tests/test_remote_probe.py`、`.github/workflows/remote-feishu-probe.yml`
 
 ---
@@ -22,8 +22,8 @@ Workflow 只是固定运行容器，不包含源规则。远端结果只保留�
 | 建立隔离分支与干净基线 | 已核实 | `git switch -c feat/remote-feishu-runner origin/main && uv run --frozen pytest -q -p no:cacheprovider` → `1029 passed, 2 skipped` |
 | 实现本地可测的只读 Probe Module | 已完成（本地候选） | 首次 RED：缺少 `jobagent.remote_probe`；实现闭合报告与校验后，聚焦测试 `8 passed` |
 | 固定一次性、只读 Workflow | 已完成（本地候选） | 仅 `pull_request: opened`，`contents: read`；无 secret、schedule、D1、通知或投递命令 |
-| 发布 draft PR 并触发一次远端探针 | 未开始 | 只允许 PR opened 事件；无 secret、无 D1 写、无 schedule |
-| 四源结果 Gate | 未开始 | 四源全部 success、count>0、digest=64 hex 才进入方案 025；任一失败即停止 |
+| 发布 draft PR 并触发一次远端探针 | 已完成 | PR `#53`、head `d8d4a1fca66bd70d561d00e077666c390ad1a90a`；run `32753445274`；CI 与 probe 均 success |
+| 四源结果 Gate | **PASS** | 蔚来 440、小鹏 487、字节 7434、商汤 160；四源均 success、非空、ID 唯一且摘要为 64 位 SHA-256 |
 
 ---
 
@@ -61,6 +61,18 @@ Cloudflare 数据库与同步代码已经落地，但四家飞书在 Cloudflare 
 | GitHub hosted runner 的网络出口不会被飞书拒绝 | 正式远端方案不可用 | 同一次 Workflow 顺序读取四源，任一失败即 Gate BLOCK |
 | Linux runner 发送现有固定 UA 时能得到与本机同形响应 | 可能收到 405、空清单或截断分页 | 复用现有 Adapter，不在 Workflow 另拼 HTTP；要求 count>0、ID 唯一、无 skipped row |
 | 一次顺序读取不会触发源站限流 | 远端探针部分失败 | 不并发、不重试；保留首次错误后停止该路线 |
+
+### 3.1 远端实测结果
+
+| 来源 | 岗位数 | 清单 SHA-256 | 耗时 |
+|---|---:|---|---:|
+| `feishu:nio:campus` | 440 | `fd703e352f522fe1a3a54e12671b3fab1d3dc4418714108a86abee72e3c9df2b` | 4.886 秒 |
+| `feishu:xiaopeng:campus` | 487 | `bb65daa257f54aa4a88fa5397c3df808069cc7c1ee31dbd9f1bc644ffd79c2af` | 3.974 秒 |
+| `feishu:bytedance:campus` | 7434 | `f60208a8e2844d1d72829c16393373bc2b1ba8050a7c5932f7a8f8172c1a630e` | 61.860 秒 |
+| `feishu:sensetime:edu` | 160 | `51848863fd90ddce553931faf1797dcf98442abe42c8ddf5d64d72c9b90ccb1b` | 1.709 秒 |
+
+该结果只证明 GitHub hosted runner 能完整读取四源；没有写 D1、没有通知用户，
+也不算正式三工作日验收。正式接入由方案 025 负责。
 
 ---
 
