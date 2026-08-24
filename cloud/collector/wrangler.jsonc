@@ -5,13 +5,14 @@
   "compatibility_date": "2026-08-24",
   "compatibility_flags": ["python_workers"],
   "triggers": {
-    "crons": ["*/30 * * * MON-FRI"]
+    // 飞书门户拒绝 Cloudflare 机房请求；五源远端试采通过前保持暂停。
+    "crons": []
   },
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "jobagent-public-observation",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "3c22c46d-46b4-4fda-bf4d-53894186488b",
       "migrations_dir": "migrations"
     }
   ],

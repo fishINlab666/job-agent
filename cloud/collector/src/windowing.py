@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Literal
-from zoneinfo import ZoneInfo
 
 
-SHANGHAI = ZoneInfo("Asia/Shanghai")
+SHANGHAI = timezone(timedelta(hours=8), "Asia/Shanghai")
 CATCH_UP_GRACE = timedelta(hours=1)
 WINDOW_MINUTES: tuple[tuple[str, int, int], ...] = (
     ("morning", 8 * 60, 12 * 60),

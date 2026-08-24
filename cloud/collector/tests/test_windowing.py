@@ -1,8 +1,23 @@
-from datetime import datetime, timezone
+import importlib
+import sys
+import zoneinfo
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from cloud.collector.src.windowing import active_window, catch_up_windows, expired_windows
+
+
+def test_windowing_imports_without_system_timezone_database(monkeypatch) -> None:
+    def unavailable(_key: str):
+        raise zoneinfo.ZoneInfoNotFoundError("timezone database unavailable")
+
+    monkeypatch.setattr(zoneinfo, "ZoneInfo", unavailable)
+    sys.modules.pop("cloud.collector.src.windowing", None)
+
+    module = importlib.import_module("cloud.collector.src.windowing")
+
+    assert module.SHANGHAI.utcoffset(None) == timedelta(hours=8)
 
 
 @pytest.mark.parametrize(
