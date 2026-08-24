@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
 
@@ -18,7 +18,7 @@ WINDOW_MINUTES: tuple[tuple[str, int, int], ...] = (
 @dataclass(frozen=True)
 class Window:
     workday: str
-    key: Literal["morning", "afternoon", "evening"]
+    key: Literal["morning", "afternoon", "evening", "technical-trial"]
     opens_at: datetime
     closes_at: datetime
 
@@ -43,3 +43,16 @@ def active_window(now_utc: datetime) -> Window | None:
                 closes_at=_at_minute(local, end),
             )
     return None
+
+
+def technical_trial_window(now_utc: datetime) -> Window:
+    """建立独立技术试运行窗口，绝不回填正式早/午/晚验收事实。"""
+    if now_utc.tzinfo is None or now_utc.utcoffset() is None:
+        raise ValueError("technical_trial_window requires a timezone-aware datetime")
+    local = now_utc.astimezone(SHANGHAI)
+    return Window(
+        workday=local.date().isoformat(),
+        key="technical-trial",
+        opens_at=local,
+        closes_at=local + timedelta(hours=1),
+    )

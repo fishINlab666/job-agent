@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "jobagent-public-observation",
+  "main": "src/main.py",
+  "compatibility_date": "2026-08-24",
+  "compatibility_flags": ["python_workers"],
+  "triggers": {
+    "crons": ["*/30 * * * MON-FRI"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "jobagent-public-observation",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}

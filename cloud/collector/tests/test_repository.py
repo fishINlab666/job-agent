@@ -61,6 +61,32 @@ def test_get_or_create_window_is_unique() -> None:
     asyncio.run(scenario())
 
 
+def test_unexpired_window_lease_rejects_second_owner_and_can_be_reclaimed() -> None:
+    async def scenario() -> None:
+        repo, _ = _repo()
+        window_id = await repo.get_or_create_window(_window(), "2026-08-24T00:00:00Z")
+        assert await repo.acquire_window(
+            window_id,
+            "owner-a",
+            "2026-08-24T00:01:00+00:00",
+            "2026-08-24T00:16:00+00:00",
+        )
+        assert not await repo.acquire_window(
+            window_id,
+            "owner-b",
+            "2026-08-24T00:02:00+00:00",
+            "2026-08-24T00:17:00+00:00",
+        )
+        assert await repo.acquire_window(
+            window_id,
+            "owner-b",
+            "2026-08-24T00:17:00+00:00",
+            "2026-08-24T00:32:00+00:00",
+        )
+
+    asyncio.run(scenario())
+
+
 def test_staging_rows_are_not_publication_facts() -> None:
     async def scenario() -> None:
         repo, database = _repo()
@@ -142,5 +168,28 @@ def test_incomplete_staging_cannot_finalize() -> None:
 
         assert database.conn.execute("SELECT COUNT(*) FROM cloud_jobs").fetchone()[0] == 0
         assert database.conn.execute("SELECT status FROM source_runs").fetchone()[0] == "running"
+
+    asyncio.run(scenario())
+
+
+def test_changes_are_cursor_ordered_and_ack_only_moves_forward() -> None:
+    async def scenario() -> None:
+        repo, _ = _repo()
+        window_id = await repo.get_or_create_window(_window(), "2026-08-24T00:00:00Z")
+        run_id = await repo.start_run(window_id, "source", "2026-08-24T00:01:00Z")
+        jobs = [_job("J1"), _job("J2")]
+        await repo.stage_jobs(run_id, "source", jobs)
+        await repo.finalize_snapshot(
+            run_id, window_id, "source", _digest(jobs), 2, "2026-08-24T00:02:00Z"
+        )
+
+        page = await repo.changes_after(0, limit=1)
+        assert [item["cursor"] for item in page["changes"]] == [1]
+        assert page["next_cursor"] == 1
+        assert page["has_more"] is True
+        assert "raw_json" not in page["changes"][0]["job"]
+
+        assert await repo.ack_client("local-mac", 1, "2026-08-24T00:03:00Z") == 1
+        assert await repo.ack_client("local-mac", 0, "2026-08-24T00:04:00Z") == 1
 
     asyncio.run(scenario())

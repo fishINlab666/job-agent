@@ -7,7 +7,10 @@ from typing import Any
 
 from jobagent.collection import snapshot_digest
 
-from .windowing import Window
+if __package__:
+    from .windowing import Window
+else:  # Cloudflare 把 src/main.py 作为顶层模块加载。
+    from windowing import Window
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,25 @@ class D1Repository:
         if len(rows) != 1:
             raise RuntimeError("window readback did not return exactly one row")
         return int(rows[0]["id"])
+
+    async def acquire_window(
+        self,
+        window_id: int,
+        owner: str,
+        now: str,
+        expires_at: str,
+    ) -> bool:
+        result = await self.database.prepare(
+            """UPDATE collection_windows SET
+                   status='running', lease_owner=?, lease_expires_at=?
+               WHERE id=? AND status<>'complete'
+                 AND (
+                   lease_owner IS NULL OR lease_expires_at IS NULL
+                   OR lease_expires_at<=? OR lease_owner=?
+                 )
+               RETURNING id"""
+        ).bind(owner, expires_at, window_id, now, owner).run()
+        return len(_rows(result)) == 1
 
     async def start_run(self, window_id: int, source_key: str, now: str) -> int:
         result = await self.database.prepare(
@@ -254,3 +276,154 @@ class D1Repository:
         ]
         await self.database.batch(statements)
         return counts
+
+    async def mark_failed(
+        self,
+        run_id: int,
+        error_kind: str,
+        error_message: str,
+        now: str,
+    ) -> None:
+        await self.database.batch(
+            [
+                self.database.prepare(
+                    """UPDATE source_runs SET
+                           status='failed', completed_at=?, error_kind=?,
+                           error_message=?
+                       WHERE id=? AND status='running'"""
+                ).bind(now, error_kind[:120], error_message[:1000], run_id),
+                self.database.prepare(
+                    "DELETE FROM staged_jobs WHERE run_id=?"
+                ).bind(run_id),
+            ]
+        )
+
+    async def successful_sources(self, window_id: int) -> set[str]:
+        result = await self.database.prepare(
+            """SELECT DISTINCT source_key FROM source_runs
+               WHERE window_id=? AND status='success'"""
+        ).bind(window_id).run()
+        return {str(row["source_key"]) for row in _rows(result)}
+
+    async def finish_window(
+        self,
+        window_id: int,
+        expected_sources: set[str],
+        now: str,
+        owner: str | None = None,
+    ) -> str:
+        successful = await self.successful_sources(window_id)
+        status = "complete" if successful == expected_sources else "partial"
+        completed_at = now if status == "complete" else None
+        result = await self.database.prepare(
+            """UPDATE collection_windows SET
+                   status=?, completed_at=?, last_error=?,
+                   lease_owner=NULL, lease_expires_at=NULL
+               WHERE id=? AND (? IS NULL OR lease_owner=?)
+               RETURNING status"""
+        ).bind(
+            status,
+            completed_at,
+            None if status == "complete" else "one or more sources incomplete",
+            window_id,
+            owner,
+            owner,
+        ).run()
+        if len(_rows(result)) != 1:
+            raise RuntimeError("window lease changed before final readback")
+        return status
+
+    async def window_summary(self, window_id: int) -> dict:
+        window_result = await self.database.prepare(
+            """SELECT id, workday, window_key, opens_at, closes_at, status,
+                      completed_at
+               FROM collection_windows WHERE id=?"""
+        ).bind(window_id).run()
+        windows = _rows(window_result)
+        if len(windows) != 1:
+            raise RuntimeError("window summary did not return exactly one row")
+
+        runs_result = await self.database.prepare(
+            """SELECT id, source_key, attempt, status, started_at, completed_at,
+                      fetched_count, snapshot_sha256, error_kind, error_message
+               FROM source_runs WHERE window_id=?
+               ORDER BY source_key, attempt DESC"""
+        ).bind(window_id).run()
+        latest: dict[str, dict] = {}
+        for row in _rows(runs_result):
+            latest.setdefault(str(row["source_key"]), row)
+        window = windows[0]
+        return {
+            "id": int(window["id"]),
+            "workday": window["workday"],
+            "window_key": window["window_key"],
+            "opens_at": window["opens_at"],
+            "closes_at": window["closes_at"],
+            "status": window["status"],
+            "completed_at": window["completed_at"],
+            "sources": [latest[key] for key in sorted(latest)],
+        }
+
+    async def status_for_day(self, workday: str) -> dict:
+        result = await self.database.prepare(
+            """SELECT id FROM collection_windows
+               WHERE workday=? ORDER BY opens_at"""
+        ).bind(workday).run()
+        windows = [await self.window_summary(int(row["id"])) for row in _rows(result)]
+        return {"workday": workday, "windows": windows}
+
+    async def changes_after(self, after: int, *, limit: int = 200) -> dict:
+        if after < 0 or not 1 <= limit <= 500:
+            raise ValueError("invalid change cursor or limit")
+        result = await self.database.prepare(
+            """SELECT cursor, source_key, external_id, kind, payload_json,
+                      occurred_at
+               FROM job_changes WHERE cursor>?
+               ORDER BY cursor LIMIT ?"""
+        ).bind(after, limit + 1).run()
+        rows = _rows(result)
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        changes = [
+            {
+                "cursor": int(row["cursor"]),
+                "source_key": row["source_key"],
+                "external_id": row["external_id"],
+                "kind": row["kind"],
+                "job": json.loads(row["payload_json"]),
+                "occurred_at": row["occurred_at"],
+            }
+            for row in rows
+        ]
+        return {
+            "changes": changes,
+            "next_cursor": int(changes[-1]["cursor"]) if changes else after,
+            "has_more": has_more,
+        }
+
+    async def ack_client(self, client_id: str, cursor: int, now: str) -> int:
+        if cursor < 0:
+            raise ValueError("ack cursor must be non-negative")
+        max_result = await self.database.prepare(
+            "SELECT COALESCE(MAX(cursor), 0) AS cursor FROM job_changes"
+        ).run()
+        maximum = int(_rows(max_result)[0]["cursor"])
+        if cursor > maximum:
+            raise ValueError("ack cursor is ahead of cloud history")
+        await self.database.prepare(
+            """INSERT INTO sync_clients(client_id, acknowledged_cursor, updated_at)
+               VALUES(?,?,?)
+               ON CONFLICT(client_id) DO UPDATE SET
+                 acknowledged_cursor=MAX(
+                   sync_clients.acknowledged_cursor,
+                   excluded.acknowledged_cursor
+                 ),
+                 updated_at=excluded.updated_at"""
+        ).bind(client_id, cursor, now).run()
+        result = await self.database.prepare(
+            "SELECT acknowledged_cursor FROM sync_clients WHERE client_id=?"
+        ).bind(client_id).run()
+        rows = _rows(result)
+        if len(rows) != 1:
+            raise RuntimeError("client ack readback did not return exactly one row")
+        return int(rows[0]["acknowledged_cursor"])
