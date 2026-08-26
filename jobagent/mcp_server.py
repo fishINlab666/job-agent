@@ -415,7 +415,7 @@ def job_changes(
     不是「这次没有变动」。
     """
     queries.validate_positive_limit(limit)
-    queries.validate_since(since)
+    normalized_since = queries.validate_since(since)
     if kind is not None and kind not in JOB_EVENT_KINDS:
         raise ValueError(
             f"不认识的事件种类 {kind!r}，可选：{'/'.join(sorted(JOB_EVENT_KINDS))}"
@@ -425,10 +425,15 @@ def job_changes(
     kinds = [kind] if kind else sorted(JOB_EVENT_KINDS)
     events: list[dict] = []
     for k in kinds:
-        events += queries.job_changes(conn, kind=k, since=since, limit=limit)
+        events += queries.job_changes(
+            conn, kind=k, since=normalized_since, limit=limit
+        )
     # 各 kind 分别取了 limit 条，合起来要重新排序再截断，否则「最近 N 条」
     # 会变成「每种最近 N 条拼在一起」——条数对，但不是最近的那些。
-    events.sort(key=lambda e: (e["occurred_at"] or "", e["id"]), reverse=True)
+    events.sort(
+        key=lambda e: (queries.timestamp_sort_key(e["occurred_at"]), e["id"]),
+        reverse=True,
+    )
     # `excluded_kinds` 每次都带上，哪怕调用方指定了单个 kind：它说的是
     # 「这一层永远不给什么」，不是「这一次筛掉了什么」。省略它等于让调用方
     # 把一份被裁过的结果当成全集 —— 019 修的就是这个。

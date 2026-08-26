@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from . import db, match
@@ -54,7 +54,7 @@ def validate_positive_limit(limit: int) -> int:
 
 
 def validate_since(since: str | None) -> str | None:
-    """只接受带时区的 ISO 时间，避免非法文本被当成“没有变动”。"""
+    """接受带时区的 ISO 时间，并转成 SQLite 可解析的 UTC 扩展格式。"""
     if since is None:
         return None
     try:
@@ -63,7 +63,22 @@ def validate_since(since: str | None) -> str | None:
         raise ValueError("since 必须是带时区的 ISO 时间") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("since 必须是带时区的 ISO 时间")
-    return since
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def timestamp_sort_key(value: str | None) -> float:
+    """把事件时间转成同一时间轴；脏时间明确报错，不伪装成正常排序。"""
+    if not value:
+        raise ValueError("事件 occurred_at 缺失")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"事件 occurred_at 无法解析：{value!r}") from exc
+    # SQLite 对无时区时间按 UTC 解释；兼容历史测试/旧行，但新输入仍由
+    # validate_since() 强制带时区。
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _row_to_job(row: sqlite3.Row) -> dict:
@@ -173,6 +188,13 @@ def explain_match(
 
     intent = intent or {}
     verdict = match.classify(job, intent)
+    matched_on = list(verdict.matched_on) if verdict.state == "hit" else []
+    reason = verdict.reason
+    if verdict.state == "hit":
+        reason = "命中：" + (
+            "；".join(matched_on) if matched_on else "画像未设置硬筛选条件"
+        )
+    breakdown = match.score_breakdown(job, intent)
     return {
         "source_key": job["source_key"],
         "external_id": job["external_id"],
@@ -184,10 +206,13 @@ def explain_match(
         "cities": job["cities"],
         "closed_at": job["closed_at"],
         "state": verdict.state,
-        "reason": verdict.reason,
+        "reason": reason,
         "unknowns": list(verdict.unknowns),
         "missing": list(verdict.missing),
-        "score": match.score(job, intent),
+        "matched_on": matched_on,
+        "score": breakdown["total"],
+        "score_breakdown": breakdown,
+        "score_note": "轻量排序优先级，不改变匹配状态，也不是录用概率。",
     }
 
 
@@ -267,9 +292,11 @@ def job_changes(
         sql += " AND kind=?"
         args.append(kind)
     if since:
-        sql += " AND occurred_at >= ?"
+        # ISO 文本不能按字典序比较：同一时刻的 `+08:00` 与 `Z` 排序位置不同。
+        # SQLite 先把两侧换算成同一时间轴，再做含边界的筛选。
+        sql += " AND julianday(occurred_at) >= julianday(?)"
         args.append(since)
-    sql += " ORDER BY occurred_at DESC, id DESC LIMIT ?"
+    sql += " ORDER BY julianday(occurred_at) DESC, id DESC LIMIT ?"
     args.append(int(limit))
 
     out: list[dict] = []

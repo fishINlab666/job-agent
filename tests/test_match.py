@@ -435,4 +435,31 @@ class TestBackwardCompat:
         assert city_list({"cities": None}) == []
 
     def test_wildcard_scores_below_explicit_city(self) -> None:
+        wildcard = match_module.score_breakdown(job(cities=["全国"]), INTENT)
+        assert wildcard["cities"] == {
+            "matched": ["全国"],
+            "mode": "wildcard",
+            "points": 1,
+        }
         assert score(job(cities=["全国"]), INTENT) < score(job(cities=["北京"]), INTENT)
+
+    def test_score_equals_breakdown_total(self) -> None:
+        """排序总分只能来自同一份可解释明细，不能维护两套算法。"""
+        intent = {**INTENT, "boost_keywords": ["产品", "运营"]}
+
+        breakdown = match_module.score_breakdown(job(), intent)
+
+        assert breakdown["boost_keywords"] == {
+            "matched": ["产品", "运营"],
+            "points": 20,
+        }
+        assert breakdown["cities"] == {
+            "matched": ["北京"],
+            "mode": "explicit",
+            "points": 2,
+        }
+        assert breakdown["recruit_type"] == {
+            "matched": ["campus"],
+            "points": 3,
+        }
+        assert score(job(), intent) == breakdown["total"] == 25

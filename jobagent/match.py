@@ -13,7 +13,12 @@ from typing import NamedTuple
 import yaml
 
 from . import profile as profile_config
-from .normalize import any_city_ok, grad_years_from_title, parse_grad_years
+from .normalize import (
+    any_city_ok,
+    grad_years_from_title,
+    is_city_wildcard,
+    parse_grad_years,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 PROFILE_PATH = ROOT / "profile.yaml"
@@ -36,6 +41,7 @@ class Verdict(NamedTuple):
     reason: str
     unknowns: tuple[str, ...] = ()   # 给人看的，文案会改
     missing: tuple[str, ...] = ()    # 给代码看的，键要稳定
+    matched_on: tuple[str, ...] = ()  # hit 的硬筛选证据，与判定在同一处生成
 
     @property
     def ok(self) -> bool:
@@ -108,9 +114,13 @@ def classify(job: dict, intent: dict) -> Verdict:
     会被判成 miss 而不是 unknown——它确定不该推，不需要让用户再看一眼。
     """
     title = job.get("title") or ""
-    for kw in intent.get("exclude_keywords") or []:
+    matched_on: list[str] = []
+    exclude_keywords = intent.get("exclude_keywords") or []
+    for kw in exclude_keywords:
         if kw in title:
             return Verdict("miss", f"命中排除词「{kw}」")
+    if exclude_keywords:
+        matched_on.append(f"未命中排除词：{'、'.join(exclude_keywords)}")
 
     unknowns: list[str] = []
     missing: list[str] = []
@@ -123,6 +133,8 @@ def classify(job: dict, intent: dict) -> Verdict:
             missing.append("job_family")
         elif fam not in fams:
             return Verdict("miss", f"岗位族 {fam} 不在 {fams}")
+        else:
+            matched_on.append(f"岗位族 {fam} 符合目标")
 
     rtypes = intent.get("recruit_types") or []
     if rtypes:
@@ -132,6 +144,8 @@ def classify(job: dict, intent: dict) -> Verdict:
             missing.append("recruit_type")
         elif rtype not in rtypes:
             return Verdict("miss", f"招聘类型 {rtype} 不在 {rtypes}")
+        else:
+            matched_on.append(f"招聘类型 {rtype} 符合目标")
 
     # 届别：want 和 job 两侧都归一到两位，画像里写 "2026" 也能对上库里的 "26"。
     want_years = {str(y)[-2:] for y in (intent.get("grad_years") or [])}
@@ -147,10 +161,14 @@ def classify(job: dict, intent: dict) -> Verdict:
             unknowns.append(f"届别未标注（原值 {job.get('grad_year') or '空'}）")
             missing.append("grad_year")
         elif not job_years:
-            pass                                    # 明确不限届别
+            matched_on.append("届别不限，符合目标")
         elif not (set(job_years) & want_years):
             src = "（据标题）" if from_title else ""
             return Verdict("miss", f"届别 {job_years}{src} 不在 {sorted(want_years)}")
+        else:
+            src = "（据标题）" if from_title else ""
+            years = "、".join(sorted(set(job_years) & want_years))
+            matched_on.append(f"届别 {years}{src} 符合目标")
 
     want_cities = set(intent.get("cities") or [])
     if want_cities:
@@ -159,15 +177,29 @@ def classify(job: dict, intent: dict) -> Verdict:
             unknowns.append("城市未标注")
             missing.append("cities")
         elif any_city_ok(job_cities):
-            pass                                    # 全国 / 不限 / 远程，都算命中
+            wildcard_cities = list(dict.fromkeys(
+                city for city in job_cities if is_city_wildcard(city)
+            ))
+            matched_on.append(
+                f"城市 {'、'.join(wildcard_cities)} 为通配范围，符合目标"
+            )
         elif not (set(job_cities) & want_cities):
             return Verdict("miss", f"城市 {sorted(job_cities)} 不含目标城市")
+        else:
+            cities = list(dict.fromkeys(
+                city for city in job_cities if city in want_cities
+            ))
+            matched_on.append(f"城市 {'、'.join(cities)} 符合目标")
 
     if unknowns:
         return Verdict(
-            "unknown", "信息不全：" + "；".join(unknowns), tuple(unknowns), tuple(missing)
+            "unknown",
+            "信息不全：" + "；".join(unknowns),
+            tuple(unknowns),
+            tuple(missing),
+            tuple(matched_on),
         )
-    return Verdict("hit", "命中")
+    return Verdict("hit", "命中", matched_on=tuple(matched_on))
 
 
 def matches(job: dict, intent: dict) -> tuple[bool, str]:
@@ -180,25 +212,58 @@ def matches(job: dict, intent: dict) -> tuple[bool, str]:
     return v.ok, v.reason
 
 
-def score(job: dict, intent: dict) -> int:
-    """轻量优先级。只用来排序，不用来过滤。"""
-    s = 0
+def score_breakdown(job: dict, intent: dict) -> dict[str, object]:
+    """轻量排序分的逐项明细；总分与明细共用这一份计算。"""
     title = job.get("title") or ""
-    for kw in intent.get("boost_keywords") or []:
-        if kw in title:
-            s += 10
+    matched_keywords = [
+        kw for kw in (intent.get("boost_keywords") or []) if kw in title
+    ]
+    keyword_points = 10 * len(matched_keywords)
+
     job_cities = city_list(job)
-    hit_cities = set(job_cities) & set(intent.get("cities") or [])
-    if hit_cities:
-        s += 2 * len(hit_cities)
+    wanted_cities = set(intent.get("cities") or [])
+    matched_cities = list(dict.fromkeys(
+        city for city in job_cities if city in wanted_cities
+    ))
+    city_mode: str | None = None
+    city_points = 0
+    if matched_cities:
+        city_mode = "explicit"
+        city_points = 2 * len(matched_cities)
     elif any_city_ok(job_cities):
         # 「全国」算够得着，但要严格排在明确写了目标城市的岗位后面：写明「北京」
         # 的岗位确定在北京，写「全国」的实际派到哪还不知道。所以明确命中按 2
         # 计权、通配按 1，命中一个城市也压得住通配。
-        s += 1
-    if job.get("recruit_type") == "campus":
-        s += 3   # 应届优先于实习
-    return s
+        matched_cities = list(dict.fromkeys(
+            city for city in job_cities if is_city_wildcard(city)
+        ))
+        city_mode = "wildcard"
+        city_points = 1
+
+    recruit_matched = ["campus"] if job.get("recruit_type") == "campus" else []
+    recruit_points = 3 if recruit_matched else 0   # 应届优先于实习
+    total = keyword_points + city_points + recruit_points
+    return {
+        "boost_keywords": {
+            "matched": matched_keywords,
+            "points": keyword_points,
+        },
+        "cities": {
+            "matched": matched_cities,
+            "mode": city_mode,
+            "points": city_points,
+        },
+        "recruit_type": {
+            "matched": recruit_matched,
+            "points": recruit_points,
+        },
+        "total": total,
+    }
+
+
+def score(job: dict, intent: dict) -> int:
+    """轻量优先级。只用来排序，不用来过滤。"""
+    return int(score_breakdown(job, intent)["total"])
 
 
 def partition(rows: list[dict], intent: dict) -> tuple[list[dict], list[dict]]:
