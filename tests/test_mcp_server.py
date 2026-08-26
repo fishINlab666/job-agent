@@ -228,7 +228,10 @@ class TestNoWriteVerbInTheRegistry:
                     external_roots.add(node.module.split(".")[0])
 
         assert local_deps == {"db", "match", "queries"}
-        assert external_roots == {"__future__", "sqlite3", "typing", "mcp"}
+        assert external_roots == {
+            "__future__", "argparse", "dataclasses", "os", "pathlib",
+            "sqlite3", "stat", "typing", "mcp",
+        }
 
         forbidden = {
             "routing", "submitter", "playwright", "selenium", "httpx",
@@ -314,6 +317,142 @@ class TestReadOnlyConnection:
         monkeypatch.setattr(db, "connect_readonly", boom)
         with pytest.raises(RuntimeError, match="SENTINEL_ro"):
             mcp_server.list_jobs()
+
+
+class TestFixedRuntimeBinding:
+    """固定运行包必须显式绑定数据，不得回退到开发目录默认值。"""
+
+    @staticmethod
+    def _profile(path: Path) -> Path:
+        import yaml
+
+        path.write_text(
+            yaml.safe_dump({
+                "intent": {
+                    "families": ["operations"],
+                    "recruit_types": ["campus"],
+                    "grad_years": ["26"],
+                    "cities": ["深圳"],
+                },
+                "identity": {"name": "不应跨边界"},
+            }, allow_unicode=True),
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        return path
+
+    def test_main_requires_both_explicit_paths_before_starting_server(
+        self, monkeypatch
+    ) -> None:
+        """缺任一路径都不得进入 stdio server。"""
+        started = False
+
+        def must_not_start():
+            nonlocal started
+            started = True
+
+        monkeypatch.setattr(mcp_server.mcp, "run", must_not_start)
+        for argv in ([], ["--db", "/tmp/not-enough.db"]):
+            with pytest.raises(SystemExit):
+                mcp_server.main(argv)
+        assert started is False
+
+    def test_main_binds_inputs_before_starting_server(
+        self, db_with_data, tmp_path, monkeypatch
+    ) -> None:
+        profile = self._profile(tmp_path / "profile.yaml")
+        monkeypatch.setattr(mcp_server, "_RUNTIME_BINDING", None, raising=False)
+        observed = []
+
+        def record_start():
+            observed.append(mcp_server._RUNTIME_BINDING)
+
+        monkeypatch.setattr(mcp_server.mcp, "run", record_start)
+        mcp_server.main([
+            "--db", str(db_with_data), "--profile", str(profile),
+        ])
+
+        assert observed == [
+            mcp_server.RuntimeBinding(Path(db_with_data), profile)
+        ]
+
+    @pytest.mark.parametrize("kind", ["db", "profile"])
+    def test_relative_runtime_path_is_rejected(
+        self, db_with_data, tmp_path, monkeypatch, kind
+    ) -> None:
+        profile = self._profile(tmp_path / "profile.yaml")
+        monkeypatch.setattr(mcp_server, "_RUNTIME_BINDING", None, raising=False)
+        db_path: Path | str = db_with_data
+        profile_path: Path | str = profile
+        if kind == "db":
+            db_path = Path("relative.db")
+        else:
+            profile_path = Path("relative.yaml")
+
+        with pytest.raises(ValueError, match="绝对路径"):
+            mcp_server._configure_runtime(db_path, profile_path)
+
+    @pytest.mark.parametrize("kind", ["db", "profile"])
+    def test_runtime_path_must_not_be_a_symlink(
+        self, db_with_data, tmp_path, monkeypatch, kind
+    ) -> None:
+        profile = self._profile(tmp_path / "profile.yaml")
+        db_path = Path(db_with_data)
+        profile_path = profile
+        if kind == "db":
+            link = tmp_path / "db-link"
+            link.symlink_to(db_path)
+            db_path = link
+        else:
+            link = tmp_path / "profile-link"
+            link.symlink_to(profile_path)
+            profile_path = link
+        monkeypatch.setattr(mcp_server, "_RUNTIME_BINDING", None, raising=False)
+
+        with pytest.raises(ValueError, match="符号链接"):
+            mcp_server._configure_runtime(db_path, profile_path)
+
+    def test_profile_with_group_or_world_permissions_is_rejected(
+        self, db_with_data, tmp_path, monkeypatch
+    ) -> None:
+        profile = self._profile(tmp_path / "profile.yaml")
+        profile.chmod(0o644)
+        monkeypatch.setattr(mcp_server, "_RUNTIME_BINDING", None, raising=False)
+
+        with pytest.raises(PermissionError, match="权限"):
+            mcp_server._configure_runtime(db_with_data, profile)
+
+    def test_binding_survives_foreign_cwd_and_default_path_drift(
+        self, db_with_data, tmp_path, monkeypatch
+    ) -> None:
+        """配置后只认冻结输入，不能又读回开发目录默认路径。"""
+        from jobagent import match
+
+        profile = self._profile(tmp_path / "profile.yaml")
+        monkeypatch.setattr(mcp_server, "_RUNTIME_BINDING", None, raising=False)
+        mcp_server._configure_runtime(db_with_data, profile)
+
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "wrong.db")
+        monkeypatch.setattr(match, "PROFILE_PATH", tmp_path / "wrong.yaml")
+        foreign = tmp_path / "foreign-cwd"
+        foreign.mkdir()
+        monkeypatch.chdir(foreign)
+
+        assert mcp_server._conn().execute(
+            "SELECT COUNT(*) n FROM jobs"
+        ).fetchone()["n"] == 1
+        assert mcp_server._intent()["families"] == ["operations"]
+
+    def test_runtime_cannot_be_rebound_to_different_inputs(
+        self, db_with_data, tmp_path, monkeypatch
+    ) -> None:
+        first = self._profile(tmp_path / "first.yaml")
+        second = self._profile(tmp_path / "second.yaml")
+        monkeypatch.setattr(mcp_server, "_RUNTIME_BINDING", None, raising=False)
+        mcp_server._configure_runtime(db_with_data, first)
+
+        with pytest.raises(RuntimeError, match="已经固定"):
+            mcp_server._configure_runtime(db_with_data, second)
 
 
 class TestIdentityDoesNotCrossTheBoundary:
@@ -904,6 +1043,17 @@ class TestToolContract:
             if line.startswith("| `list_jobs`")
         )
         assert "届别筛" not in row
+
+    def test_mcp_setup_uses_fixed_explicit_runtime_inputs(self) -> None:
+        setup = (
+            Path(mcp_server.__file__).resolve().parent.parent
+            / "docs" / "MCP_SETUP.md"
+        ).read_text(encoding="utf-8")
+
+        assert '"--db"' in setup and '"--profile"' in setup
+        assert "git rev-parse" not in setup
+        assert "一条命令写进去" not in setup
+        assert "开发目录" in setup and "不要" in setup
 
     def test_notes_reach_the_caller(self, db_with_data) -> None:
         """`allow_missing` 没生效这件事要传到模型那一侧，不能只留在 Python 里。"""
