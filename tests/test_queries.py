@@ -209,6 +209,40 @@ class TestExplainMatch:
         assert out["score"] > 0
         assert out["cities"] == ["深圳"]
 
+    def test_hit_explains_filters_and_score_breakdown(self, conn) -> None:
+        """命中不能只回一句“命中”和一个无含义的总分。"""
+        seed_job(conn, "good")
+
+        out = queries.explain_match(conn, "good", INTENT)
+
+        assert out["reason"] != "命中"
+        assert out["matched_on"] == [
+            "岗位族 operations 符合目标",
+            "招聘类型 campus 符合目标",
+            "届别 26 符合目标",
+            "城市 深圳 符合目标",
+        ]
+        assert out["score_breakdown"] == {
+            "boost_keywords": {"matched": [], "points": 0},
+            "cities": {"matched": ["深圳"], "mode": "explicit", "points": 2},
+            "recruit_type": {"matched": ["campus"], "points": 3},
+            "total": 5,
+        }
+        assert out["score"] == out["score_breakdown"]["total"]
+        assert "不是录用概率" in out["score_note"]
+
+    def test_exclusion_only_intent_reports_the_satisfied_rule(self, conn) -> None:
+        """只设置排除词也属于设置了硬规则，不能声称画像没有筛选条件。"""
+        seed_job(conn, "good", title="产品经理")
+
+        out = queries.explain_match(
+            conn, "good", {"exclude_keywords": ["销售", "外包"]}
+        )
+
+        assert out["state"] == "hit"
+        assert out["matched_on"] == ["未命中排除词：销售、外包"]
+        assert out["reason"] == "命中：未命中排除词：销售、外包"
+
     def test_incomplete_job_is_unknown_not_miss(self, conn) -> None:
         """信息不全必须是第三态。折进 miss 会让这批岗位被静默扣掉。"""
         seed_job(conn, "partial", grad_year=None)
@@ -369,6 +403,30 @@ class TestJobChanges:
         rows = queries.job_changes(conn, kind="job_closed")
         assert [r["kind"] for r in rows] == ["job_closed"]
         assert queries.job_changes(conn, since="2999-01-01") == []
+
+    def test_equivalent_since_offsets_return_same_events(self, conn) -> None:
+        """同一时刻用 +08:00 或 Z 表示，筛选结果必须完全相同。"""
+        conn.executemany(
+            """INSERT INTO events(kind, payload, occurred_at)
+               VALUES('job_updated', '{}', ?)""",
+            [
+                ("2026-08-26T20:36:46+08:00",),
+                ("2026-08-26T20:36:47+08:00",),
+                ("2026-08-26T20:36:48+08:00",),
+            ],
+        )
+        conn.commit()
+
+        local = queries.job_changes(
+            conn, since="2026-08-26T20:36:47+08:00"
+        )
+        utc = queries.job_changes(conn, since="2026-08-26T12:36:47Z")
+
+        assert [row["id"] for row in local] == [row["id"] for row in utc]
+        assert [row["occurred_at"] for row in local] == [
+            "2026-08-26T20:36:48+08:00",
+            "2026-08-26T20:36:47+08:00",
+        ]
 
 
 class TestCliDelegatesInsteadOfKeepingItsOwnCopy:

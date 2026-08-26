@@ -861,6 +861,26 @@ class TestWhitelistCoversEveryIngestKind:
             "条数对，内容错。"
         )
 
+    def test_global_recent_uses_timeline_across_offsets(self, db_with_data) -> None:
+        """跨 kind 聚合后也必须按真实时刻排，不能退回 ISO 字符串排序。"""
+        c = db.connect(db_with_data)
+        c.execute("DELETE FROM events")
+        c.executemany(
+            """INSERT INTO events(kind, payload, occurred_at)
+               VALUES(?, '{}', ?)""",
+            [
+                ("job_opened", "2026-08-26T20:00:00+08:00"),  # 12:00Z
+                ("job_closed", "2026-08-26T12:30:00Z"),       # later
+            ],
+        )
+        c.commit()
+        c.close()
+
+        events = call("job_changes", {"limit": 1})["events"]
+
+        assert len(events) == 1
+        assert events[0]["kind"] == "job_closed"
+
 
 class TestToolContract:
 
@@ -890,6 +910,35 @@ class TestToolContract:
         out = call("explain_match", {"external_id": "没这条"})
         assert out["found"] is False
         assert "hint" in out
+
+    def test_hit_explanation_crosses_the_mcp_boundary(
+        self, db_with_data, tmp_path, monkeypatch
+    ) -> None:
+        """真实 MCP 返回必须带可读命中依据，而不是查询层有、边界外丢了。"""
+        import yaml
+        from jobagent import match
+
+        profile = tmp_path / "profile.yaml"
+        profile.write_text(
+            yaml.safe_dump({
+                "intent": {
+                    "families": ["operations"],
+                    "recruit_types": ["campus"],
+                    "grad_years": ["26"],
+                    "cities": ["深圳"],
+                    "exclude_keywords": ["销售"],
+                },
+            }, allow_unicode=True),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(match, "PROFILE_PATH", profile)
+        out = call("explain_match", {"external_id": "J1"})
+
+        assert out["found"] is True
+        assert out["state"] == "hit"
+        assert "未命中排除词：销售" in out["matched_on"]
+        assert out["score"] == out["score_breakdown"]["total"]
+        assert "不是录用概率" in out["score_note"]
 
     def test_duplicate_job_id_exposes_sources_instead_of_guessing(
         self, db_with_data
@@ -1014,6 +1063,27 @@ class TestToolContract:
         assert result.is_error
         assert "since" in result.content[0].text
         assert "时区" in result.content[0].text
+
+    @pytest.mark.parametrize(
+        "since",
+        [
+            "20260826T123647+00:00",
+            "2026-W35-3T12:36:47+00:00",
+        ],
+    )
+    def test_valid_iso_variants_are_normalized_before_querying(
+        self, db_with_data, since
+    ) -> None:
+        """Python 接受的 ISO 写法不能被 SQLite 静默解释成 0 条。"""
+        canonical = call(
+            "job_changes", {"since": "2026-08-26T12:36:47+00:00", "limit": 100}
+        )
+        variant = call("job_changes", {"since": since, "limit": 100})
+
+        assert [event["id"] for event in variant["events"]] == [
+            event["id"] for event in canonical["events"]
+        ]
+        assert variant["events"], "合法时间不能被静默洗成‘没有变化’"
 
     def test_profile_errors_do_not_expose_local_paths(
         self, db_with_data, tmp_path, monkeypatch
