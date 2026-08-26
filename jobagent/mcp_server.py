@@ -21,12 +21,18 @@
 
 跑法（stdio）：
 
-    .venv/bin/python -m jobagent.mcp_server
+    .venv/bin/python -m jobagent.mcp_server --db /absolute/jobagent.db \
+        --profile /absolute/profile.yaml
 """
 from __future__ import annotations
 
+import argparse
+import os
 import sqlite3
-from typing import Any
+import stat
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Sequence
 
 from mcp.server import MCPServer
 
@@ -104,13 +110,85 @@ PROFILE_UNAVAILABLE = (
 )
 
 
+@dataclass(frozen=True)
+class RuntimeBinding:
+    """MCP 进程启动时一次性固定的本机只读输入。"""
+
+    db_path: Path
+    profile_path: Path
+
+
+_RUNTIME_BINDING: RuntimeBinding | None = None
+
+
+def _checked_regular_file(path: Path | str, *, label: str) -> Path:
+    """拒绝相对路径、缺失文件和任一层符号链接。"""
+    checked = Path(path)
+    if not checked.is_absolute():
+        raise ValueError(f"{label} 必须使用绝对路径")
+
+    current = Path(checked.anchor)
+    for part in checked.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise ValueError(f"{label} 不能经过符号链接")
+
+    try:
+        file_stat = checked.stat()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"{label} 不存在") from None
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise ValueError(f"{label} 必须是普通文件")
+    return checked
+
+
+def _configure_runtime(db_path: Path | str, profile_path: Path | str) -> RuntimeBinding:
+    """验证并冻结 MCP 的数据库与画像路径；不修改两份文件。"""
+    global _RUNTIME_BINDING
+
+    checked_db = _checked_regular_file(db_path, label="数据库")
+    checked_profile = _checked_regular_file(profile_path, label="画像")
+    profile_stat = checked_profile.stat()
+    if profile_stat.st_uid != os.getuid():
+        raise PermissionError("画像必须由当前用户持有")
+    profile_mode = stat.S_IMODE(profile_stat.st_mode)
+    if profile_mode & 0o077:
+        raise PermissionError("画像权限过宽；group/world 不得拥有任何权限")
+
+    candidate = RuntimeBinding(checked_db, checked_profile)
+    if _RUNTIME_BINDING is not None:
+        if _RUNTIME_BINDING != candidate:
+            raise RuntimeError("MCP 运行输入已经固定，不能在同一进程中改绑")
+        return _RUNTIME_BINDING
+
+    conn = db.connect_readonly(checked_db)
+    try:
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    required_tables = {"events", "jobs", "runs", "sources"}
+    if missing := sorted(required_tables - tables):
+        raise ValueError(f"数据库 schema 不完整，缺少表：{missing}")
+
+    # 启动时先验一遍，避免客户端接通后才把画像错误包装成正常空结果。
+    match.load_intent(checked_profile)
+    _RUNTIME_BINDING = candidate
+    return candidate
+
+
 def _conn() -> sqlite3.Connection:
     """每次调用开一个只读连接。
 
     不缓存成模块级单例：sqlite3 连接默认绑在创建它的线程上，而 MCP 的工具调用
     不保证同线程。开连接对本地 SQLite 是微秒级的事，省这个不值当。
     """
-    return db.connect_readonly()
+    path = _RUNTIME_BINDING.db_path if _RUNTIME_BINDING else None
+    return db.connect_readonly(path)
 
 
 def _intent() -> dict:
@@ -133,7 +211,8 @@ def _intent() -> dict:
     白名单比「排除 identity」稳：profile 将来加一个 `contacts` 之类的段落时，
     黑名单会默认放它过去，白名单会默认拦下来。
     """
-    raw = match.load_intent()
+    path = _RUNTIME_BINDING.profile_path if _RUNTIME_BINDING else None
+    raw = match.load_intent(path)
     return {k: v for k, v in raw.items() if k in INTENT_KEYS}
 
 
@@ -356,8 +435,13 @@ def job_changes(
     return {"events": events[:limit], "excluded_kinds": list(EXCLUDED_KINDS)}
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     """stdio 传输。不开 HTTP —— 一个本地库不需要监听端口，端口就是攻击面。"""
+    parser = argparse.ArgumentParser(description="job-agent 本机只读 MCP")
+    parser.add_argument("--db", required=True, type=Path, help="生产数据库绝对路径")
+    parser.add_argument("--profile", required=True, type=Path, help="画像绝对路径")
+    args = parser.parse_args(argv)
+    _configure_runtime(args.db, args.profile)
     mcp.run()
 
 

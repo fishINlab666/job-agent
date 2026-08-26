@@ -1,6 +1,8 @@
 # 把 job-agent 的只读层接到对话里
 
-方案见 [014-MCP只读层.md](plans/014-MCP只读层.md)。这份只讲怎么配、怎么用、怎么确认它真的通了。
+最初设计见 [014-MCP只读层.md](plans/014-MCP只读层.md)，固定封装见
+[027-MCP固定只读封装.md](plans/027-MCP固定只读封装.md)。这份只讲怎么配、怎么用、
+怎么确认它真的通了。
 
 配完之后你在对话里问「蔚来还有几个开放岗位」，模型直接查本地库回答，
 不用我跑命令再把输出贴进来。
@@ -11,10 +13,35 @@
 
 ---
 
-## 一、配
+## 一、先准备固定运行包
 
-> 本节只说明未来如何接入，不授权现在修改任何客户端配置。只有代码进入 `main`、
-> 干净安装通过，并在只读 MCP 检查点获得明确批准后，才恢复一个客户端。
+> 本节只说明未来如何接入，不授权现在修改任何客户端配置。只有候选进入 `main`、
+> 固定目录的干净安装通过，并在只读 MCP 检查点获得明确批准后，才恢复一个客户端。
+
+**不要让客户端启动日常开发目录。** 开发分支、未提交修改和虚拟环境都会继续变化；
+同一份客户端配置可能在没有提醒的情况下换成另一版代码。固定运行包必须来自一个已审核
+提交，并直接在最终目录创建虚拟环境，不能先建好 `.venv` 再移动目录。
+
+准备时需要固定四个输入：
+
+- 已审核的 Git commit；
+- 不再移动的运行目录；
+- 生产数据库的绝对路径；
+- `profile.yaml` 的绝对路径，且文件不得给 group/world 任何权限。
+
+安装命令由发布流程按上述四项生成并单独复核。安装完成后，真正的启动形状必须是：
+
+```bash
+/absolute/fixed/job-agent/.venv/bin/python -m jobagent.mcp_server \
+  --db /absolute/path/to/jobagent.db \
+  --profile /absolute/path/to/profile.yaml
+```
+
+`--db` 和 `--profile` 都是必填项。路径缺失、是相对路径、经过符号链接、数据库 schema
+不完整或画像权限过宽时，server 会在开放 stdio 前失败；不会创建空库，也不会退回开发
+目录里的默认文件。
+
+## 二、接入客户端（候选模板）
 
 ### Claude Desktop
 
@@ -30,77 +57,55 @@ Application Support 子目录；2026-08-13 的历史排查中，配置写进了 
 必须用该客户端自己的运行时注册表或日志确认它读取的配置，并在重启后看到下面五个
 工具；当前文档不授权修改任何客户端配置。
 
-把 `job-agent` 这一段加进 `mcpServers`（文件不存在就整份写进去）：
+获批激活时，把 `job-agent` 这一段作为**候选**加入 `mcpServers`：
 
 ```json
 {
   "mcpServers": {
     "job-agent": {
-      "command": "/absolute/path/to/job-agent/.venv/bin/python",
-      "args": ["-m", "jobagent.mcp_server"],
-      "cwd": "/absolute/path/to/job-agent"
+      "command": "/absolute/fixed/job-agent/.venv/bin/python",
+      "args": [
+        "-m",
+        "jobagent.mcp_server",
+        "--db",
+        "/absolute/path/to/jobagent.db",
+        "--profile",
+        "/absolute/path/to/profile.yaml"
+      ]
     }
   }
 }
 ```
 
-三个字段都不能省，各自有原因：
+关键点：
 
-- **`command` 用 venv 里的绝对路径。** 不写 `python` ——
-  客户端不走你的 shell，`PATH` 里那个 python 大概没装 `mcp` 和 `httpx`。
-- **`args` 用 `-m`。** 模块方式启动，相对 import 才成立。
-- **`cwd` 填上。** 库路径仍从模块位置解析，不依赖当前目录；项目本身也会安装
-  到虚拟环境，因此客户端从其他目录启动 `-m jobagent.mcp_server` 仍能导入。
-
-一条命令写进去（**会覆盖 `mcpServers` 里的同名项，其余保留**）：
-
-```bash
-cd "$(git rev-parse --show-toplevel)" && .venv/bin/python -c "
-import json, pathlib
-p = pathlib.Path.home()/'Library/Application Support/Claude/claude_desktop_config.json'
-d = json.loads(p.read_text()) if p.exists() else {}
-root = str(pathlib.Path.cwd())
-d.setdefault('mcpServers', {})['job-agent'] = {
-    'command': root + '/.venv/bin/python',
-    'args': ['-m', 'jobagent.mcp_server'],
-    'cwd': root,
-}
-p.parent.mkdir(parents=True, exist_ok=True)
-p.write_text(json.dumps(d, indent=2, ensure_ascii=False))
-print('已写入:', p)
-print('现有 server:', list(d['mcpServers'].keys()))
-"
-```
+- `command` 是固定目录虚拟环境的绝对路径，不写裸 `python`。
+- `args` 同时固定模块、数据库和画像；不能省略两个路径参数。
+- 不依赖 `cwd`。客户端从任意目录启动，仍只使用上面明确绑定的两个文件。
+- 不提供自动改配置脚本。激活必须先退出客户端、备份并精确检查同名项，避免恢复旧实例。
 
 **改完必须重启 Claude Desktop。** 配置只在启动时读一次。
 
 ### Claude Code（CLI）
 
 ```bash
-cd "$(git rev-parse --show-toplevel)" && claude mcp add job-agent -- "$PWD/.venv/bin/python" -m jobagent.mcp_server
+claude mcp add job-agent -- /absolute/fixed/job-agent/.venv/bin/python \
+  -m jobagent.mcp_server \
+  --db /absolute/path/to/jobagent.db \
+  --profile /absolute/path/to/profile.yaml
 ```
 
----
-
-## 二、确认它真的通了
+## 三、确认它真的通了
 
 先确认 server 自己能起来（会挂住等 stdio 输入，`Ctrl-C` 退出 —— 挂住就是对的）：
 
 ```bash
-cd "$(git rev-parse --show-toplevel)" && .venv/bin/python -m jobagent.mcp_server
+/absolute/fixed/job-agent/.venv/bin/python -m jobagent.mcp_server \
+  --db /absolute/path/to/jobagent.db \
+  --profile /absolute/path/to/profile.yaml
 ```
 
-再确认注册表里是那 5 个工具。**这条比读代码可靠**，它问的是运行时：
-
-```bash
-cd "$(git rev-parse --show-toplevel)" && .venv/bin/python -c "
-from jobagent import mcp_server as m
-import asyncio
-for t in asyncio.run(m.mcp.list_tools()): print(t.name)
-"
-```
-
-应该正好这五行：
+重启客户端后，从客户端自己的**运行时注册表**确认应该正好是五个工具：
 
 ```
 list_jobs
@@ -110,14 +115,14 @@ list_sync_runs
 job_changes
 ```
 
-最后 —— **在对话里实调一次**。前面两条只证明进程能起、注册表对，
+最后在对话里实调一次 `list_sources` 和 `list_jobs`。前面的启动只证明进程能起，
 不证明客户端连上了。随便问一句「现在库里有多少开放岗位」，
 看模型是不是真调了 `list_jobs`（界面上会显示工具调用）。
-没看到工具调用就是没连上，去看客户端日志。
+没看到工具调用就是没连上，不能把“配置文件里已经写了”当成成功。
 
 ---
 
-## 三、五个工具各干什么
+## 四、五个工具各干什么
 
 | 工具 | 问什么 | 注意 |
 |---|---|---|
@@ -137,7 +142,7 @@ job_changes
 
 ---
 
-## 四、这一层为什么动不了库
+## 五、这一层为什么动不了库
 
 三条硬约束，都在形状上，不是提示词里的请求：
 
