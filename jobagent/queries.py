@@ -286,27 +286,52 @@ def job_changes(
     脏数据不该让整个查询炸掉，但也不能装作没有过 —— 悄悄吞掉会让「diff 里什么都
     没有」和「diff 存坏了」看起来一样。
     """
-    sql = "SELECT * FROM events WHERE 1=1"
-    args: list[Any] = []
-    if kind:
-        sql += " AND kind=?"
-        args.append(kind)
-    if since:
-        # ISO 文本不能按字典序比较：同一时刻的 `+08:00` 与 `Z` 排序位置不同。
-        # SQLite 先把两侧换算成同一时间轴，再做含边界的筛选。
-        sql += " AND julianday(occurred_at) >= julianday(?)"
-        args.append(since)
-    sql += " ORDER BY julianday(occurred_at) DESC, id DESC LIMIT ?"
-    args.append(int(limit))
+    owns_snapshot = bool(since) and not conn.in_transaction
+    if owns_snapshot:
+        # 脏时间检查和结果查询必须来自同一快照；否则两次 SELECT 之间新插入
+        # 一条坏时间，仍可能被下一条 julianday() 静默过滤。
+        conn.execute("BEGIN")
+    try:
+        if since:
+            dirty_sql = """SELECT id, occurred_at FROM events
+                           WHERE (occurred_at IS NULL
+                                  OR julianday(occurred_at) IS NULL)"""
+            dirty_args: list[Any] = []
+            if kind:
+                dirty_sql += " AND kind=?"
+                dirty_args.append(kind)
+            dirty_sql += " ORDER BY id LIMIT 1"
+            dirty = conn.execute(dirty_sql, dirty_args).fetchone()
+            if dirty is not None:
+                raise ValueError(
+                    "事件 occurred_at 无法解析："
+                    f"id={dirty['id']}, value={dirty['occurred_at']!r}"
+                )
 
-    out: list[dict] = []
-    for r in conn.execute(sql, args).fetchall():
-        e = dict(r)
-        raw = e.pop("payload", None)
-        try:
-            e["payload"] = json.loads(raw) if raw else {}
-        except (ValueError, TypeError):
-            e["payload"] = {}
-            e["payload_raw"] = raw
-        out.append(e)
-    return out
+        sql = "SELECT * FROM events WHERE 1=1"
+        args: list[Any] = []
+        if kind:
+            sql += " AND kind=?"
+            args.append(kind)
+        if since:
+            # ISO 文本不能按字典序比较：同一时刻的 `+08:00` 与 `Z` 排序位置不同。
+            # SQLite 先把两侧换算成同一时间轴，再做含边界的筛选。
+            sql += " AND julianday(occurred_at) >= julianday(?)"
+            args.append(since)
+        sql += " ORDER BY julianday(occurred_at) DESC, id DESC LIMIT ?"
+        args.append(int(limit))
+
+        out: list[dict] = []
+        for r in conn.execute(sql, args).fetchall():
+            e = dict(r)
+            raw = e.pop("payload", None)
+            try:
+                e["payload"] = json.loads(raw) if raw else {}
+            except (ValueError, TypeError):
+                e["payload"] = {}
+                e["payload_raw"] = raw
+            out.append(e)
+        return out
+    finally:
+        if owns_snapshot:
+            conn.rollback()

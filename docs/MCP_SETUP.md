@@ -129,8 +129,8 @@ job_changes
 | `list_jobs` | 当前开放岗位，可按族/城市/公司筛，可只看命中我画像的 | 届别来自画像匹配，不是独立工具参数；`total` 不受 `limit` 影响 |
 | `explain_match` | 某条岗位为什么命中／不命中 | `state` 是**三态**；命中时 `matched_on` 列硬条件，`score_breakdown` 列排序加分。分数不是录用概率 |
 | `list_sources` | 每个源的岗位数、最近采集、投递配额 | `last_run` 为 null = **一次都没跑过**，和「跑过但失败了」不是一回事 |
-| `list_sync_runs` | 采集批次历史 | `finished_at` 为 null = 这轮没收尾（进程被杀或正在跑），不是数据缺失 |
-| `job_changes` | 岗位变动：新开、关闭、改动、源首次接入 | **只有岗位侧事件。** `since` 按带时区的真实时刻筛选，不按时间字符串外观比较 |
+| `list_sync_runs` | 采集批次历史 | `finished_at` 为 null = 这轮没收尾；`truncated=true` = 后面还有记录，当前不是全部 |
+| `job_changes` | 岗位变动：新开、关闭、改动、源首次接入 | **只有岗位侧事件。** `truncated=true` = 后面还有；脏事件时间会明确报错，不会被 `since` 静默漏掉 |
 
 ### 几个容易读错的地方
 
@@ -139,6 +139,10 @@ job_changes
 
 `explain_match` 的 `score` 只是同一画像下的轻量展示顺序。看它时要同时看
 `score_breakdown`，不要把高分理解成“更容易录用”。
+
+`list_sync_runs` 和 `job_changes` 的 `returned` 是本次实际给出的条数；
+`truncated` 只说明是否还有更多，不是精确总数。需要完整判断时，不能把
+`truncated=true` 的这一页当成全集。
 
 表单判据检查不属于 MCP。它会启动浏览器并接触登录态，只能在明确授权的
 本地人工流程中运行，不能从对话工具注册表恢复。

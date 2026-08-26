@@ -356,9 +356,18 @@ def list_sync_runs(source_key: str | None = None, limit: int = 20) -> dict:
 
     `finished_at` 为 null = 这一轮没收尾（进程被杀，或正在跑）。这条痕迹是故意
     留着的，不要当成数据缺失。
+
+    `returned` 是本次给出的条数；`truncated=true` 表示后面至少还有一条，
+    不能把这一页当成全部历史。
     """
     queries.validate_positive_limit(limit)
-    return {"runs": queries.sync_runs(_conn(), source_key=source_key, limit=limit)}
+    rows = queries.sync_runs(_conn(), source_key=source_key, limit=limit + 1)
+    page = rows[:limit]
+    return {
+        "runs": page,
+        "returned": len(page),
+        "truncated": len(rows) > limit,
+    }
 
 
 #: `events` 表里**采集侧**的事件种类。这一层只交出这些。
@@ -407,6 +416,9 @@ def job_changes(
     `excluded_kinds` 写明了差在哪。
     since: ISO 时间字符串，只看这之后的。
 
+    `returned` 是本次给出的条数；`truncated=true` 表示符合条件的事件还有更多，
+    当前数组不是全集。
+
     **只有采集侧的事件。** 投递记录不在这一层 —— 代投全程在命令行里做，
     问投了什么请去看 `jobagent applications`。所以 `events` 为空只说明
     「这段时间没有岗位变动」，推不出「没有投递」。
@@ -424,10 +436,17 @@ def job_changes(
     conn = _conn()
     kinds = [kind] if kind else sorted(JOB_EVENT_KINDS)
     events: list[dict] = []
-    for k in kinds:
-        events += queries.job_changes(
-            conn, kind=k, since=normalized_since, limit=limit
-        )
+    # 逐 kind 查询必须来自同一个快照。否则采集恰好在循环中提交时，前半页和
+    # 后半页会代表不同时间点，`truncated` 也不再描述一个确定的数据集合。
+    conn.execute("BEGIN")
+    try:
+        for k in kinds:
+            events += queries.job_changes(
+                conn, kind=k, since=normalized_since, limit=limit + 1
+            )
+    finally:
+        # 只读事务没有需要提交的内容；rollback 同时明确释放快照。
+        conn.rollback()
     # 各 kind 分别取了 limit 条，合起来要重新排序再截断，否则「最近 N 条」
     # 会变成「每种最近 N 条拼在一起」——条数对，但不是最近的那些。
     events.sort(
@@ -437,7 +456,13 @@ def job_changes(
     # `excluded_kinds` 每次都带上，哪怕调用方指定了单个 kind：它说的是
     # 「这一层永远不给什么」，不是「这一次筛掉了什么」。省略它等于让调用方
     # 把一份被裁过的结果当成全集 —— 019 修的就是这个。
-    return {"events": events[:limit], "excluded_kinds": list(EXCLUDED_KINDS)}
+    page = events[:limit]
+    return {
+        "events": page,
+        "returned": len(page),
+        "truncated": len(events) > limit,
+        "excluded_kinds": list(EXCLUDED_KINDS),
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> None:
