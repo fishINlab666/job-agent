@@ -428,6 +428,72 @@ class TestJobChanges:
             "2026-08-26T20:36:47+08:00",
         ]
 
+    def test_since_rejects_dirty_event_time(self, conn) -> None:
+        """带时间窗时不能把无法解析的事件静默当成“窗外”。"""
+        conn.executemany(
+            """INSERT INTO events(kind, payload, occurred_at)
+               VALUES('job_opened', '{}', ?)""",
+            [
+                ("2026-08-27T08:00:00+00:00",),
+                ("not-a-time",),
+            ],
+        )
+        conn.commit()
+
+        rows_without_since = queries.job_changes(
+            conn, kind="job_opened", limit=10
+        )
+        assert any(row["occurred_at"] == "not-a-time" for row in rows_without_since)
+
+        with pytest.raises(ValueError, match="occurred_at.*无法解析"):
+            queries.job_changes(
+                conn,
+                kind="job_opened",
+                since="2026-08-27T00:00:00+00:00",
+                limit=10,
+            )
+        assert not conn.in_transaction, "查询层自己开启的只读快照没有在异常后释放"
+
+    def test_since_preserves_a_callers_existing_transaction(self, conn) -> None:
+        """查询层只能释放自己的快照，不能回滚调用方尚未提交的事务。"""
+        conn.execute(
+            """INSERT INTO events(kind, payload, occurred_at)
+               VALUES('job_opened', '{}', '2026-08-27T08:00:00+00:00')"""
+        )
+        assert conn.in_transaction
+
+        rows = queries.job_changes(
+            conn,
+            kind="job_opened",
+            since="2026-08-27T00:00:00+00:00",
+            limit=10,
+        )
+
+        assert rows
+        assert conn.in_transaction, "调用方事务被只读查询意外结束"
+        conn.rollback()
+
+    def test_dirty_time_in_other_kind_does_not_block_filter(self, conn) -> None:
+        """点名查询一种事件时，不被另一种事件的坏时间误伤。"""
+        conn.executemany(
+            """INSERT INTO events(kind, payload, occurred_at)
+               VALUES(?, '{}', ?)""",
+            [
+                ("job_opened", "2026-08-27T08:00:00+00:00"),
+                ("job_closed", "not-a-time"),
+            ],
+        )
+        conn.commit()
+
+        rows = queries.job_changes(
+            conn,
+            kind="job_opened",
+            since="2026-08-27T00:00:00+00:00",
+            limit=10,
+        )
+
+        assert [row["kind"] for row in rows] == ["job_opened"]
+
 
 class TestCliDelegatesInsteadOfKeepingItsOwnCopy:
     """守**归属**，不是守行为。

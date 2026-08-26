@@ -884,6 +884,136 @@ class TestWhitelistCoversEveryIngestKind:
 
 class TestToolContract:
 
+    def test_sync_runs_reports_when_more_results_exist(
+        self, db_with_data
+    ) -> None:
+        """返回一页历史时必须明说后面还有，不能让局部看成全集。"""
+        conn = db.connect(db_with_data)
+        for _ in range(2):
+            run_id = db.start_run(conn, "tencent_join")
+            db.finish_run(conn, run_id, "ok", fetched=1)
+        conn.close()
+
+        out = call("list_sync_runs", {"limit": 1})
+
+        assert len(out["runs"]) == 1
+        assert out["returned"] == 1
+        assert out["truncated"] is True
+
+    def test_job_changes_reports_global_truncation(self, db_with_data) -> None:
+        """跨 kind 合并后按全局结果判断截断，不是每类各说各话。"""
+        conn = db.connect(db_with_data)
+        db.add_event(conn, "job_closed", company="腾讯", payload={})
+        conn.commit()
+        conn.close()
+
+        out = call("job_changes", {"limit": 1})
+
+        assert len(out["events"]) == 1
+        assert out["returned"] == 1
+        assert out["truncated"] is True
+
+    def test_job_changes_uses_one_snapshot_across_kinds(
+        self, db_with_data, monkeypatch
+    ) -> None:
+        """循环中提交的新事件只能在下一次调用看见，不能混进当前页面。"""
+        from jobagent import queries
+
+        original = queries.job_changes
+        inserted = False
+        marker_kind = sorted(mcp_server.JOB_EVENT_KINDS)[-1]
+        marker_time = "2099-01-01T00:00:00+00:00"
+
+        def insert_after_first_kind(conn, **kwargs):
+            nonlocal inserted
+            rows = original(conn, **kwargs)
+            if not inserted:
+                writer = db.connect(db_with_data)
+                writer.execute(
+                    """INSERT INTO events(kind, payload, occurred_at)
+                       VALUES(?, '{}', ?)""",
+                    (marker_kind, marker_time),
+                )
+                writer.commit()
+                writer.close()
+                inserted = True
+            return rows
+
+        monkeypatch.setattr(queries, "job_changes", insert_after_first_kind)
+
+        first = call("job_changes", {"limit": 100})
+        second = call("job_changes", {"limit": 100})
+
+        assert not [
+            event for event in first["events"]
+            if event["occurred_at"] == marker_time
+        ], "查询中途提交的新行混进了当前快照"
+        assert [
+            event for event in second["events"]
+            if event["occurred_at"] == marker_time
+        ], "当前快照释放后，下一次查询仍看不到已提交行"
+
+    def test_limited_tools_report_complete_results(self, db_with_data) -> None:
+        """结果没超过上限时，不能因为刚好返回一条就误报截断。"""
+        conn = db.connect(db_with_data)
+        run_id = db.start_run(conn, "tencent_join")
+        db.finish_run(conn, run_id, "ok", fetched=1)
+        conn.close()
+
+        runs = call("list_sync_runs", {"limit": 5})
+        events = call("job_changes", {"limit": 5})
+
+        assert runs["returned"] == 1
+        assert runs["truncated"] is False
+        assert events["returned"] == 1
+        assert events["truncated"] is False
+
+    def test_exact_limit_is_not_reported_as_truncated(self, db_with_data) -> None:
+        """恰好有 limit 条就是完整结果，不能用“页满了”猜后面还有。"""
+        conn = db.connect(db_with_data)
+        for _ in range(2):
+            run_id = db.start_run(conn, "tencent_join")
+            db.finish_run(conn, run_id, "ok", fetched=1)
+        db.add_event(conn, "job_closed", company="腾讯", payload={})
+        conn.commit()
+        conn.close()
+
+        runs = call("list_sync_runs", {"limit": 2})
+        events = call("job_changes", {"limit": 2})
+
+        assert len(runs["runs"]) == runs["returned"] == 2
+        assert runs["truncated"] is False
+        assert len(events["events"]) == events["returned"] == 2
+        assert events["truncated"] is False
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [{}, {"since": "2026-08-27T00:00:00+00:00"}],
+    )
+    def test_dirty_event_time_is_an_explicit_tool_error(
+        self, db_with_data, arguments
+    ) -> None:
+        """MCP 无论是否筛时间都不能把无法排序的坏行伪装成正常结果。"""
+        from mcp import Client
+
+        conn = db.connect(db_with_data)
+        conn.execute(
+            """INSERT INTO events(kind, payload, occurred_at)
+               VALUES('job_opened', '{}', 'not-a-time')"""
+        )
+        conn.commit()
+        conn.close()
+
+        async def go():
+            async with Client(mcp_server.mcp) as client:
+                return await client.call_tool("job_changes", arguments)
+
+        result = asyncio.run(go())
+
+        assert result.is_error
+        assert "occurred_at" in result.content[0].text
+        assert "无法解析" in result.content[0].text
+
     def test_total_is_not_capped_by_limit(self, db_with_data) -> None:
         """`total` 是筛完的全量，`returned` 才受 limit 限。
 
