@@ -88,18 +88,25 @@ uv run python -m jobagent.cli digest --mark
 # 立即跑一轮五家公司观察（腾讯、蔚来、小鹏、字节、商汤）
 uv run python -m jobagent.cli observe
 
-# 安装每天 09:30 / 14:30 / 20:30 的 macOS 自动观察
+# 三工作日试运行：安装每天 09:30 / 14:30 / 20:30 的 macOS 自动观察
 uv run python -m jobagent.cli schedule-install
+
+# 连续三工作日每天至少有一轮五家公司完整成功后，改为“当天成功一次即可”
+# 必须显式传入固定提交 release、其中的 Python 和现有生产数据库
+uv run python -m jobagent.cli schedule-flexible-install \
+  --project-root ~/.local/share/job-agent-observer/releases/<full-commit-sha> \
+  --python ~/.local/share/job-agent-observer/releases/<full-commit-sha>/.venv/bin/python \
+  --db /absolute/path/to/jobagent.db
 
 # 查看三工作日观察进度；周末照常运行，但不占验收天数
 uv run python -m jobagent.cli observation-status
 
-# 每天只读预览三轮 × 五家公司的官网对照汇总
+# 只读预览官网对照；旧模式显示 15 格，灵活模式显示 5 格
 uv run python -m jobagent.cli observation-review-day 2026-08-21
 
-# 人工逐项看完后，一次确认当天 15 份证据
+# 人工逐项看完后，一次确认当天全部证据
 uv run python -m jobagent.cli observation-review-day 2026-08-21 \
-  --accept --reviewer "你的名字" --note "已逐项查看三轮五家公司"
+  --accept --reviewer "你的名字" --note "已逐项查看当天五家公司"
 
 # 停止自动观察（历史记录和岗位数据库保留）
 uv run python -m jobagent.cli schedule-uninstall
@@ -122,24 +129,27 @@ uv run python -m jobagent.cli applications --company 蔚来     # 一家公司�
 失败也会落库并阻止该轮冒充正式验收。电脑休眠后若延迟超过 60 分钟才补跑，记录仍保留，
 但不能冒充原计划时段。
 
+灵活模式不要求固定 09:30/14:30/20:30：登录时先检查，Mac 醒着时每个整点和半点再检查。
+休眠时不采集；`StartCalendarInterval` 会在唤醒后消费错过的检查机会。若此时网络尚未恢复，
+该次会明确失败，后续整点/半点继续重试。当天五家公司完整成功一次后，其余触发只做轻量
+检查，不重复抓岗位。独立官网候选仍会保存并报告失败，但不会为了追逐两次读取之间的正常
+岗位变化而重复抓取五家公司。屏幕锁定不影响后台运行，系统睡眠才会暂停。
+
 ### 云端混合采集
 
-`cloud/collector/` 是五家公司公开岗位的云端采集候选：Cloudflare Worker 每 30 分钟
-检查一次上海时区的早、午、晚弹性窗口，D1 保存公开岗位、变化游标和五源完成状态。
-同一窗口只有五家公司全部成功才算完成；单源失败时后续只补该源，重复触发不会重复记账。
-
-本机联网/唤醒只作为兜底机会：云端有缺口时请求云端自行补采，云端已完成时只同步新变化，
-本机不会上传自行抓取的岗位清单。云端构建 allowlist 不包含 `profile.yaml`、简历、申请记录、
-浏览器登录态、Cookie、Playwright 或任何投递器；鉴权 token 只允许存于 Cloudflare Secret 和
-本机私有配置，不能提交到仓库。
+`cloud/collector/` 保留五家公司公开岗位的云端技术候选，但当前正式定时保持关闭：Cloudflare
+Worker Cron 为空，GitHub Workflow 只允许手工触发，本机 `cloud-check` 不安装。原因是免费执行
+环境无法稳定访问四家飞书门户，用户也不采用付费云主机。D1、历史试运行和安全协议保留，
+但不参与本机每日完成判定，也不能与本机灵活调度同时加载。
 
 部署和验收步骤见 [云端混合采集实施计划](docs/plans/023-云端混合采集实施.md)。部署当天的
 即时采集只算技术试运行，不能代替三个完整工作日的产品验收。
 
 每轮定时观察还会通过独立的官方 API 路径保存完整岗位编号候选，但候选不会自动代签
-“官网已核对”。`observation-review-day` 把当天三轮 × 五家公司收成一次只读汇总；只有用户
-看完后明确加 `--accept`，系统才在一个数据库事务里写入 15 份最终证据。岗位编号集合不同、
-少一轮、少一家公司、同步失败、官网候选失败或通知失败都会拒绝确认。旧的单轮 JSON
+“官网已核对”。`observation-review-day` 在旧模式汇总三轮 × 五家公司，在灵活模式汇总当天
+第一个完整批次的五家公司；只有用户看完后明确加 `--accept`，系统才在一个数据库事务里写入
+最终证据。岗位编号集合不同、少一家公司、同步失败或官网候选失败都会拒绝确认。灵活模式下
+已经明确落库的通知失败只显示警告，不会污染岗位真值；缺少通知结果仍会拒绝确认。旧的单轮 JSON
 `observe-review` 仍保留用于诊断性手工核对，不是自动观察的推荐日常入口。
 
 **M7 是只读的**，没有任何改状态的开关：状态变更必须走 `apply` 的

@@ -31,6 +31,59 @@ class ReviewNotReadyError(RuntimeError):
     pass
 
 
+def validate_candidate_snapshot(
+    conn,
+    *,
+    batch,
+    source,
+    candidate,
+    spec: dict,
+) -> dict:
+    """Validate one official candidate against the exact collection snapshot."""
+    if source["status"] != "ok" or source["run_id"] is None:
+        raise ValueError("数据同步失败")
+    if candidate is None:
+        raise ValueError("缺少官网候选")
+    if candidate["status"] != "captured":
+        raise ValueError(f"官网候选失败：{candidate['error']}")
+    if candidate["official_url"] != spec["entry_url"]:
+        raise ValueError("官网入口与固定目标不一致")
+    try:
+        captured = datetime.fromisoformat(candidate["captured_at"])
+        started = datetime.fromisoformat(batch["started_at"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("官网候选时间格式错误") from exc
+    if captured < started or captured > started + timedelta(minutes=120):
+        raise ValueError("官网候选不在同期窗口")
+    try:
+        official_ids = json.loads(candidate["official_ids_json"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("官网候选清单格式错误") from exc
+    if (
+        not isinstance(official_ids, list)
+        or any(not isinstance(value, str) or not value for value in official_ids)
+        or official_ids != sorted(set(official_ids))
+    ):
+        raise ValueError("官网候选清单无序、重复或含空编号")
+    if _digest(official_ids) != candidate["official_ids_sha256"]:
+        raise ValueError("官网候选哈希不一致")
+    system_ids = [
+        row["external_id"]
+        for row in conn.execute(
+            "SELECT external_id FROM snapshots WHERE run_id=? ORDER BY external_id",
+            (source["run_id"],),
+        ).fetchall()
+    ]
+    if official_ids != system_ids:
+        raise ValueError("岗位编号不一致")
+    return {
+        "official_ids": official_ids,
+        "system_ids": system_ids,
+        "captured_at": candidate["captured_at"],
+        "official_ids_sha256": candidate["official_ids_sha256"],
+    }
+
+
 def _canonical(value) -> str:
     return json.dumps(
         value,
@@ -326,50 +379,19 @@ def review_day(conn, observed_date: str) -> dict:
             if source["bootstrap"]:
                 problems.append(f"{slot} {spec['company']} 仍是首轮基线，不能签正式真值")
             candidate = candidates.get(source_key)
-            if candidate is None:
-                problems.append(f"{slot} {spec['company']} 缺少官网候选")
-                continue
-            if candidate["status"] != "captured":
-                problems.append(
-                    f"{slot} {spec['company']} 官网候选失败：{candidate['error']}"
+            try:
+                validated = validate_candidate_snapshot(
+                    conn,
+                    batch=batch,
+                    source=source,
+                    candidate=candidate,
+                    spec=spec,
                 )
+            except ValueError as exc:
+                problems.append(f"{slot} {spec['company']} {exc}")
                 continue
-            if candidate["official_url"] != spec["entry_url"]:
-                problems.append(f"{slot} {spec['company']} 官网入口与固定目标不一致")
-                continue
-            try:
-                captured = datetime.fromisoformat(candidate["captured_at"])
-                started = datetime.fromisoformat(batch["started_at"])
-            except (TypeError, ValueError):
-                problems.append(f"{slot} {spec['company']} 官网候选时间格式错误")
-                continue
-            if captured < started or captured > started + timedelta(minutes=120):
-                problems.append(f"{slot} {spec['company']} 官网候选不在同期窗口")
-                continue
-            try:
-                official_ids = json.loads(candidate["official_ids_json"])
-            except (TypeError, json.JSONDecodeError):
-                problems.append(f"{slot} {spec['company']} 官网候选清单格式错误")
-                continue
-            if (
-                not isinstance(official_ids, list)
-                or any(not isinstance(value, str) or not value for value in official_ids)
-                or official_ids != sorted(set(official_ids))
-            ):
-                problems.append(f"{slot} {spec['company']} 官网候选清单无序、重复或含空编号")
-                continue
-            if _digest(official_ids) != candidate["official_ids_sha256"]:
-                problems.append(f"{slot} {spec['company']} 官网候选哈希不一致")
-                continue
-            system_ids = [
-                row["external_id"]
-                for row in conn.execute(
-                    "SELECT external_id FROM snapshots WHERE run_id=? ORDER BY external_id",
-                    (source["run_id"],),
-                ).fetchall()
-            ]
-            if official_ids != system_ids:
-                problems.append(f"{slot} {spec['company']} 岗位编号不一致")
+            official_ids = validated["official_ids"]
+            system_ids = validated["system_ids"]
             event_rows = conn.execute(
                 """SELECT e.id, e.kind, j.external_id, j.title
                    FROM events AS e LEFT JOIN jobs AS j ON j.id=e.job_id
@@ -386,9 +408,9 @@ def review_day(conn, observed_date: str) -> dict:
                     "source_key": source_key,
                     "company": spec["company"],
                     "official_url": candidate["official_url"],
-                    "captured_at": candidate["captured_at"],
+                    "captured_at": validated["captured_at"],
                     "official_ids": official_ids,
-                    "official_ids_sha256": candidate["official_ids_sha256"],
+                    "official_ids_sha256": validated["official_ids_sha256"],
                     "official_count": len(official_ids),
                     "system_count": len(system_ids),
                     "verified_event_ids": event_ids,
@@ -399,3 +421,151 @@ def review_day(conn, observed_date: str) -> dict:
     if len(items) != len(OBSERVATION_SLOTS) * len(expected_sources):
         problems.append("当天官网证据未形成完整 15 格")
     return {"date": observed_date, "ready": not problems, "problems": problems, "items": items}
+
+
+def review_daily(conn, observed_date: str) -> dict:
+    """Review the first complete flexible five-source snapshot for one day."""
+    expected_sources = {spec["source_key"]: spec for spec in OBSERVATION_SOURCES}
+    problems: list[str] = []
+    warnings: list[str] = []
+    batches = conn.execute(
+        """SELECT * FROM observation_batches
+           WHERE observed_date=? AND trigger='flexible' AND status='ok'
+             AND finished_at IS NOT NULL
+           ORDER BY id""",
+        (observed_date,),
+    ).fetchall()
+    if not batches:
+        return {
+            "date": observed_date,
+            "ready": False,
+            "problems": ["当天尚无完整的灵活采集"],
+            "warnings": [],
+            "items": [],
+        }
+
+    for batch in batches:
+        batch_id = int(batch["id"])
+        current_problems: list[str] = []
+        current_warnings: list[str] = []
+        items: list[dict] = []
+        sources = {
+            row["source_key"]: row
+            for row in conn.execute(
+                "SELECT * FROM observation_sources WHERE observation_id=?",
+                (batch_id,),
+            ).fetchall()
+        }
+        candidates = {
+            row["source_key"]: row
+            for row in conn.execute(
+                "SELECT * FROM observation_truth_candidates WHERE observation_id=?",
+                (batch_id,),
+            ).fetchall()
+        }
+        if set(sources) != set(expected_sources):
+            current_problems.append("daily 目标公司记录不完整")
+        if set(candidates) != set(expected_sources):
+            current_problems.append("daily 官网候选记录不完整")
+
+        total_changes = int(
+            conn.execute(
+                """SELECT COALESCE(SUM(s.change_count), 0)
+                   FROM observation_sources AS s
+                   JOIN observation_batches AS b ON b.id=s.observation_id
+                   WHERE b.observed_date=? AND b.trigger='flexible'""",
+                (observed_date,),
+            ).fetchone()[0]
+        )
+        expected_notification = (
+            ("changes", "sent") if total_changes else ("daily-complete", "sent")
+        )
+        notification = conn.execute(
+            """SELECT policy, status, error FROM observation_notifications
+               WHERE observation_id=?""",
+            (batch_id,),
+        ).fetchone()
+        if notification is None:
+            current_problems.append("daily 缺少通知结果")
+        elif notification["policy"] != expected_notification[0]:
+            current_problems.append("daily 通知策略不符合采集事实")
+        elif notification["status"] == "failed":
+            current_warnings.append(f"daily 通知失败：{notification['error']}")
+        elif notification["status"] != expected_notification[1]:
+            current_problems.append("daily 通知结果尚未收口")
+
+        for source_key, spec in expected_sources.items():
+            source = sources.get(source_key)
+            if source is None:
+                continue
+            if source["bootstrap"]:
+                current_problems.append(
+                    f"daily {spec['company']} 仍是首轮基线，不能签正式真值"
+                )
+            candidate = candidates.get(source_key)
+            try:
+                validated = validate_candidate_snapshot(
+                    conn,
+                    batch=batch,
+                    source=source,
+                    candidate=candidate,
+                    spec=spec,
+                )
+            except ValueError as exc:
+                current_problems.append(f"daily {spec['company']} {exc}")
+                continue
+            event_rows = conn.execute(
+                """SELECT e.id, e.kind, j.external_id, j.title
+                   FROM events AS e LEFT JOIN jobs AS j ON j.id=e.job_id
+                   WHERE e.run_id=?
+                     AND e.kind IN ('job_opened','job_updated','job_reopened','job_closed')
+                   ORDER BY e.id""",
+                (source["run_id"],),
+            ).fetchall()
+            event_ids = [int(row["id"]) for row in event_rows]
+            items.append(
+                {
+                    "observation_id": batch_id,
+                    "slot": "daily",
+                    "source_key": source_key,
+                    "company": spec["company"],
+                    "official_url": candidate["official_url"],
+                    "captured_at": validated["captured_at"],
+                    "official_ids": validated["official_ids"],
+                    "official_ids_sha256": validated["official_ids_sha256"],
+                    "official_count": len(validated["official_ids"]),
+                    "system_count": len(validated["system_ids"]),
+                    "verified_event_ids": event_ids,
+                    "change_count": len(event_ids),
+                    "events": [dict(row) for row in event_rows],
+                }
+            )
+        if len(items) != len(expected_sources):
+            current_problems.append("daily 官网证据未形成完整 5 格")
+        if not current_problems:
+            return {
+                "date": observed_date,
+                "ready": True,
+                "problems": [],
+                "warnings": current_warnings,
+                "items": items,
+            }
+        problems.extend(current_problems)
+        warnings.extend(current_warnings)
+    return {
+        "date": observed_date,
+        "ready": False,
+        "problems": problems,
+        "warnings": warnings,
+        "items": [],
+    }
+
+
+def review_date(conn, observed_date: str) -> dict:
+    """Use the five-item review only after flexible mode has produced a batch."""
+    row = conn.execute(
+        """SELECT 1 FROM observation_batches
+           WHERE observed_date=? AND trigger='flexible' LIMIT 1""",
+        (observed_date,),
+    ).fetchone()
+    return review_daily(conn, observed_date) if row else review_day(conn, observed_date)

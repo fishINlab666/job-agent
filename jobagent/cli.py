@@ -35,10 +35,13 @@ _install_observation_schedule = scheduler.install
 _uninstall_observation_schedule = scheduler.uninstall
 _install_cloud_check_schedule = scheduler.install_cloud_check
 _uninstall_cloud_check_schedule = scheduler.uninstall_cloud_check
+_install_flexible_schedule = scheduler.install_flexible
+_recover_flexible_schedule = scheduler.recover_flexible
 _observation_progress = observation.progress
+_completed_workday_window = observation.consecutive_completed_workdays
 _capture_official_candidates = official_truth.capture_candidates
 _deliver_observation_notification = notifications.deliver_observation
-_review_observation_day = official_truth.review_day
+_review_observation_day = official_truth.review_date
 _accept_observation_day = observation.accept_day
 
 # 这里原来有两张 {source_key: cls} 表。现在注册表移到 jobagent/routing.py，
@@ -614,6 +617,89 @@ def observe(
         raise typer.Exit(1)
 
 
+@app.command(name="observe-daily")
+def observe_daily(
+    db_path: Path = typer.Option(..., "--db", help="已存在的观察数据库路径"),
+) -> None:
+    """当天成功一次即可；未完成时利用当前在线机会重试五家公司。"""
+    path = db_path.absolute()
+    if path.is_symlink() or not path.is_file():
+        raise typer.BadParameter("--db 必须是已存在且非符号链接的数据库文件")
+    today = date.today().isoformat()
+    try:
+        with observation.exclusive_run(path, wait_seconds=120):
+            conn = db.connect(path)
+            db.init(conn)
+            try:
+                completed_id = observation.completed_daily_collection(conn, today)
+                if completed_id is not None:
+                    completed_batch = conn.execute(
+                        "SELECT trigger FROM observation_batches WHERE id=?",
+                        (completed_id,),
+                    ).fetchone()
+                    notification = conn.execute(
+                        """SELECT status, error FROM observation_notifications
+                           WHERE observation_id=?""",
+                        (completed_id,),
+                    ).fetchone()
+                    console.print(
+                        f"[green]今天已经完整采集[/green] · #{completed_id}，本次不重复。"
+                    )
+                    if (
+                        completed_batch["trigger"] == "flexible"
+                        and notification is None
+                    ):
+                        console.print("[red]今日通知结果缺失；不会重新抓岗位。[/red]")
+                        raise typer.Exit(1)
+                    if notification is not None and notification["status"] == "failed":
+                        console.print(f"[red]此前本机通知失败[/red]：{notification['error']}")
+                        raise typer.Exit(1)
+                    return
+
+                report = _run_observation(
+                    conn,
+                    specs=OBSERVATION_SOURCES,
+                    trigger="flexible",
+                    slot="daily",
+                )
+                candidate_report = _capture_official_candidates(
+                    conn, report, OBSERVATION_SOURCES
+                )
+                if report["status"] != "ok" or candidate_report["status"] != "ok":
+                    notification_result = _deliver_observation_notification(
+                        conn, {**report, "status": "partial"}, slot="daily"
+                    )
+                else:
+                    completed_id = observation.completed_daily_collection(conn, today)
+                    if completed_id != report["id"]:
+                        raise RuntimeError("本轮候选写入后仍未形成完整日快照")
+                    notification_result = _deliver_observation_notification(
+                        conn,
+                        observation.daily_notification_report(
+                            conn, today, int(completed_id)
+                        ),
+                        slot="daily",
+                    )
+            finally:
+                conn.close()
+    except observation.AlreadyRunningError as exc:
+        console.print(f"[yellow]{exc}，本次等待下一机会。[/yellow]")
+        raise typer.Exit(1)
+
+    console.print(f"[green]今日采集 #{report['id']}[/green] · {report['status']}")
+    if report["status"] != "ok":
+        console.print("[red]五源采集未完整，下一次在线机会将重试。[/red]")
+        raise typer.Exit(1)
+    if candidate_report["status"] != "ok":
+        console.print(
+            "[red]官网候选不完整；五源数据已保留，不会因此重复抓岗位。[/red]"
+        )
+        raise typer.Exit(1)
+    if notification_result["status"] == "failed":
+        console.print(f"[red]本机通知失败[/red]：{notification_result['error']}")
+        raise typer.Exit(1)
+
+
 @app.command(name="observe-review")
 def observe_review(
     observation_id: int = typer.Argument(..., help="观察轮次编号"),
@@ -643,10 +729,15 @@ def observe_review(
             "SELECT trigger FROM observation_batches WHERE id=?",
             (observation_id,),
         ).fetchone()
-        if batch is not None and batch["trigger"] == "scheduled":
+        if batch is not None and batch["trigger"] in {"scheduled", "flexible"}:
+            label = (
+                "定时观察不能逐公司确认。"
+                if batch["trigger"] == "scheduled"
+                else "灵活观察不能逐公司确认。"
+            )
             console.print(
-                "[red]定时观察不能逐公司确认。[/red]"
-                "请使用 observation-review-day 一次核对当天 15 份证据。"
+                f"[red]{label}[/red]"
+                "请使用 observation-review-day 一次核对当天全部证据。"
             )
             raise typer.Exit(1)
         observation.record_truth(
@@ -701,7 +792,7 @@ def observation_status(
 def observation_review_day(
     observed_date: str = typer.Argument(..., help="要核对的工作日（YYYY-MM-DD）"),
     db_path: Path | None = typer.Option(None, "--db", help="观察数据库路径"),
-    accept: bool = typer.Option(False, "--accept", help="明确确认并一次写入 15 份证据"),
+    accept: bool = typer.Option(False, "--accept", help="明确确认并一次写入当天全部证据"),
     reviewer: str = typer.Option("", "--reviewer", help="确认人"),
     note: str = typer.Option("", "--note", help="确认说明"),
 ) -> None:
@@ -719,6 +810,8 @@ def observation_review_day(
         if accept:
             db.init(conn)
         review = _review_observation_day(conn, observed_date)
+        for warning in review.get("warnings", []):
+            console.print(f"[yellow]提醒[/yellow] {warning}")
         for item in review["items"]:
             count = item.get("official_count", "?")
             digest = item.get("official_ids_sha256", "")[:12] or "未提供"
@@ -738,7 +831,7 @@ def observation_review_day(
             raise typer.Exit(1)
         if not accept:
             console.print(
-                "[green]当天 15 份官网候选可以确认。[/green]"
+                f"[green]当天 {len(review['items'])} 份官网候选可以确认。[/green]"
                 "当前只是预览，尚未写入最终验收。"
             )
             return
@@ -772,6 +865,56 @@ def schedule_install(
         home=home.resolve(),
     )
     console.print("[green]自动观察已安装[/green] " + " / ".join(slots))
+
+
+@app.command(name="schedule-flexible-install")
+def schedule_flexible_install(
+    project_root: Path = typer.Option(
+        ..., "--project-root", help="releases/<40位提交SHA> 固定运行目录"
+    ),
+    python_executable: Path = typer.Option(Path(sys.executable), "--python"),
+    db_path: Path = typer.Option(..., "--db", help="现有生产观察数据库"),
+    through_date: str = typer.Option(
+        date.today().isoformat(), "--through-date", help="三工作日窗口终点"
+    ),
+    home: Path = typer.Option(Path.home(), "--home", hidden=True),
+) -> None:
+    """连续三工作日每天有完整五源快照后，切换为每天成功一次。"""
+    try:
+        date.fromisoformat(through_date)
+    except ValueError as exc:
+        raise typer.BadParameter("--through-date 必须是 YYYY-MM-DD") from exc
+    path = db_path.absolute()
+    if path.is_symlink() or not path.is_file():
+        raise typer.BadParameter("--db 必须是已存在且非符号链接的数据库文件")
+    conn = db.connect_readonly(path)
+    try:
+        window = _completed_workday_window(conn, through_date)
+        if len(window) != 3:
+            console.print("[yellow]连续三个工作日尚未完成，保持旧调度。[/yellow]")
+            raise typer.Exit(1)
+    finally:
+        conn.close()
+    label = _install_flexible_schedule(
+        project_root=project_root.absolute(),
+        python_executable=python_executable.absolute(),
+        db_path=path,
+        home=home.absolute(),
+    )
+    console.print(f"[green]灵活每日采集已启用[/green] · {label}")
+
+
+@app.command(name="schedule-flexible-recover")
+def schedule_flexible_recover(
+    db_path: Path = typer.Option(..., "--db", help="同一生产观察数据库"),
+    home: Path = typer.Option(Path.home(), "--home", hidden=True),
+) -> None:
+    """仅消费身份匹配的本机 marker，恢复中断前的调度。"""
+    path = db_path.absolute()
+    if path.is_symlink() or not path.is_file():
+        raise typer.BadParameter("--db 必须是已存在且非符号链接的数据库文件")
+    _recover_flexible_schedule(db_path=path, home=home.absolute())
+    console.print("[green]灵活调度中断现场已恢复[/green]")
 
 
 @app.command(name="schedule-uninstall")
