@@ -58,6 +58,12 @@ from .base import (
 # 投递按钮的文案。四个租户实测一致（2026-08-10）。
 APPLY_TEXT = "投递"
 
+# 字节招聘页会在岗位详情上叠一层 AI 求职助手引导，遮罩会拦截「投递」按钮。
+# 只能点遮罩内语义明确的「稍后再说」；找不到唯一按钮就保持 fail-closed，
+# 不用 force click，也不删除 DOM，避免误触真正的投递流程。
+AI_GUIDE_MASK = ".hire-ai-assistant-guide-cn-mask"
+AI_GUIDE_DISMISS_TEXT = "稍后再说"
+
 # 表单底部真正的提交按钮。**不能只写「提交」** —— 页面上「投递」「提交简历」
 # 同时存在，模糊匹配会点错。实测字节是「提交简历」（2026-08-10 截图核实）。
 SUBMIT_TEXT = "提交简历"
@@ -371,6 +377,11 @@ class FeishuSubmitter:
             # 换成等按钮自己出现：**等我们真正要的那个元素，而不是等「页面大概好了」**。
             try:
                 page.wait_for_selector(
+                    f"button:has-text('{APPLY_TEXT}'), {AI_GUIDE_MASK}",
+                    timeout=self.timeout,
+                )
+                self._dismiss_optional_guide(page)
+                page.wait_for_selector(
                     f"button:has-text('{APPLY_TEXT}')", timeout=self.timeout
                 )
             except PlaywrightTimeout:
@@ -395,13 +406,11 @@ class FeishuSubmitter:
             # count() 要问 locator 本身，不是问 .first —— .first 是「第 0 个元素」
             # 这个概念，对它数个数在语义上是错的（真实 Playwright 下恒为 0 或 1，
             # 掩盖得住；假页面下直接暴露）。
-            apply_loc = page.locator(f"button:has-text('{APPLY_TEXT}')")
-            if not apply_loc.count():
+            if not self._click_apply_when_ready(page):
                 closer()
                 return self._blocked(
                     plan, f"没找到「{APPLY_TEXT}」按钮，页面结构可能已变", shot
                 )
-            apply_loc.first.click()
 
             # 点投递后页面不是立刻到位：先落在 /resume/<id>/apply 且正文只有一个
             # loading spinner（实测 body 40 字节），要 3~5s 才到稳态。立刻判
@@ -1184,6 +1193,37 @@ class FeishuSubmitter:
 
     # ---------- 页面状态探测 ----------
     # 站点改版时这几个最先失效，保持独立小函数方便单测和快速替换。
+
+    def _dismiss_optional_guide(self, page: Page) -> bool:
+        """关闭遮住岗位详情的可选 AI 引导；不触碰登录或投递确认。"""
+        if page.locator(AI_GUIDE_MASK).count() != 1:
+            return False
+        dismiss = page.locator(
+            f'{AI_GUIDE_MASK} button:text-is("{AI_GUIDE_DISMISS_TEXT}")'
+        )
+        if dismiss.count() != 1:
+            return False
+        dismiss.first.click(timeout=min(self.timeout, 3000))
+        page.wait_for_timeout(300)
+        return True
+
+    def _click_apply_when_ready(self, page: Page) -> bool:
+        """等待岗位按钮稳定可点，再且仅再发出一次真实点击。"""
+        attempts = max(1, int(self.timeout // 250))
+        for _ in range(attempts):
+            self._dismiss_optional_guide(page)
+            apply_loc = page.locator(f"button:has-text('{APPLY_TEXT}')")
+            if not apply_loc.count():
+                page.wait_for_timeout(250)
+                continue
+            try:
+                # trial 只验证可操作性，不发出点击；避免遮罩竞态造成重复导航。
+                apply_loc.first.click(trial=True, timeout=250)
+            except PlaywrightTimeout:
+                continue
+            apply_loc.first.click(timeout=self.timeout)
+            return True
+        return False
 
     def _is_page_missing(self, page: Page) -> bool:
         """页面是不是「不存在」。
