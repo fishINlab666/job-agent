@@ -472,6 +472,37 @@ class TestApplications:
         assert r.exit_code == 0
         assert "没有" in r.output
 
+    @pytest.mark.parametrize(
+        ("args", "expected_exit_code"),
+        [
+            (["apply", "missing-job"], 1),
+            (["application-reconcile", "999"], 1),
+            (["applications"], 0),
+            (["checkup", "missing-job"], 1),
+        ],
+    )
+    def test_product_commands_accept_explicit_database_path(
+        self, tmp_path, monkeypatch, args, expected_exit_code
+    ) -> None:
+        """固定 release 的产品命令必须能显式绑定同一份生产库。"""
+        database = tmp_path / "explicit.db"
+        conn = db.connect(database)
+        db.init(conn)
+        conn.close()
+
+        connect = db.connect
+        calls = []
+
+        def capture(path=None):
+            calls.append(path)
+            return connect(path)
+
+        monkeypatch.setattr(db, "connect", capture)
+        result = runner.invoke(cli.app, [*args, "--db", str(database)])
+
+        assert result.exit_code == expected_exit_code, result.output
+        assert calls == [database]
+
     def test_orphan_application_still_listed(self, tmp_db) -> None:
         """孤儿行照样出现。**这条是「做一半会红」的那条。**
 

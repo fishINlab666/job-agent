@@ -1447,13 +1447,14 @@ def apply(
     again: bool = typer.Option(
         False, "--again", help="核对过源站后，显式重试已有终态记录的同一岗位"
     ),
+    db_path: Path | None = typer.Option(None, "--db", help="岗位数据库路径"),
 ) -> None:
     """代投单个岗位：先填好表停下，你确认了才提交。
 
     没有 --yes 这种开关，这是故意的。提交不可逆，对方系统里多一条记录就撤
     不回来，所以确认环节不提供跳过的口子。想批量投递也得一个一个看过去。
     """
-    conn = db.connect()
+    conn = db.connect(db_path)
 
     job = _find_job_or_exit(conn, job_id, source)
     src = job["source_key"]
@@ -1650,9 +1651,10 @@ def application_reconcile(
         "--confirmed-not-submitted",
         help="已在招聘官网确认这次没有形成投递记录",
     ),
+    db_path: Path | None = typer.Option(None, "--db", help="岗位数据库路径"),
 ) -> None:
     """人工核对源站后，释放一条悬挂或结果未知的投递占位。"""
-    conn = db.connect()
+    conn = db.connect(db_path)
     row = conn.execute(
         "SELECT * FROM applications WHERE id=?", (attempt_id,)
     ).fetchone()
@@ -1714,6 +1716,7 @@ def applications(
     company: str = typer.Option(None, "--company", help="只看某家公司（跨该公司的所有源）"),
     limit: int = typer.Option(30),
     funnel: bool = typer.Option(False, "--funnel", help="只看分档汇总，不列明细"),
+    db_path: Path | None = typer.Option(None, "--db", help="岗位数据库路径"),
 ) -> None:
     """看投递记录：投了什么、卡在哪、截图在哪。
 
@@ -1721,7 +1724,7 @@ def applications(
     核对后，才能另走 ``application-reconcile`` 的显式确认闸门；提交中的记录
     连该闸门也不能释放。
     """
-    conn = db.connect()
+    conn = db.connect(db_path)
 
     if status and status not in APP_STATUSES:
         raise typer.BadParameter(
@@ -1977,6 +1980,7 @@ def checkup(
     job_id: str = typer.Argument(..., help="拿哪个岗位的表单来体检（external_id）"),
     source: str = typer.Option(None, help="岗位编号重号时指定来源"),
     user_data_dir: str = typer.Option(None, help="浏览器用户数据目录（要有登录态）"),
+    db_path: Path | None = typer.Option(None, "--db", help="岗位数据库路径"),
 ) -> None:
     """核一遍投递表单的判据还认不认页面。**只读，不填不投。**
 
@@ -1987,7 +1991,7 @@ def checkup(
     判据写对了不算完，得有一条命令能回答「怎么知道它失效了」。这就是那条命令。
     改完选择器、或者隔一段时间没投过，跑一次。
     """
-    conn = db.connect()
+    conn = db.connect(db_path)
     job = _find_job_or_exit(conn, job_id, source)
     src = job["source_key"]
 
