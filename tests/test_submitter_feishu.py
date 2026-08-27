@@ -21,10 +21,15 @@ import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
 from jobagent import profile as P
 from jobagent.submitters.base import SESSIONS, LiveSession, TokenError
-from jobagent.submitters.feishu import FeishuSubmitter
+from jobagent.submitters.feishu import (
+    AI_GUIDE_DISMISS_TEXT,
+    AI_GUIDE_MASK,
+    FeishuSubmitter,
+)
 
 JOB = {
     "external_id": "7592540658310154534",
@@ -62,13 +67,19 @@ def mock_page():
 
 
 def fake_page(*, missing=False, closed=False, no_apply_btn=False,
-              logged_in=False, url=None, labels_present=False):
+              logged_in=False, url=None, labels_present=False,
+              assistant_guide=False):
     """按选择器文案作答的假页面。
 
     logged_in=True 模拟「已登录，点投递后进了表单」—— 本轮那也是 blocked，
     但 blocker 文案不同（要求补 FORM_FIELDS 而不是要求登录）。
     """
-    state = {"clicked": False}
+    state = {
+        "clicked": False,
+        "assistant_guide": assistant_guide,
+        "apply_delay_ticks": 0,
+        "apply_clicks": [],
+    }
     base_url = url or JOB["apply_url"]
     page = MagicMock()
     page.url = base_url
@@ -81,6 +92,8 @@ def fake_page(*, missing=False, closed=False, no_apply_btn=False,
         if "获取验证码" in sel:
             # 点了投递之后才会出现登录页文案
             return int(state["clicked"] and not logged_in)
+        if "hire-ai-assistant-guide-cn-mask" in sel or "稍后再说" in sel:
+            return int(state["assistant_guide"])
         if labels_present and sel.startswith('label:text-is('):
             # 让 label_drift 查空。默认返 0 会让 prepare 在「一个都对不上」
             # 那道闸就停下，走不到填表 —— 想验填表行为的测试必须开这个。
@@ -91,10 +104,21 @@ def fake_page(*, missing=False, closed=False, no_apply_btn=False,
         loc = MagicMock()
         loc.count.return_value = counts(sel)
         target = MagicMock()
+        if "稍后再说" in sel:
+            target.click.side_effect = lambda *a, **k: state.update(
+                assistant_guide=False
+            )
         if "投递" in sel:
-            loc.count.return_value = 0 if no_apply_btn else 1
+            loc.count.return_value = int(
+                not no_apply_btn and state["apply_delay_ticks"] == 0
+            )
 
             def click(*a, **k):
+                state["apply_clicks"].append(dict(k))
+                if state["assistant_guide"]:
+                    raise RuntimeError("AI 求职助手遮罩拦截了投递按钮")
+                if k.get("trial"):
+                    return
                 state["clicked"] = True
                 if not logged_in:
                     page.url = (
@@ -106,6 +130,12 @@ def fake_page(*, missing=False, closed=False, no_apply_btn=False,
         return loc
 
     page.locator.side_effect = locator
+
+    def advance(*args, **kwargs):
+        if state["apply_delay_ticks"]:
+            state["apply_delay_ticks"] -= 1
+
+    page.wait_for_timeout.side_effect = advance
     page.state = state
     return page
 
@@ -307,6 +337,86 @@ class TestPageStates:
         plan = prep(fake_page(no_apply_btn=True))
         assert plan.status == "blocked"
         assert "投递" in plan.blocker
+
+    def test_bytedance_ai_guide_is_dismissed_before_apply(self):
+        """非投递引导弹窗不能把只读体检和人工确认流程永久挡住。"""
+        page = fake_page()
+
+        # 真站的弹窗会晚于岗位按钮出现：第一次等待已经结束、截图时才挂上遮罩。
+        shown = False
+
+        def show_guide_once(*args, **kwargs):
+            nonlocal shown
+            if not shown:
+                page.state["assistant_guide"] = True
+                page.state["apply_delay_ticks"] = 2
+                shown = True
+
+        page.screenshot.side_effect = show_guide_once
+
+        plan = prep(page, tenant="bytedance")
+
+        assert page.state["assistant_guide"] is False
+        assert page.state["clicked"] is True
+        real_clicks = [c for c in page.state["apply_clicks"] if not c.get("trial")]
+        assert len(real_clicks) == 1
+        assert all(not c.get("force", False) for c in page.state["apply_clicks"])
+        assert "需要登录" in plan.blocker
+
+    def test_ai_guide_requires_exactly_one_mask(self):
+        sub = FeishuSubmitter(tenant="bytedance")
+        page = MagicMock()
+        mask = MagicMock()
+        mask.count.return_value = 2
+        dismiss = MagicMock()
+        dismiss.count.return_value = 1
+        page.locator.side_effect = [mask, dismiss]
+
+        assert not sub._dismiss_optional_guide(page)
+        dismiss.first.click.assert_not_called()
+
+    def test_ai_guide_requires_one_exact_scoped_dismiss_button(self):
+        sub = FeishuSubmitter(tenant="bytedance")
+        page = MagicMock()
+        mask = MagicMock()
+        mask.count.return_value = 1
+        dismiss = MagicMock()
+        dismiss.count.return_value = 1
+        page.locator.side_effect = [mask, dismiss]
+
+        assert sub._dismiss_optional_guide(page)
+        assert page.locator.call_args_list[1].args[0] == (
+            f'{AI_GUIDE_MASK} button:text-is("{AI_GUIDE_DISMISS_TEXT}")'
+        )
+        dismiss.first.click.assert_called_once_with(timeout=3000)
+
+    def test_ai_guide_rejects_ambiguous_dismiss_buttons(self):
+        sub = FeishuSubmitter(tenant="bytedance")
+        page = MagicMock()
+        mask = MagicMock()
+        mask.count.return_value = 1
+        dismiss = MagicMock()
+        dismiss.count.return_value = 2
+        page.locator.side_effect = [mask, dismiss]
+
+        assert not sub._dismiss_optional_guide(page)
+        dismiss.first.click.assert_not_called()
+
+    def test_failed_actionability_trial_never_sends_a_real_click(self):
+        sub = FeishuSubmitter(tenant="bytedance", timeout=0.5)
+        page = MagicMock()
+        apply_loc = MagicMock()
+        apply_loc.count.return_value = 1
+        apply_loc.first.click.side_effect = PlaywrightTimeout("仍被遮挡")
+        page.locator.return_value = apply_loc
+
+        with patch.object(sub, "_dismiss_optional_guide", return_value=False):
+            assert not sub._click_apply_when_ready(page)
+
+        calls = apply_loc.first.click.call_args_list
+        assert calls
+        assert all(call.kwargs.get("trial") is True for call in calls)
+        assert all("force" not in call.kwargs for call in calls)
 
     def test_login_gate_blocks_and_tells_user_what_to_do(self):
         """撞登录门时 blocked，并说清「只能你自己做」。
