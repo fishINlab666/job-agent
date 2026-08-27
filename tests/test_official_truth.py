@@ -298,6 +298,148 @@ def test_daily_review_rejects_a_valid_status_with_the_wrong_policy(tmp_path) -> 
     conn.close()
 
 
+def _seed_flexible_review(conn, *, notification_status: str = "sent") -> int:
+    started = "2026-08-25T10:00:00+08:00"
+    batch_id = conn.execute(
+        """INSERT INTO observation_batches(
+               started_at, finished_at, observed_date, trigger, slot,
+               is_workday, on_time, status)
+           VALUES(?,?, '2026-08-25', 'flexible', 'daily', 1, 0, 'ok')""",
+        (started, started),
+    ).lastrowid
+    conn.execute(
+        """INSERT INTO observation_notifications(
+               observation_id, policy, status, attempted_at, error)
+           VALUES(?, 'daily-complete', ?, ?, ?)""",
+        (
+            batch_id,
+            notification_status,
+            started,
+            "denied" if notification_status == "failed" else None,
+        ),
+    )
+    for number, spec in enumerate(OBSERVATION_SOURCES, start=1):
+        db.register_source(
+            conn,
+            spec["source_key"],
+            spec["company"],
+            spec["system"],
+            spec["entry_url"],
+            tenant=spec.get("tenant"),
+        )
+        run_id = conn.execute(
+            """INSERT INTO runs(source_key, started_at, finished_at, status)
+               VALUES(?,?,?,'ok')""",
+            (spec["source_key"], started, started),
+        ).lastrowid
+        external_id = f"{spec['source_key']}:daily-{number}"
+        conn.execute(
+            """INSERT INTO snapshots(
+                   run_id, source_key, external_id, fingerprint, raw_json, captured_at)
+               VALUES(?,?,?,?,?,?)""",
+            (run_id, spec["source_key"], external_id, "fp", "{}", started),
+        )
+        conn.execute(
+            """INSERT INTO observation_sources(
+                   observation_id, source_key, company, run_id, status, bootstrap)
+               VALUES(?,?,?,?, 'ok', 0)""",
+            (batch_id, spec["source_key"], spec["company"], run_id),
+        )
+        ids_json = json.dumps([external_id], ensure_ascii=False, separators=(",", ":"))
+        conn.execute(
+            """INSERT INTO observation_truth_candidates(
+                   observation_id, source_key, status, official_url, captured_at,
+                   official_ids_json, official_ids_sha256)
+               VALUES(?,?,'captured',?,?,?,?)""",
+            (
+                batch_id,
+                spec["source_key"],
+                spec["entry_url"],
+                started,
+                ids_json,
+                hashlib.sha256(ids_json.encode("utf-8")).hexdigest(),
+            ),
+        )
+    conn.commit()
+    return int(batch_id)
+
+
+def test_flexible_daily_review_reuses_five_item_truth_contract(tmp_path) -> None:
+    conn = db.connect(tmp_path / "observation.db")
+    db.init(conn)
+    _seed_flexible_review(conn)
+
+    review = official_truth.review_daily(conn, "2026-08-25")
+
+    assert review["ready"] is True
+    assert len(review["items"]) == 5
+    assert review["warnings"] == []
+    conn.close()
+
+
+def test_flexible_daily_review_warns_on_recorded_notification_failure(tmp_path) -> None:
+    conn = db.connect(tmp_path / "observation.db")
+    db.init(conn)
+    _seed_flexible_review(conn, notification_status="failed")
+
+    review = official_truth.review_daily(conn, "2026-08-25")
+
+    assert review["ready"] is True
+    assert any("通知失败" in warning for warning in review["warnings"])
+    conn.close()
+
+
+def test_flexible_daily_review_uses_changes_from_earlier_attempts(tmp_path) -> None:
+    conn = db.connect(tmp_path / "observation.db")
+    db.init(conn)
+    completed_id = _seed_flexible_review(conn)
+    previous_id = conn.execute(
+        """INSERT INTO observation_batches(
+               started_at, finished_at, observed_date, trigger, slot,
+               is_workday, on_time, status)
+           VALUES('2026-08-25T09:00:00+08:00', '2026-08-25T09:01:00+08:00',
+                  '2026-08-25', 'flexible', 'daily', 1, 0, 'partial')"""
+    ).lastrowid
+    spec = OBSERVATION_SOURCES[0]
+    conn.execute(
+        """INSERT INTO observation_sources(
+               observation_id, source_key, company, status, change_count)
+           VALUES(?,?,?,'partial',2)""",
+        (previous_id, spec["source_key"], spec["company"]),
+    )
+    conn.execute(
+        """UPDATE observation_notifications SET policy='changes', status='sent'
+           WHERE observation_id=?""",
+        (completed_id,),
+    )
+    conn.commit()
+
+    review = official_truth.review_daily(conn, "2026-08-25")
+
+    assert review["ready"] is True
+    conn.close()
+
+
+def test_accept_day_uses_five_item_contract_after_flexible_collection(tmp_path) -> None:
+    conn = db.connect(tmp_path / "observation.db")
+    db.init(conn)
+    _seed_flexible_review(conn)
+
+    result = observation.accept_day(
+        conn,
+        "2026-08-25",
+        reviewer="product-owner",
+        note="已逐项查看五家公司清单",
+        checked_at="2026-08-25T10:05:00+08:00",
+    )
+
+    assert result == {"date": "2026-08-25", "accepted": 5}
+    assert conn.execute(
+        "SELECT COUNT(*) FROM observation_truth_evidence"
+    ).fetchone()[0] == 5
+    conn.close()
+
+
 def test_accept_day_commits_all_fifteen_items_atomically(tmp_path) -> None:
     conn = db.connect(tmp_path / "observation.db")
     db.init(conn)

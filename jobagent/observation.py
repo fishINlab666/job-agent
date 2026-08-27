@@ -258,6 +258,93 @@ def run(
     }
 
 
+def completed_daily_collection(conn, observed_date: str) -> int | None:
+    """Return the first complete five-source sync on a calendar day.
+
+    Independent official candidates belong to the truth-review seam. They may
+    legitimately drift after a complete sync and must not trigger a data recrawl.
+    """
+    expected = {spec["source_key"] for spec in OBSERVATION_SOURCES}
+    batches = conn.execute(
+        """SELECT * FROM observation_batches
+           WHERE observed_date=? AND status='ok' AND finished_at IS NOT NULL
+             AND trigger IN ('scheduled','flexible')
+           ORDER BY id""",
+        (observed_date,),
+    ).fetchall()
+    for batch in batches:
+        batch_id = int(batch["id"])
+        sources = {
+            row["source_key"]: row
+            for row in conn.execute(
+                "SELECT * FROM observation_sources WHERE observation_id=?",
+                (batch_id,),
+            ).fetchall()
+        }
+        if set(sources) != expected:
+            continue
+        if any(
+            source["status"] != "ok" or source["run_id"] is None
+            for source in sources.values()
+        ):
+            continue
+        return batch_id
+    return None
+
+
+def daily_notification_report(conn, observed_date: str, observation_id: int) -> dict:
+    """Aggregate persisted flexible changes without re-running any source."""
+    rows = conn.execute(
+        """SELECT s.source_key, s.company, SUM(s.change_count) AS change_count
+           FROM observation_sources AS s
+           JOIN observation_batches AS b ON b.id=s.observation_id
+           WHERE b.observed_date=? AND b.trigger='flexible'
+           GROUP BY s.source_key, s.company ORDER BY s.source_key""",
+        (observed_date,),
+    ).fetchall()
+    return {
+        "id": observation_id,
+        "status": "ok",
+        "results": [
+            {
+                "source_key": row["source_key"],
+                "company": row["company"],
+                "status": "ok",
+                "change_count": int(row["change_count"] or 0),
+            }
+            for row in rows
+        ],
+    }
+
+
+def _previous_workday(day: date) -> date:
+    candidate = day - timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def consecutive_completed_workdays(
+    conn, through_date: str, *, required: int = 3
+) -> list[str]:
+    """Return the exact required workday window ending at the requested date."""
+    if required <= 0:
+        raise ValueError("required must be positive")
+    end = date.fromisoformat(through_date)
+    if end > date.today():
+        return []
+    while end.weekday() >= 5:
+        end -= timedelta(days=1)
+    days = [end]
+    while len(days) < required:
+        days.append(_previous_workday(days[-1]))
+    days.reverse()
+    labels = [day.isoformat() for day in days]
+    if any(completed_daily_collection(conn, day) is None for day in labels):
+        return []
+    return labels
+
+
 def record_truth(
     conn,
     observation_id: int,
@@ -453,8 +540,8 @@ def accept_day(
     note: str,
     checked_at: str | None = None,
 ) -> dict:
-    """用户明确确认后，把完整 15 格在同一个事务中写成最终证据。"""
-    review = official_truth.review_day(conn, observed_date)
+    """用户明确确认后，把当天完整证据在同一个事务中写成最终真值。"""
+    review = official_truth.review_date(conn, observed_date)
     if not review["ready"]:
         raise official_truth.ReviewNotReadyError("；".join(review["problems"]))
     try:

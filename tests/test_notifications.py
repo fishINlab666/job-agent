@@ -189,6 +189,33 @@ def test_ordinary_no_change_slot_is_persisted_as_skipped(tmp_path) -> None:
     conn.close()
 
 
+def test_flexible_daily_no_change_sends_completion_once(tmp_path) -> None:
+    conn = db.connect(tmp_path / "observation.db")
+    db.init(conn)
+    conn.execute(
+        """INSERT INTO observation_batches(
+               id, started_at, finished_at, observed_date, trigger, slot,
+               is_workday, on_time, status)
+           VALUES(7, '2026-08-25T10:00:00+08:00',
+                  '2026-08-25T10:01:00+08:00', '2026-08-25',
+                  'flexible', 'daily', 1, 0, 'ok')"""
+    )
+    conn.commit()
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    result = notifications.deliver_observation(
+        conn, _report(), slot="daily", runner=runner
+    )
+
+    assert result == {"policy": "daily-complete", "status": "sent", "error": None}
+    assert calls[0][-1] == "今日五家公司采集已完成，没有发现岗位变化。"
+    conn.close()
+
+
 def test_notification_failure_is_persisted_and_returned(tmp_path) -> None:
     conn = db.connect(tmp_path / "observation.db")
     db.init(conn)

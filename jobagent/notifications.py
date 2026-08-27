@@ -27,6 +27,12 @@ def _message(
             "Job Agent 发现岗位变化",
             f"{slot} 观察发现 {changes} 条岗位变化。",
         )
+    if slot == "daily":
+        return (
+            "daily-complete",
+            "Job Agent 今日采集完成",
+            "今日五家公司采集已完成，没有发现岗位变化。",
+        )
     if slot == "20:30":
         if not daily_complete:
             return (

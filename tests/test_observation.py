@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date, timedelta
 
 import httpx
 import pytest
 from typer.testing import CliRunner
 
-from jobagent import cli, db, network, observation
+from jobagent import cli, db, network, observation, official_truth
 from jobagent.adapters.base import RawJob
 from jobagent.targets import OBSERVATION_SOURCES
 from scripts import run_five
@@ -429,6 +430,88 @@ def test_schedule_install_preserves_the_virtualenv_python_symlink(
     assert result.exit_code == 0, result.output
     assert captured["python"] == venv_python.absolute()
     assert captured["python"] != base_python.resolve()
+
+
+def test_flexible_install_cli_does_not_require_terminal_legacy_day(
+    tmp_path, monkeypatch
+) -> None:
+    database = tmp_path / "jobagent.db"
+    conn = db.connect(database)
+    db.init(conn)
+    conn.close()
+    monkeypatch.setattr(
+        cli,
+        "_completed_workday_window",
+        lambda _conn, _day: ["2026-08-24", "2026-08-25", "2026-08-26"],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_install_flexible_schedule",
+        lambda **_kwargs: "com.fishinlab.job-agent.observe-daily",
+        raising=False,
+    )
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "schedule-flexible-install",
+            "--project-root",
+            str(tmp_path / "releases" / ("a" * 40)),
+            "--db",
+            str(database),
+            "--through-date",
+            "2026-08-26",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "灵活每日采集已启用" in result.output
+
+
+def test_flexible_install_cli_passes_exact_runtime_and_database(tmp_path, monkeypatch) -> None:
+    database = tmp_path / "jobagent.db"
+    conn = db.connect(database)
+    db.init(conn)
+    conn.close()
+    release = tmp_path / "releases" / ("a" * 40)
+    python = release / ".venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_text("python", encoding="utf-8")
+    captured: dict = {}
+    monkeypatch.setattr(
+        cli,
+        "_completed_workday_window",
+        lambda _conn, _day: ["2026-08-24", "2026-08-25", "2026-08-26"],
+        raising=False,
+    )
+    def fake_install(**kwargs):
+        captured.update(kwargs)
+        return "com.fishinlab.job-agent.observe-daily"
+
+    monkeypatch.setattr(cli, "_install_flexible_schedule", fake_install, raising=False)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "schedule-flexible-install",
+            "--project-root",
+            str(release),
+            "--python",
+            str(python),
+            "--db",
+            str(database),
+            "--home",
+            str(tmp_path / "home"),
+            "--through-date",
+            "2026-08-26",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["project_root"] == release.absolute()
+    assert captured["python_executable"] == python.absolute()
+    assert captured["db_path"] == database.absolute()
 
 
 def test_observe_cli_shows_each_failure_and_returns_nonzero(tmp_path, monkeypatch) -> None:
@@ -873,6 +956,247 @@ def _record_matching_truth(conn, observation_id: int, spec: dict) -> None:
         note="官网清单与变化逐项一致",
         checked_at=row["started_at"],
     )
+
+
+def _seed_complete_daily_collection(conn, day: str = "2026-08-25") -> int:
+    report = observation.run(
+        conn,
+        specs=OBSERVATION_SOURCES,
+        trigger="flexible",
+        slot="daily",
+        started_at=f"{day}T10:00:00+08:00",
+        syncer=_evidenced_sync,
+    )
+
+    def snapshot_ids(spec: dict) -> list[str]:
+        run_id = conn.execute(
+            """SELECT run_id FROM observation_sources
+               WHERE observation_id=? AND source_key=?""",
+            (report["id"], spec["source_key"]),
+        ).fetchone()["run_id"]
+        return [
+            row["external_id"]
+            for row in conn.execute(
+                "SELECT external_id FROM snapshots WHERE run_id=? ORDER BY external_id",
+                (run_id,),
+            ).fetchall()
+        ]
+
+    official_truth.capture_candidates(
+        conn,
+        report,
+        OBSERVATION_SOURCES,
+        fetcher=snapshot_ids,
+        captured_at=f"{day}T10:01:00+08:00",
+    )
+    conn.execute(
+        """INSERT INTO observation_notifications(
+               observation_id, policy, status, attempted_at)
+           VALUES(?, 'daily-complete', 'sent', ?)""",
+        (report["id"], f"{day}T10:02:00+08:00"),
+    )
+    conn.commit()
+    return int(report["id"])
+
+
+def test_completed_daily_collection_requires_a_finished_exact_snapshot(tmp_path) -> None:
+    conn = db.connect(tmp_path / "observation.db")
+    db.init(conn)
+    observation_id = _seed_complete_daily_collection(conn)
+
+    assert observation.completed_daily_collection(conn, "2026-08-25") == observation_id
+
+    conn.execute(
+        "UPDATE observation_batches SET finished_at=NULL WHERE id=?",
+        (observation_id,),
+    )
+    conn.commit()
+    assert observation.completed_daily_collection(conn, "2026-08-25") is None
+    conn.close()
+
+
+def test_completed_daily_collection_is_not_invalidated_by_later_truth_drift(
+    tmp_path,
+) -> None:
+    conn = db.connect(tmp_path / "observation.db")
+    db.init(conn)
+    observation_id = _seed_complete_daily_collection(conn)
+    wrong_ids = ["different-job-id"]
+    canonical = json.dumps(
+        wrong_ids,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    conn.execute(
+        """UPDATE observation_truth_candidates
+           SET official_ids_json=?, official_ids_sha256=?
+           WHERE observation_id=? AND source_key=?""",
+        (
+            canonical,
+            hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            observation_id,
+            OBSERVATION_SOURCES[0]["source_key"],
+        ),
+    )
+    conn.commit()
+
+    assert observation.completed_daily_collection(conn, "2026-08-25") == observation_id
+    conn.close()
+
+
+def test_observe_daily_does_not_recrawl_after_truth_candidate_failure(
+    tmp_path, monkeypatch
+) -> None:
+    database = tmp_path / "observation.db"
+    conn = db.connect(database)
+    db.init(conn)
+    observation_id = _seed_complete_daily_collection(
+        conn, day=date.today().isoformat()
+    )
+    conn.execute(
+        """UPDATE observation_truth_candidates
+           SET status='failed', official_ids_json=NULL,
+               official_ids_sha256=NULL, error='upstream changed during review'
+           WHERE observation_id=? AND source_key=?""",
+        (observation_id, OBSERVATION_SOURCES[0]["source_key"]),
+    )
+    conn.execute(
+        """UPDATE observation_notifications
+           SET policy='failure', status='sent'
+           WHERE observation_id=?""",
+        (observation_id,),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(
+        cli,
+        "_run_observation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("官网证据失败不得触发岗位重抓")
+        ),
+    )
+
+    result = runner.invoke(cli.app, ["observe-daily", "--db", str(database)])
+
+    assert result.exit_code == 0, result.output
+    assert "今天已经完整采集" in result.output
+
+
+def test_observe_daily_truth_failure_does_not_claim_jobs_will_be_recrawled(
+    tmp_path, monkeypatch
+) -> None:
+    database = tmp_path / "observation.db"
+    database.touch()
+    monkeypatch.setattr(
+        cli,
+        "_run_observation",
+        lambda *_args, **_kwargs: {"id": 1, "status": "ok", "results": []},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_capture_official_candidates",
+        lambda *_args, **_kwargs: {"status": "partial", "results": []},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_deliver_observation_notification",
+        lambda *_args, **_kwargs: {
+            "policy": "failure",
+            "status": "sent",
+            "error": None,
+        },
+    )
+
+    result = runner.invoke(cli.app, ["observe-daily", "--db", str(database)])
+
+    assert result.exit_code == 1
+    assert "五源数据已保留，不会因此重复抓岗位" in result.output
+    assert "下一次在线机会将重试" not in result.output
+
+
+def test_observe_daily_source_failure_says_the_next_opportunity_will_retry(
+    tmp_path, monkeypatch
+) -> None:
+    database = tmp_path / "observation.db"
+    database.touch()
+    monkeypatch.setattr(
+        cli,
+        "_run_observation",
+        lambda *_args, **_kwargs: {"id": 1, "status": "partial", "results": []},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_capture_official_candidates",
+        lambda *_args, **_kwargs: {"status": "partial", "results": []},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_deliver_observation_notification",
+        lambda *_args, **_kwargs: {
+            "policy": "failure",
+            "status": "sent",
+            "error": None,
+        },
+    )
+
+    result = runner.invoke(cli.app, ["observe-daily", "--db", str(database)])
+
+    assert result.exit_code == 1
+    assert "五源采集未完整，下一次在线机会将重试" in result.output
+    assert "不会因此重复抓岗位" not in result.output
+
+
+def test_observe_daily_cli_skips_after_complete_collection(tmp_path, monkeypatch) -> None:
+    database = tmp_path / "observation.db"
+    conn = db.connect(database)
+    db.init(conn)
+    _seed_complete_daily_collection(conn, day=date.today().isoformat())
+    conn.close()
+    monkeypatch.setattr(
+        cli,
+        "_run_observation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("同日完整后不得再次采集")
+        ),
+    )
+
+    result = runner.invoke(cli.app, ["observe-daily", "--db", str(database)])
+
+    assert result.exit_code == 0, result.output
+    assert "今天已经完整采集" in result.output
+
+
+def test_consecutive_completed_workdays_must_end_at_through_date(tmp_path) -> None:
+    conn = db.connect(tmp_path / "observation.db")
+    db.init(conn)
+    for day in ("2026-08-21", "2026-08-24", "2026-08-25"):
+        _seed_complete_daily_collection(conn, day=day)
+
+    assert observation.consecutive_completed_workdays(
+        conn, "2026-08-25"
+    ) == ["2026-08-21", "2026-08-24", "2026-08-25"]
+    assert observation.consecutive_completed_workdays(conn, "2026-08-26") == []
+    assert observation.consecutive_completed_workdays(
+        conn, "2026-08-23"
+    ) == []
+    conn.close()
+
+
+def test_consecutive_completed_workdays_rejects_a_future_endpoint(tmp_path) -> None:
+    conn = db.connect(tmp_path / "observation.db")
+    db.init(conn)
+    end = date.today() + timedelta(days=7)
+    while end.weekday() >= 5:
+        end -= timedelta(days=1)
+    days = [end]
+    while len(days) < 3:
+        days.append(observation._previous_workday(days[-1]))
+    for day in reversed(days):
+        _seed_complete_daily_collection(conn, day=day.isoformat())
+
+    assert observation.consecutive_completed_workdays(conn, end.isoformat()) == []
+    conn.close()
 
 
 def test_observation_records_each_source_and_workday(tmp_path) -> None:
