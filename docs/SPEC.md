@@ -225,6 +225,7 @@ stat -f '%N inode=%i size=%z' data/jobagent.db data/jobagent-5.db
 |---|---|---|
 | 提交必须带 `confirm_token` | `submitters/base.py` `mint_token()` / `TokenError` | 模型自作主张提交 |
 | 投递分 prepare / execute 两步 | `cli apply` | 「填完顺手就投了」 |
+| 投递前核对岗位届别与实际表单画像 | `eligibility.assess_grad_year()` + `cli apply` | 明确不符时零路由、零占位、零浏览器；信息不足默认停止，只有预填前显式同意才继续 |
 | 路由五道拒绝 | `routing._build()` | 认不出系统、租户对不上、多租户缺 tenant 等 |
 | 域名判据收窄到产品级 | `ats.py` `domains` | 品牌域名（`feishu.cn`）把一篇文档判成招聘入口 |
 | dry-run 全程不落盘 | `db.*(commit=False)` + `conn.rollback()` | `--dry-run` 往真库留 `running` 行，让 `status` 说假话 |

@@ -15,6 +15,7 @@ from . import (
     ats,
     cloud_sync,
     db,
+    eligibility,
     ingest,
     match,
     notifications,
@@ -1466,6 +1467,38 @@ def apply(
         console.print("[yellow]提示[/yellow] 复制 profile.yaml.example 改一份")
         raise typer.Exit(1)
 
+    grad_verdict = eligibility.assess_grad_year(job, form)
+    eligibility_warning: str | None = None
+
+    def with_eligibility_note(note: str | None) -> str | None:
+        if not eligibility_warning:
+            return note
+        return f"{eligibility_warning} / {note}" if note else eligibility_warning
+
+    if grad_verdict.state is eligibility.EligibilityState.INELIGIBLE:
+        profile_term = (
+            f"20{grad_verdict.profile_term}届"
+            if grad_verdict.profile_term else "无法确认"
+        )
+        job_terms = "、".join(f"20{term}届" for term in grad_verdict.job_terms or ())
+        console.print("[red]不投了[/red] 这份资料的毕业届别不符合岗位要求")
+        console.print(f"[dim]画像：{profile_term}；岗位：{job_terms}。[/dim]")
+        console.print("[dim]未创建投递记录，也没有打开浏览器、填写或上传资料。[/dim]")
+        raise typer.Exit(1)
+
+    if grad_verdict.state is eligibility.EligibilityState.UNKNOWN:
+        if grad_verdict.reason == "profile_term_missing":
+            reason = "画像里的毕业年份为空或格式不正确（请使用 20xx）"
+        elif grad_verdict.reason == "job_term_ambiguous":
+            reason = "岗位届别写法存在否定、冲突或无法安全解析"
+        else:
+            reason = "岗位没有可确认的届别"
+        console.print(f"[yellow]届别需要人工核对[/yellow] {reason}")
+        if not typer.confirm("届别无法自动确认，仍要打开浏览器并预填吗？", default=False):
+            console.print("[dim]已停止；没有创建投递记录，也没有打开或填写网页。[/dim]")
+            raise typer.Exit(1)
+        eligibility_warning = f"届别未经自动确认：{reason}；用户已同意继续预填"
+
     src_row = conn.execute("SELECT * FROM sources WHERE source_key=?", (src,)).fetchone()
     lookup = dict(job)
 
@@ -1534,6 +1567,8 @@ def apply(
     # ---- 阶段一：填表，停在提交按钮前 ----
     console.print(f"[dim]启动浏览器，填表但不提交…[/dim]")
     plan = submitter.prepare(job, form)
+    if eligibility_warning and eligibility_warning not in plan.warnings:
+        plan.warnings.insert(0, eligibility_warning)
 
     if plan.status == "blocked":
         console.print(f"[yellow]未能填表[/yellow] {plan.blocker}")
@@ -1560,7 +1595,7 @@ def apply(
         submitter.discard(plan.confirm_token)
         db.complete_application(
             conn, app_id, expected_status="prefilled",
-            status="abandoned", note="dry_run",
+            status="abandoned", note=with_eligibility_note("dry_run"),
         )
         return
 
@@ -1577,7 +1612,7 @@ def apply(
         submitter.discard(plan.confirm_token)
         db.complete_application(
             conn, app_id, expected_status="prefilled",
-            status="abandoned", note="用户放弃",
+            status="abandoned", note=with_eligibility_note("用户放弃"),
         )
         db.add_event(conn, "apply_abandoned", source_key=src,
                      company=job["company"], job_id=job["id"])
@@ -1598,7 +1633,7 @@ def apply(
         db.complete_application(
             conn, app_id, expected_status="submitting",
             status="unknown", error=error,
-            note="execute_exception_outcome_unknown",
+            note=with_eligibility_note("execute_exception_outcome_unknown"),
         )
         db.add_event(
             conn, "apply_unknown", source_key=src, company=job["company"],
@@ -1618,7 +1653,7 @@ def apply(
         screenshot_path=result.screenshot_path,
         filled_fields=result.filled_fields or None,
         skipped_fields=result.skipped_fields or None,
-        note=result.note,
+        note=with_eligibility_note(result.note),
     )
     db.add_event(conn, f"apply_{persisted_status}", source_key=src,
                  company=job["company"], job_id=job["id"],
@@ -2222,6 +2257,7 @@ def _record_blocked(
         db.transition_application(
             conn, app_id, expected_status="reserved", status="blocked",
             error=plan.blocker, screenshot_path=plan.screenshot_path,
+            note=" / ".join(plan.warnings) if plan.warnings else None,
         )
     db.add_event(conn, "apply_blocked", source_key=src, company=job["company"],
                  job_id=job["id"], payload={"blocker": plan.blocker})
