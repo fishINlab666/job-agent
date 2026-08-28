@@ -103,7 +103,13 @@ class FormProfile(BaseModel):
     def grad_term(self) -> str | None:
         """毕业年份 → 届别（2027 → "27"），和 jobs.grad_year 对齐。"""
         y = self.get("grad_year")
-        return y[-2:] if y and len(y) >= 2 and y.isdigit() else None
+        valid = (
+            y
+            and len(y) == 4
+            and y.startswith("20")
+            and all("0" <= char <= "9" for char in y)
+        )
+        return y[-2:] if valid else None
 
 
 SPEC_BY_NAME = {name: (label, sens) for name, label, sens in FIELD_SPECS}

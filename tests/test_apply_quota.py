@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import itertools
 import time
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
@@ -249,6 +250,277 @@ class TestLimitLookup:
         assert limit == 3
 
 
+class TestGradYearEligibilityGate:
+    def _seed_job(
+        self,
+        conn,
+        *,
+        grad_year: str | None,
+        title: str = "产品运营",
+        recruit_type: str = "campus",
+    ) -> None:
+        db.register_source(
+            conn,
+            "tencent_join",
+            "A公司",
+            "tencent_join",
+            "https://join.qq.com/post.html",
+        )
+        conn.execute(
+            """INSERT INTO jobs(source_key, external_id, company, title,
+                   recruit_type, grad_year, apply_url, apply_system, fingerprint,
+                   first_seen_at, last_seen_at)
+               VALUES('tencent_join','J1','A公司',?,?,?,?,
+                      'tencent_join','fp',?,?)""",
+            (title, recruit_type, grad_year, "https://join.qq.com/x", db.now(), db.now()),
+        )
+        conn.commit()
+
+    @staticmethod
+    def _profile(tmp_path, end: str = "2027-06"):
+        path = tmp_path / "eligibility-profile.yaml"
+        path.write_text(
+            "identity:\n"
+            "  name: 测试用户\n"
+            "  phone: '13800000000'\n"
+            "  email: test@example.com\n"
+            "education:\n"
+            "  - school: 测试大学\n"
+            f"    end: '{end}'\n",
+            encoding="utf-8",
+        )
+        return path
+
+    @staticmethod
+    def _plan(*, status: str = "blocked") -> SubmissionPlan:
+        return SubmissionPlan(
+            job_id="J1",
+            source_key="tencent_join",
+            company="A公司",
+            title="产品运营",
+            status=status,
+            blocker="测试到此停止" if status == "blocked" else None,
+            confirm_token="tok-eligibility" if status == "ready" else "",
+            expires_at=time.time() + 300,
+        )
+
+    def _record_boundaries(self, monkeypatch, calls):
+        original_reserve = db.reserve_application
+
+        def resolve(*_args, **_kwargs):
+            calls.append("resolve")
+            return SimpleNamespace(key="test", basis="test")
+
+        class RecordingSubmitter:
+            def prepare(inner_self, *_args, **_kwargs):
+                calls.append("prepare")
+                return self._plan()
+
+        def get_submitter(*_args, **_kwargs):
+            calls.append("get_submitter")
+            return RecordingSubmitter()
+
+        def reserve(*args, **kwargs):
+            calls.append("reserve")
+            return original_reserve(*args, **kwargs)
+
+        monkeypatch.setattr(cli.routing, "resolve", resolve)
+        monkeypatch.setattr(cli.routing, "get_submitter", get_submitter)
+        monkeypatch.setattr(cli.db, "reserve_application", reserve)
+
+    def test_mismatch_stops_before_route_reservation_and_browser(
+        self, tmp_db, tmp_path, monkeypatch
+    ):
+        self._seed_job(tmp_db, grad_year="26届")
+        calls = []
+        self._record_boundaries(monkeypatch, calls)
+        before_apps = tmp_db.execute("SELECT count(*) FROM applications").fetchone()[0]
+        before_events = tmp_db.execute("SELECT count(*) FROM events").fetchone()[0]
+
+        result = runner.invoke(
+            cli.app,
+            ["apply", "J1", "--profile-path", str(self._profile(tmp_path))],
+        )
+
+        assert result.exit_code == 1
+        assert calls == []
+        assert "毕业届别不符合" in result.output
+        assert (
+            tmp_db.execute("SELECT count(*) FROM applications").fetchone()[0]
+            == before_apps
+        )
+        assert tmp_db.execute("SELECT count(*) FROM events").fetchone()[0] == before_events
+
+    @pytest.mark.parametrize("extra", [[], ["--again"], ["--dry-run"]])
+    def test_mismatch_cannot_be_bypassed_by_again_or_dry_run(
+        self, tmp_db, tmp_path, monkeypatch, extra
+    ):
+        self._seed_job(tmp_db, grad_year="26届")
+        calls = []
+        self._record_boundaries(monkeypatch, calls)
+
+        result = runner.invoke(
+            cli.app,
+            ["apply", "J1", *extra, "--profile-path", str(self._profile(tmp_path))],
+        )
+
+        assert result.exit_code == 1
+        assert calls == []
+
+    @pytest.mark.parametrize(
+        ("title", "recruit_type"),
+        [("产品运营", "campus"), ("【٢٧届校招】产品运营", "social")],
+    )
+    def test_unknown_default_no_stops_before_all_side_effects(
+        self, tmp_db, tmp_path, monkeypatch, title, recruit_type
+    ):
+        self._seed_job(
+            tmp_db, grad_year=None, title=title, recruit_type=recruit_type
+        )
+        calls = []
+        self._record_boundaries(monkeypatch, calls)
+
+        result = runner.invoke(
+            cli.app,
+            ["apply", "J1", "--profile-path", str(self._profile(tmp_path))],
+            input="\n",
+        )
+
+        assert result.exit_code == 1
+        assert calls == []
+        assert "届别需要人工核对" in result.output
+        assert "仍要打开浏览器并预填吗" in result.output
+        assert tmp_db.execute("SELECT count(*) FROM applications").fetchone()[0] == 0
+
+    @pytest.mark.parametrize(
+        "grad_year",
+        [
+            "非2027届",
+            "不是2027届",
+            "不招2027届",
+            "not 2027",
+            "疑似2027届",
+            "所有2026届",
+            "26-2028届",
+            "2026/27届",
+            "26～28届",
+            "2027届除外",
+            "2027-2026年",
+        ],
+    )
+    def test_ambiguous_term_defaults_to_no_before_all_side_effects(
+        self, tmp_db, tmp_path, monkeypatch, grad_year
+    ):
+        self._seed_job(tmp_db, grad_year=grad_year)
+        calls = []
+        self._record_boundaries(monkeypatch, calls)
+
+        result = runner.invoke(
+            cli.app,
+            ["apply", "J1", "--profile-path", str(self._profile(tmp_path))],
+            input="\n",
+        )
+
+        assert result.exit_code == 1
+        assert calls == []
+        assert "届别需要人工核对" in result.output
+        assert tmp_db.execute("SELECT count(*) FROM applications").fetchone()[0] == 0
+
+    def test_eligibility_exception_is_fail_closed_before_all_side_effects(
+        self, tmp_db, tmp_path, monkeypatch
+    ):
+        self._seed_job(tmp_db, grad_year="27届")
+        calls = []
+        self._record_boundaries(monkeypatch, calls)
+
+        def explode(*_args, **_kwargs):
+            raise RuntimeError("eligibility parser failed")
+
+        monkeypatch.setattr(cli.eligibility, "assess_grad_year", explode)
+        result = runner.invoke(
+            cli.app,
+            ["apply", "J1", "--profile-path", str(self._profile(tmp_path))],
+        )
+
+        assert result.exit_code == 1
+        assert isinstance(result.exception, RuntimeError)
+        assert calls == []
+        assert tmp_db.execute("SELECT count(*) FROM applications").fetchone()[0] == 0
+
+    def test_unknown_explicit_yes_warns_before_prepare(
+        self, tmp_db, tmp_path, monkeypatch
+    ):
+        self._seed_job(tmp_db, grad_year=None)
+        calls = []
+        self._record_boundaries(monkeypatch, calls)
+        original_confirm = cli.typer.confirm
+
+        def confirm(message, *, default=False):
+            if "打开浏览器" in message:
+                calls.append("confirm")
+                assert default is False
+                return True
+            return original_confirm(message, default=default)
+
+        monkeypatch.setattr(cli.typer, "confirm", confirm)
+
+        result = runner.invoke(
+            cli.app,
+            ["apply", "J1", "--profile-path", str(self._profile(tmp_path))],
+        )
+
+        assert result.exit_code == 1
+        assert calls == ["confirm", "resolve", "get_submitter", "reserve", "prepare"]
+        assert "届别需要人工核对" in result.output
+
+    def test_unknown_consent_is_kept_in_the_existing_application_note(
+        self, tmp_db, tmp_path, monkeypatch
+    ):
+        self._seed_job(tmp_db, grad_year=None)
+
+        class ReadySubmitter:
+            def prepare(inner_self, *_args, **_kwargs):
+                return self._plan(status="ready")
+
+            def discard(self, _token):
+                return None
+
+        monkeypatch.setattr(
+            cli.routing, "get_submitter", lambda *_args, **_kwargs: ReadySubmitter()
+        )
+
+        result = runner.invoke(
+            cli.app,
+            [
+                "apply", "J1", "--dry-run",
+                "--profile-path", str(self._profile(tmp_path)),
+            ],
+            input="y\n",
+        )
+
+        assert result.exit_code == 0, result.output
+        row = tmp_db.execute(
+            "SELECT status, note FROM applications WHERE external_id='J1'"
+        ).fetchone()
+        assert row["status"] == "abandoned"
+        assert "岗位没有可确认的届别" in row["note"]
+        assert "用户已同意继续预填" in row["note"]
+
+    def test_match_reaches_prepare(self, tmp_db, tmp_path, monkeypatch):
+        self._seed_job(tmp_db, grad_year="27届")
+        calls = []
+        self._record_boundaries(monkeypatch, calls)
+
+        result = runner.invoke(
+            cli.app,
+            ["apply", "J1", "--profile-path", str(self._profile(tmp_path))],
+        )
+
+        assert result.exit_code == 1
+        assert calls == ["resolve", "get_submitter", "reserve", "prepare"]
+        assert "届别需要人工核对" not in result.output
+
+
 @pytest.fixture
 def no_browser(monkeypatch):
     """把 prepare() 换成一个「被调到就炸」的桩。
@@ -274,9 +546,10 @@ class TestApplyGate:
                            "https://join.qq.com/post.html", "", None, 2)
         conn.execute(
             """INSERT INTO jobs(source_key, external_id, company, title,
-                   apply_url, apply_system, fingerprint, first_seen_at, last_seen_at)
-               VALUES('tencent_join',?,?,'产品运营','https://join.qq.com/x',
-                      'tencent_join','fp',?,?)""",
+                   recruit_type, grad_year, apply_url, apply_system, fingerprint,
+                   first_seen_at, last_seen_at)
+               VALUES('tencent_join',?,?,'产品运营','campus','27',
+                      'https://join.qq.com/x','tencent_join','fp',?,?)""",
             (ext_id, company, db.now(), db.now()),
         )
         conn.commit()
@@ -287,7 +560,8 @@ class TestApplyGate:
             add_app(tmp_db, "A公司", "submitted", source_key="tencent_join")
         prof = tmp_path / "p.yaml"
         prof.write_text(
-            "name: 张三\nphone: '13800000000'\nemail: a@b.com\n", encoding="utf-8"
+            "name: 张三\nphone: '13800000000'\nemail: a@b.com\ngrad_year: '2027'\n",
+            encoding="utf-8",
         )
         r = runner.invoke(cli.app, ["apply", "J1", "--profile-path", str(prof)])
         assert r.exit_code == 1
@@ -300,7 +574,8 @@ class TestApplyGate:
             add_app(tmp_db, "A公司", "submitted", source_key="tencent_join")
         prof = tmp_path / "p.yaml"
         prof.write_text(
-            "name: 张三\nphone: '13800000000'\nemail: a@b.com\n", encoding="utf-8"
+            "name: 张三\nphone: '13800000000'\nemail: a@b.com\ngrad_year: '2027'\n",
+            encoding="utf-8",
         )
         runner.invoke(cli.app, ["apply", "J1", "--profile-path", str(prof)])
         row = tmp_db.execute(
@@ -320,7 +595,8 @@ class TestApplyGate:
         add_app(tmp_db, "A公司", "submitted", source_key="tencent_join")
         prof = tmp_path / "p.yaml"
         prof.write_text(
-            "name: 张三\nphone: '13800000000'\nemail: a@b.com\n", encoding="utf-8"
+            "name: 张三\nphone: '13800000000'\nemail: a@b.com\ngrad_year: '2027'\n",
+            encoding="utf-8",
         )
         r = runner.invoke(cli.app, ["apply", "J1", "--profile-path", str(prof)])
         assert "额度 1/2" in r.output
@@ -338,9 +614,10 @@ class TestSafeApplyWorkflow:
         )
         cur = conn.execute(
             """INSERT INTO jobs(source_key, external_id, company, title,
-                   apply_url, apply_system, fingerprint, first_seen_at, last_seen_at)
-               VALUES('tencent_join',?,'A公司','产品运营','https://join.qq.com/x',
-                      'tencent_join','fp',?,?)""",
+                   recruit_type, grad_year, apply_url, apply_system, fingerprint,
+                   first_seen_at, last_seen_at)
+               VALUES('tencent_join',?,'A公司','产品运营','campus','27',
+                      'https://join.qq.com/x','tencent_join','fp',?,?)""",
             (external_id, db.now(), db.now()),
         )
         conn.commit()
@@ -349,7 +626,8 @@ class TestSafeApplyWorkflow:
     def _profile(self, tmp_path):
         path = tmp_path / "profile.yaml"
         path.write_text(
-            "name: 测试用户\nphone: '13800000000'\nemail: test@example.com\n",
+            "name: 测试用户\nphone: '13800000000'\nemail: test@example.com\n"
+            "grad_year: '2027'\n",
             encoding="utf-8",
         )
         return path
